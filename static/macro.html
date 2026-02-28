@@ -15,7 +15,7 @@
             data-bs-target="#{{target}}"
             type="button"
             role="tab"
-            aria-controls="home"
+            aria-controls="{{target}}"
             aria-selected="{% if active %}true{% else %}false{% endif %}">
             {{ caller() }}
         </button>
@@ -34,8 +34,8 @@
     <button
         class="btn btn-secondary btn-sm"
         type="button"
-        data-toggle="tooltip"
-        data-placement="button"
+        data-bs-toggle="tooltip"
+        data-bs-placement="top"
         data-clipboard-src="{{src}}"
         title="Copy to Clipboard"
         >

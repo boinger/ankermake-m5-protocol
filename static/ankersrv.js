@@ -9,9 +9,11 @@ $(function () {
      */
     var popupModal = document.getElementById("popupModal");
 
-    popupModal.addEventListener("shown.bs.modal", function (e) {
-        window.location.href = $("#reload").data("href");
-    });
+    if (popupModal) {
+        popupModal.addEventListener("shown.bs.modal", function (e) {
+            window.location.href = $("#reload").data("href");
+        });
+    }
 
     /**
      * On click of an element with attribute "data-clipboard-src", updates clipboard with text from that element
@@ -278,7 +280,7 @@ $(function () {
     /**
      * Auto web sockets
      */
-    sockets = {};
+    const sockets = {};
 
     sockets.mqtt = new AutoWebSocket({
         name: "mqtt socket",
@@ -286,7 +288,13 @@ $(function () {
         badge: "#badge-mqtt",
 
         message: function (ev) {
-            const data = JSON.parse(ev.data);
+            let data = null;
+            try {
+                data = JSON.parse(ev.data);
+            } catch (err) {
+                console.warn("mqtt socket: failed to parse message", err);
+                return;
+            }
             if (data.commandType == 1000) {
                 // Printer state machine: value=0 idle, value=1 printing, value=2 paused
                 _updatePrintControlButtons(data.value);
@@ -337,6 +345,11 @@ $(function () {
                         `<div class="progress-bar progress-bar-striped progress-bar-animated" ` +
                         `style="width:${pct}%" aria-valuenow="${pct}"></div></div></div>`;
                 }
+            } else if (data.commandType == 1044) {
+                // Print start notification — extract basename from filePath
+                const filePath = data.filePath || "";
+                const baseName = filePath.split("/").pop().split("\\").pop();
+                $("#print-name").text(baseName);
             } else if (data.commandType == 1052) {
                 // Returns Layer Info; derive progress from layer counts
                 const layer = `${data.real_print_layer} / ${data.total_layer}`;
@@ -363,9 +376,9 @@ $(function () {
             $("#progressbar").attr("style", "width: 0%");
             $("#progress").text("0%");
             $("#nozzle-temp").text("0°C");
-            $("#set-nozzle-temp").attr("value", "0°C");
+            $("#set-nozzle-temp").val(0);
             $("#bed-temp").text("0°C");
-            $("#set-bed-temp").attr("value", "0°C");
+            $("#set-bed-temp").val(0);
             $("#print-speed").text("0mm/s");
             $("#print-layer").text("0 / 0");
             document.title = "ankerctl";
@@ -433,6 +446,7 @@ $(function () {
     if (videoPlayer) {
         videoPlayer.addEventListener("loadedmetadata", updateVideoResolution);
         videoPlayer.addEventListener("loadeddata", updateVideoResolution);
+        videoPlayer.addEventListener("resize", updateVideoResolution);
     }
 
     sockets.ctrl = new AutoWebSocket({
@@ -459,7 +473,13 @@ $(function () {
         reconnect: 5000,
 
         message: function (event) {
-            const data = JSON.parse(event.data);
+            let data = null;
+            try {
+                data = JSON.parse(event.data);
+            } catch (err) {
+                console.warn("pppp socket: failed to parse message", err);
+                return;
+            }
             if (data.status === "connected") {
                 $(this.badge).removeClass("text-bg-danger text-bg-warning").addClass("text-bg-success");
             } else if (data.status === "disconnected") {
@@ -758,8 +778,11 @@ $(function () {
         const countryCodes = selectElement.data("countrycodes");
         const currentCountry = selectElement.data("country");
         countryCodes.forEach((item) => {
-            const selected = (currentCountry == item.c) ? " selected" : "";
-            $(`<option value="${item.c}"${selected}>${item.n}</option>`).appendTo(selectElement);
+            const opt = document.createElement("option");
+            opt.value = item.c;
+            opt.textContent = item.n;
+            opt.selected = (currentCountry == item.c);
+            selectElement[0].appendChild(opt);
         });
     })($("#loginCountry"));
 
@@ -796,7 +819,7 @@ $(function () {
                 else if ("captcha_id" in data) {
                     input.val("");
                     input.attr("aria-required", "true");
-                    input.prop("required");
+                    input.prop("required", true);
                     input.get(0).focus();
                     $("#loginCaptchaId").val(data["captcha_id"]);
                     $("#loginCaptchaImg").attr("src", data["captcha_url"]);
@@ -1083,7 +1106,7 @@ $(function () {
                 snaps.forEach(s => {
                     const opt = document.createElement("option");
                     opt.value = s.id;
-                    opt.textContent = escapeHtml(s.label);
+                    opt.textContent = s.label;
                     if (s.id === prevA) opt.selected = true;
                     selA.appendChild(opt);
                 });
@@ -1098,7 +1121,7 @@ $(function () {
             snaps.forEach(s => {
                 const opt = document.createElement("option");
                 opt.value = s.id;
-                opt.textContent = escapeHtml(s.label);
+                opt.textContent = s.label;
                 if (s.id === prevB) opt.selected = true;
                 selB.appendChild(opt);
             });
@@ -1451,17 +1474,21 @@ $(function () {
      * Temperature Control Logic
      */
     $("#set-nozzle-temp").on("change", function () {
-        const temp = $(this).val();
-        if (temp !== "") {
-            sendPrinterGCode(`M104 S${temp}`);
-        }
+        const raw = parseInt($(this).val(), 10);
+        if (isNaN(raw)) return;
+        const max = parseInt($(this).attr("max"), 10) || 260;
+        const temp = Math.max(0, Math.min(max, raw));
+        $(this).val(temp);
+        sendPrinterGCode(`M104 S${temp}`);
     });
 
     $("#set-bed-temp").on("change", function () {
-        const temp = $(this).val();
-        if (temp !== "") {
-            sendPrinterGCode(`M140 S${temp}`);
-        }
+        const raw = parseInt($(this).val(), 10);
+        if (isNaN(raw)) return;
+        const max = parseInt($(this).attr("max"), 10) || 100;
+        const temp = Math.max(0, Math.min(max, raw));
+        $(this).val(temp);
+        sendPrinterGCode(`M140 S${temp}`);
     });
 
     $(".preheat-preset").on("click", function () {
@@ -1500,7 +1527,8 @@ $(function () {
     function gcodeLog(msg) {
         const log = $("#gcode-log");
         const ts = new Date().toLocaleTimeString();
-        log.append(`[${ts}] ${msg}\n`);
+        const line = document.createTextNode(`[${ts}] ${msg}\n`);
+        log.append(line);
         log.scrollTop(log[0].scrollHeight);
     }
 
@@ -1703,7 +1731,7 @@ $(function () {
             finished: '<span class="badge bg-success">Finished</span>',
             failed: '<span class="badge bg-danger">Failed</span>',
         };
-        return map[status] || `<span class="badge bg-secondary">${status}</span>`;
+        return map[status] || `<span class="badge bg-secondary">${escapeHtml(status)}</span>`;
     }
 
     function loadHistory(append) {
@@ -1785,7 +1813,7 @@ $(function () {
 
         titleEl.textContent = v.filename;
         metaEl.textContent  = `${v.created_at ? new Date(v.created_at).toLocaleString() : "-"} · ${formatSize(v.size_bytes)}`;
-        videoEl.src         = `/api/timelapse/${escapeHtml(v.filename)}`;
+        videoEl.src         = `/api/timelapse/${encodeURIComponent(v.filename)}`;
         videoEl.load();
         if (deleteBtn) deleteBtn.dataset.file = v.filename;
         card.style.display        = "";
@@ -1819,7 +1847,7 @@ $(function () {
                             <div class="text-muted" style="font-size:0.75em;">${created} · ${formatSize(v.size_bytes)}</div>
                         </div>
                         <div class="d-flex gap-1 flex-shrink-0">
-                            <a href="/api/timelapse/${safeFilename}" class="btn btn-sm btn-outline-secondary" download title="Download">
+                            <a href="/api/timelapse/${encodeURIComponent(v.filename)}" class="btn btn-sm btn-outline-secondary" download title="Download">
                                 <i class="bi bi-download"></i>
                             </a>
                             <button type="button" class="btn btn-sm btn-outline-danger timelapse-delete" data-file="${safeFilename}" title="Delete">
@@ -1855,7 +1883,7 @@ $(function () {
     $(document).on("click", ".timelapse-delete", function () {
         const file = $(this).data("file");
         if (!confirm(`Delete timelapse ${file}?`)) return;
-        fetch(`/api/timelapse/${file}`, { method: "DELETE" })
+        fetch(`/api/timelapse/${encodeURIComponent(file)}`, { method: "DELETE" })
             .then(() => {
                 // If the deleted video is currently loaded in the player, clear it
                 const videoEl     = document.getElementById("timelapse-player");

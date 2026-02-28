@@ -10,3 +10,8 @@ captures
 captures/
 dump/
 .env
+.env.*
+!.env.example
+.claude/
+.venv/
+*.log

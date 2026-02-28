@@ -214,6 +214,19 @@ def ctrl(sock):
     if not app.config["login"]:
         return
 
+    # before_request middleware does not run for WebSocket routes, so enforce
+    # API key auth inline here for this write-capable endpoint.
+    api_key = app.config.get("api_key")
+    if api_key:
+        authed = (
+            session.get("authenticated")
+            or request.headers.get("X-Api-Key") == api_key
+            or request.args.get("apikey") == api_key
+        )
+        if not authed:
+            log.warning("WebSocket /ws/ctrl rejected: missing or invalid API key")
+            return
+
     # send a response on connect, to let the client know the connection is ready
     sock.send(json.dumps({"ankerctl": 1}))
     vq = app.svc.svcs.get("videoqueue")
@@ -224,7 +237,16 @@ def ctrl(sock):
         sock.send(json.dumps({"video_profile": profile_id}))
 
     while True:
-        msg = json.loads(sock.receive())
+        try:
+            data = sock.receive()
+            if data is None:
+                break
+            msg = json.loads(data)
+        except ConnectionClosed:
+            break
+        except (json.JSONDecodeError, TypeError) as exc:
+            log.warning(f"/ws/ctrl: malformed message, ignoring: {exc}")
+            continue
 
         if "light" in msg:
             if isinstance(msg["light"], bool):
@@ -234,11 +256,11 @@ def ctrl(sock):
                 log.warning(f"Invalid 'light' value (expected bool): {msg['light']!r}")
 
         if "video_profile" in msg:
-            if isinstance(msg["video_profile"], int):
+            if isinstance(msg["video_profile"], str):
                 with app.svc.borrow("videoqueue") as vq:
                     vq.api_video_profile(msg["video_profile"])
             else:
-                log.warning(f"Invalid 'video_profile' value (expected int): {msg['video_profile']!r}")
+                log.warning(f"Invalid 'video_profile' value (expected str): {msg['video_profile']!r}")
         elif "quality" in msg:
             if isinstance(msg["quality"], int):
                 with app.svc.borrow("videoqueue") as vq:
@@ -1060,17 +1082,28 @@ def app_api_timelapses():
 def app_api_timelapse_download(filename):
     """Download a timelapse video."""
     from flask import send_file
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return jsonify({"error": "invalid filename"}), 400
     with app.svc.borrow("mqttqueue") as mqtt:
         path = mqtt.timelapse.get_video_path(filename)
+        captures_dir = os.path.realpath(mqtt.timelapse._captures_dir)
     if not path:
         return {"error": "Video not found"}, 404
+    if not os.path.realpath(path).startswith(captures_dir + os.sep):
+        return jsonify({"error": "invalid filename"}), 400
     return send_file(path, mimetype="video/mp4", as_attachment=False, download_name=filename)
 
 
 @app.delete("/api/timelapse/<filename>")
 def app_api_timelapse_delete(filename):
     """Delete a timelapse video."""
+    if "/" in filename or "\\" in filename or ".." in filename:
+        return jsonify({"error": "invalid filename"}), 400
     with app.svc.borrow("mqttqueue") as mqtt:
+        captures_dir = os.path.realpath(mqtt.timelapse._captures_dir)
+        path = mqtt.timelapse.get_video_path(filename)
+        if not path or not os.path.realpath(path).startswith(captures_dir + os.sep):
+            return {"error": "Video not found"}, 404
         deleted = mqtt.timelapse.delete_video(filename)
     if not deleted:
         return {"error": "Video not found"}, 404
@@ -1243,6 +1276,9 @@ _PROTECTED_GET_PATHS = {
     "/api/debug/state",
     "/api/debug/logs",
     "/api/debug/services",
+    # Sensitive credential exposure: HA MQTT password, Apprise URLs/keys
+    "/api/settings/mqtt",
+    "/api/notifications/settings",
 }
 
 # POST endpoints needed for initial printer setup (config import / login)

@@ -208,7 +208,10 @@ class HomeAssistantService:
         client.subscribe(light_cmd_topic, qos=1)
         log.info(f"HA MQTT: subscribed to {light_cmd_topic}")
 
-        # Start availability heartbeat
+        # Start availability heartbeat — stop any existing thread first to avoid leaks
+        if self._availability_thread and self._availability_thread.is_alive():
+            self._stop_event.set()
+            self._availability_thread.join(timeout=2)
         self._stop_event.clear()
         self._availability_thread = threading.Thread(
             target=self._availability_loop, daemon=True, name="ha-mqtt-avail"

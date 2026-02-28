@@ -259,7 +259,7 @@
                                         0°C
                                     </span>
                                     <input type="number" id="set-nozzle-temp" class="form-control text-center px-1"
-                                        value="0" />
+                                        value="0" min="0" max="{{ 300 if printer and 'M5C' in printer.model else 260 }}" />
                                     <span class="input-group-text">°C</span>
                                 </div>
                             </div>
@@ -273,7 +273,7 @@
                                         0°C
                                     </span>
                                     <input type="number" id="set-bed-temp" class="form-control text-center px-1"
-                                        value="0" />
+                                        value="0" min="0" max="100" />
                                     <span class="input-group-text">°C</span>
                                 </div>
                             </div>

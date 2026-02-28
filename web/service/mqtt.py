@@ -120,6 +120,7 @@ class MqttQueue(Service):
 
     def worker_stop(self):
         self._ha.update_state(mqtt_connected=False)
+        self._ha.stop()
         del self.client
         
     def _send_status_query(self):

@@ -5,7 +5,8 @@ import contextlib
 from enum import Enum
 from threading import Thread, Event
 from datetime import datetime, timedelta
-from multiprocessing import Queue
+import queue
+from queue import Queue
 
 
 class Holdoff:
@@ -358,7 +359,6 @@ class ServiceManager:
             self.put(name)
 
     def stream(self, name: str):
-        import queue as _queue
         try:
             with self.borrow(name) as svc:
                 q = Queue()
@@ -367,7 +367,7 @@ class ServiceManager:
                     while svc.state == RunState.Running:
                         try:
                             data = q.get(timeout=1.0)
-                        except _queue.Empty:
+                        except queue.Empty:
                             continue
                         yield data
         except (EOFError, OSError, ServiceStoppedError):
