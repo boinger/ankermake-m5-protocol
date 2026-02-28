@@ -260,7 +260,8 @@ All endpoints are served by `web/__init__.py`. Authentication is enforced by the
 - **GET requests** are unauthenticated by default (read-only).
 - **POST / DELETE requests** always require auth (session cookie, `X-Api-Key` header, or `?apikey=` param).
 - **Protected GET paths** (listed in `_PROTECTED_GET_PATHS`) also require auth:
-  `/api/ankerctl/server/reload`, `/api/debug/state`, `/api/debug/logs`, `/api/debug/services`.
+  `/api/ankerctl/server/reload`, `/api/debug/state`, `/api/debug/logs`, `/api/debug/services`,
+  `/api/settings/mqtt`, `/api/notifications/settings`.
 - **All `/api/debug/*` paths** require auth (prefix match in middleware).
 - **Setup paths** (`/api/ankerctl/config/upload`, `/api/ankerctl/config/login`) are exempt
   from auth when no printer is configured yet.
@@ -307,7 +308,7 @@ All endpoints are served by `web/__init__.py`. Authentication is enforced by the
 
 | Method | Path | Auth Required | Description |
 |--------|------|--------------|-------------|
-| `GET` | `/api/notifications/settings` | No | Return current Apprise config |
+| `GET` | `/api/notifications/settings` | Yes | Return current Apprise config (contains API keys) |
 | `POST` | `/api/notifications/settings` | Yes | Update Apprise config; JSON body `{"apprise": {...}}` |
 | `POST` | `/api/notifications/test` | Yes | Send test notification; optionally pass `{"apprise": {...}}` to override settings |
 
@@ -317,7 +318,7 @@ All endpoints are served by `web/__init__.py`. Authentication is enforced by the
 |--------|------|--------------|-------------|
 | `GET` | `/api/settings/timelapse` | No | Return current timelapse config |
 | `POST` | `/api/settings/timelapse` | Yes | Update timelapse config; JSON body `{"timelapse": {...}}`; auto-reloads service |
-| `GET` | `/api/settings/mqtt` | No | Return current Home Assistant MQTT config |
+| `GET` | `/api/settings/mqtt` | Yes | Return current Home Assistant MQTT config (contains broker password) |
 | `POST` | `/api/settings/mqtt` | Yes | Update HA MQTT config; JSON body `{"home_assistant": {...}}`; auto-reloads service |
 
 ### Print History Endpoints
@@ -367,7 +368,7 @@ All endpoints are served by `web/__init__.py`. Authentication is enforced by the
 | `/ws/video` | Server → Client | Raw H.264 video frame stream |
 | `/ws/pppp-state` | Server → Client | PPPP connection status (`{"status": "connected"}` / `{"status": "disconnected"}`) |
 | `/ws/upload` | Server → Client | File upload progress events from FileTransferService |
-| `/ws/ctrl` | Bidirectional | Light control (`{"light": bool}`), video quality (`{"video_profile": "sd"\|"hd"}`), video enable/disable (`{"video_enabled": bool}`) |
+| `/ws/ctrl` | Bidirectional | Light control (`{"light": bool}`), video quality (`{"video_profile": "sd"\|"hd"}`), video enable/disable (`{"video_enabled": bool}`). Requires auth when `ANKERCTL_API_KEY` is set (inline check — `before_request` does not run for WebSocket routes). |
 
 ### Debug Endpoints (ANKERCTL_DEV_MODE=true only)
 

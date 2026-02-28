@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+ - **`GET /api/settings/mqtt` now requires auth** — previously returned the HA MQTT broker password unauthenticated; added to `_PROTECTED_GET_PATHS`
+ - **`GET /api/notifications/settings` now requires auth** — previously returned Apprise server URLs and API keys unauthenticated; added to `_PROTECTED_GET_PATHS`
+ - **`/ws/ctrl` WebSocket now enforces API key auth inline** — `before_request` middleware does not run for WebSocket routes, so write-capable control operations (light, video quality, video enable) were previously unauthenticated when `ANKERCTL_API_KEY` was set
+ - **Timelapse endpoints now have path traversal protection** — `GET /api/timelapse/<filename>` and `DELETE /api/timelapse/<filename>` now reject filenames containing `/`, `\`, or `..`, and additionally use `os.path.realpath()` to confirm the resolved path remains inside the captures directory
+ - **XSS fixes in frontend** — `statusBadge()` unknown-status fallback now uses `escapeHtml()`; country code dropdown options now use `escapeHtml()` on values; GCode log now uses `document.createTextNode()` instead of string `.append()` to prevent HTML injection
+ - Timelapse video URLs now use `encodeURIComponent()` instead of `escapeHtml()` (correct encoding for URL path segments)
+ - `sockets` variable in `ankersrv.js` promoted from implicit global to explicit `const`
+
+### Fixed
+ - `multiprocessing.Queue` replaced with `queue.Queue` in `web/lib/service.py` — the multiprocessing variant is incompatible with the threading context used by `ServiceManager`, causing stream consumers to silently hang
+ - **HomeAssistantService availability thread leak** — `_on_connect` now stops the existing heartbeat thread before spawning a new one on MQTT reconnects; previously each reconnect leaked a thread
+ - **`MqttQueue.worker_stop()` now calls `self._ha.stop()`** — Home Assistant service was not shut down when the MQTT service stopped, leaving the HA broker connection and heartbeat thread running
+ - `/ws/ctrl` handler now catches `ConnectionClosed`, `json.JSONDecodeError`, and `TypeError` (from `None` returned by `sock.receive()`) — previously any of these would crash the handler thread
+ - Video quality `/ws/ctrl` handler now correctly accepts `str` values (`"sd"`, `"hd"`) — was checking `isinstance(..., int)` but the frontend sends strings
+ - `JSON.parse()` in MQTT and PPPP WebSocket `onmessage` handlers wrapped in `try/catch` — a malformed message previously caused the handler to stop processing all subsequent messages
+ - Temperature inputs: `max` attribute is now set dynamically from printer model (M5: 260°C nozzle, M5C: 300°C nozzle, both 100°C bed) via Jinja2 template; JS clamp reads the `max` attribute instead of using a hardcoded value
+ - Temperature reset now uses `.val(0)` instead of `.attr("value", "0°C")` — the old form left a stale display value
+ - ct=1044 MQTT handler added to frontend: populates `#print-name` with the basename of `data.filePath` when a print starts
+ - Removed double `escapeHtml()` on `.textContent` assignments — `.textContent` is already safe, double-escaping caused `&amp;` to appear literally in the UI
+ - `.prop("required", true)` fix for CAPTCHA input — was `.prop("required")` (reads property instead of setting it), making the field not required in the browser
+ - `macro.html`: fixed `aria-controls="{{target}}"` (was hardcoded `"home"`); updated tooltip attributes to Bootstrap 5 (`data-bs-toggle`, `data-bs-placement`)
+ - Video resolution label now registers a `resize` event listener so the label updates correctly when the stream resolution changes mid-session
+ - Removed stale `//# sourceMappingURL=chart.umd.js.map` reference from `chart.umd.min.js` that caused a 404 console error
+ - Removed test GCode files (`test_cube_50mm.gcode`, `test_cube_5mm.gcode`) from the repository
+ - Updated `.gitignore`: added `.env.*`, `.claude/`, `.venv/`, `*.log`
+
 ### Added
  - Apprise notification integration with full web UI configuration
    - Event hooks for print start/finish/fail/progress and file uploads
@@ -21,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  - Test script for print control commands (`examples/test_print_control.py`)
  - Comprehensive CLAUDE.md guide for AI assistants and developers
 
-### Fixed
+### Fixed (prior)
  - **PPPP single-reader architecture** - Critical fix for "two readers one socket" bug that caused packet loss and unstable video/command connections
  - Thread-safety in PPPP AABB reply reader with locking to prevent `EOFError` crashes
  - UDP socket timeout leak in PPPP recv/send operations
