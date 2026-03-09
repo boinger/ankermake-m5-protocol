@@ -3114,6 +3114,14 @@ $(function () {
         });
     }
 
+    const filamentServiceCooldownBtn = document.getElementById("filament-service-cooldown-btn");
+    if (filamentServiceCooldownBtn) {
+        filamentServiceCooldownBtn.addEventListener("click", function () {
+            sendPrinterGCode("M104 S0\nM140 S0\nM106 S0");
+            filamentSetServiceStatus("Cooldown sent: nozzle, bed and fan set to 0.", "secondary");
+        });
+    }
+
     const filamentSwapStartBtn = document.getElementById("filament-swap-start-btn");
     if (filamentSwapStartBtn) {
         filamentSwapStartBtn.addEventListener("click", async function () {
