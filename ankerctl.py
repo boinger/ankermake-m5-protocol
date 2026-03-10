@@ -8,6 +8,7 @@ import platform
 import getpass
 import webbrowser
 import logging
+from datetime import datetime, timedelta
 
 log = logging.getLogger("main")
 
@@ -31,7 +32,7 @@ import libflagship.seccode
 from libflagship.util import enhex
 from cli.util import patch_gcode_time
 from libflagship.mqtt import MqttMsgType
-from libflagship.pppp import PktLanSearch, P2PCmdType, P2PSubCmdType, FileTransfer
+from libflagship.pppp import PktLanSearch, PktPunchPkt, P2PCmdType, P2PSubCmdType, FileTransfer
 from libflagship.ppppapi import FileUploadInfo, PPPPError
 
 
@@ -288,15 +289,40 @@ def pppp_lan_search(env):
 
     Works by broadcasting a LAN_SEARCH packet, and waiting for a reply.
     """
+    env.load_config(required=False)
     api = cli.pppp.pppp_open_broadcast(dumpfile=env.pppp_dump)
+    discovered = 0
     try:
         api.send(PktLanSearch())
-        resp = api.recv(timeout=1.0)
-    except TimeoutError:
+        deadline = datetime.now() + timedelta(seconds=1.0)
+        seen = set()
+        while datetime.now() < deadline:
+            try:
+                resp = api.recv(timeout=(deadline - datetime.now()).total_seconds())
+            except TimeoutError:
+                break
+
+            if not isinstance(resp, PktPunchPkt):
+                continue
+
+            duid = str(resp.duid)
+            ip_addr = str(api.addr[0])
+            if (duid, ip_addr) in seen:
+                continue
+
+            seen.add((duid, ip_addr))
+            discovered += 1
+            persisted = cli.pppp.persist_printer_ip(env.config, duid, ip_addr)
+            suffix = " [saved to default.json]" if persisted else ""
+            log.info(f"Printer [{duid}] is online at {ip_addr}{suffix}")
+    finally:
+        try:
+            api.sock.close()
+        except Exception:
+            pass
+
+    if not discovered:
         log.error("No printers responded within timeout. Are you connected to the same network as the printer?")
-    else:
-        if isinstance(resp, libflagship.pppp.PktPunchPkt):
-            log.info(f"Printer [{str(resp.duid)}] is online at {str(api.addr[0])}")
 
 
 @pppp.command("print-file")

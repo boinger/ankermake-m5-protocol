@@ -58,6 +58,42 @@ def pppp_open_broadcast(dumpfile=None):
     return api
 
 
+def persist_printer_ip(config, printer_duid, ip_addr, printer_index=None):
+    ip_addr = (ip_addr or "").strip()
+    if not ip_addr:
+        return False
+
+    try:
+        with config.open() as cfg:
+            printers = getattr(cfg, "printers", []) or []
+            if not printers:
+                return False
+
+            indexes = []
+            if printer_index is not None and 0 <= printer_index < len(printers):
+                if printers[printer_index].p2p_duid == printer_duid:
+                    indexes.append(printer_index)
+
+            if not indexes:
+                indexes = [
+                    idx for idx, saved_printer in enumerate(printers)
+                    if saved_printer.p2p_duid == printer_duid
+                ]
+
+            if not indexes:
+                return False
+
+        with config.modify() as cfg:
+            for idx in indexes:
+                if idx < len(cfg.printers):
+                    cfg.printers[idx].ip_addr = ip_addr
+
+        return True
+    except Exception as e:
+        log.warning(f"Could not persist printer IP: {e}")
+        return False
+
+
 def pppp_resolve_printer_ip(config, printer, printer_index, dumpfile=None, timeout=2.0):
     ip_addr = (printer.ip_addr or "").strip()
     if ip_addr:
@@ -76,12 +112,7 @@ def pppp_resolve_printer_ip(config, printer, printer_index, dumpfile=None, timeo
             if isinstance(resp, PktPunchPkt) and str(resp.duid) == printer.p2p_duid:
                 ip_addr = str(api.addr[0])
                 log.info(f"Discovered printer IP: {ip_addr}")
-                try:
-                    with config.modify() as cfg:
-                        if printer_index < len(cfg.printers):
-                            cfg.printers[printer_index].ip_addr = ip_addr
-                except Exception as e:
-                    log.warning(f"Could not persist printer IP: {e}")
+                persist_printer_ip(config, printer.p2p_duid, ip_addr, printer_index=printer_index)
                 return ip_addr
     finally:
         try:
