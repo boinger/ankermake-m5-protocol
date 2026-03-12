@@ -27,7 +27,8 @@ class TimelapseService:
 
     def __init__(self, config_manager, captures_dir=None):
         self._config_manager = config_manager
-        self._captures_dir = captures_dir or os.getenv("TIMELAPSE_CAPTURES_DIR", "/captures")
+        default_captures = os.path.join(str(config_manager.config_root), "captures")
+        self._captures_dir = captures_dir or os.getenv("TIMELAPSE_CAPTURES_DIR", default_captures)
         os.makedirs(self._captures_dir, exist_ok=True)
 
         self._lock = threading.Lock()
