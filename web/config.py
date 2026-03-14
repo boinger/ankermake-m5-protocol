@@ -18,6 +18,8 @@ Functions:
 Returns:
 - config_output: A formatted string containing the configuration information.
 """
+import json
+
 import libflagship.httpapi
 import libflagship.logincache
 
@@ -98,10 +100,22 @@ def config_import(login_file: object, config: object):
     - config_output: A formatted string containing the configuration information.
     """
     # get the login data
-    cache = libflagship.logincache.load(login_file.stream.read())["data"]
+    try:
+        cache = libflagship.logincache.load(login_file.stream.read())
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as err:
+        raise ConfigImportError(f"Failed to parse login file: {err}")
+
+    if not isinstance(cache, dict) or "data" not in cache:
+        raise ConfigImportError("Invalid login file: missing 'data' field")
 
     # load remaining configuration items from the server
-    cli.config.import_config_from_server(config, cache, False)
+    try:
+        cli.config.import_config_from_server(config, cache["data"], False)
+    except libflagship.httpapi.APIError as err:
+        raise ConfigImportError(
+            f"API request failed: {err} "
+            "(auth token might be expired: try 'ankerctl config login' to refresh)"
+        )
 
 
 def config_login(email: str, password: str, country: str, captcha_id: str, captcha_answer: str, config: object):
