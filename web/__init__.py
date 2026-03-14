@@ -381,16 +381,28 @@ def mqtt(sock):
 @sock.route("/ws/video")
 def video(sock):
     """
-    Handles receiving and sending messages on the 'videoqueue' stream service through websocket
+    Handles receiving and sending messages on the 'videoqueue' stream service through websocket.
+
+    Each connected client expresses intent to receive video by connecting here.
+    video_enabled is set True on connect and cleared when the last client disconnects,
+    so multiple tabs can independently enable/disable without interfering.
     """
     if not app.config["login"] or not app.config.get("video_supported") or app.config.get("unsupported_device"):
         return
 
     vq = app.svc.svcs.get("videoqueue")
-    if not vq or not getattr(vq, "video_enabled", False):
+    if not vq:
         return
-    for msg in app.svc.stream("videoqueue"):
-        sock.send(msg.data)
+
+    vq.set_video_enabled(True)
+    try:
+        for msg in app.svc.stream("videoqueue"):
+            sock.send(msg.data)
+    finally:
+        # Only disable video if no other clients are consuming the stream.
+        # refs > 0 means other /ws/video handlers are still inside stream() → borrow().
+        if app.svc.refs.get("videoqueue", 0) == 0:
+            vq.set_video_enabled(False)
 
 
 def _maybe_start_pppp_probe(reason="scheduled"):
@@ -505,12 +517,19 @@ def pppp_state(sock):
                 # Short retries for first MAX_RETRIES failures; long back-off once the printer is clearly offline
                 next_interval = RETRY_INTERVAL if probe_fail_count <= MAX_RETRIES else PROBE_INTERVAL
 
+                # Also probe when PPPP was recently connected but service stopped
+                # (e.g. last video client disconnected) so the badge refreshes.
+                pppp_went_dormant = pppp_was_connected and probe_result is None
+
                 should_probe = (
-                    (mqtt_stale or mqtt_recovered or probe_result is False)
+                    (mqtt_stale or mqtt_recovered or probe_result is False or pppp_went_dormant)
                     and (now - last_probe_time) > next_interval
                 )
                 if should_probe:
-                    reason = "MQTT recovered" if mqtt_recovered else ("MQTT stale" if mqtt_stale else "retry after fail")
+                    reason = ("PPPP service stopped" if pppp_went_dormant
+                              else "MQTT recovered" if mqtt_recovered
+                              else "MQTT stale" if mqtt_stale
+                              else "retry after fail")
                     _maybe_start_pppp_probe(reason)
 
                 if probe_result is True:
@@ -615,12 +634,6 @@ def ctrl(sock):
             vq = app.svc.svcs.get("videoqueue")
             if vq:
                 vq.set_video_enabled(msg["video_enabled"])
-                if msg["video_enabled"]:
-                    if vq.state == RunState.Stopped:
-                        vq.start()
-                else:
-                    if vq.state == RunState.Running:
-                        vq.stop()
 
 
 @app.get("/video")
