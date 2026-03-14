@@ -10,8 +10,8 @@ from tqdm import tqdm
 import cli.util
 
 from libflagship.pktdump import PacketWriter
-from libflagship.pppp import Duid, P2PCmdType, FileTransfer, PktLanSearch, PktPunchPkt
-from libflagship.ppppapi import AnkerPPPPApi, PPPPState
+from libflagship.pppp import Duid, P2PCmdType, FileTransfer, PktClose, PktLanSearch, PktPunchPkt
+from libflagship.ppppapi import AnkerPPPPApi, AnkerPPPPAsyncApi, PPPPState
 
 
 def _pppp_dumpfile(api, dumpfile):
@@ -59,11 +59,11 @@ def pppp_open_broadcast(dumpfile=None):
 
 
 def probe_printer_ip(printer, ip_addr, timeout=2.0):
-    """Try a short PPPP handshake against a specific IP."""
+    """Try a short PPPP handshake against a specific IP using the async web path."""
     if not ip_addr:
         return False
 
-    api = AnkerPPPPApi.open_lan(Duid.from_string(printer.p2p_duid), host=ip_addr)
+    api = AnkerPPPPAsyncApi.open_lan(Duid.from_string(printer.p2p_duid), host=ip_addr)
     try:
         deadline = datetime.now() + timedelta(seconds=timeout)
         api.connect_lan_search()
