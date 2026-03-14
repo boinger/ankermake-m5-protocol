@@ -1213,9 +1213,15 @@ def app_api_printer_autolevel():
 @app.get("/api/printer/z-offset")
 def app_api_printer_z_offset():
     with app.svc.borrow("mqttqueue") as mqtt:
+        state = mqtt.get_z_offset_state()
+        if not state.get("available"):
+            try:
+                state = mqtt.refresh_z_offset(timeout=Z_OFFSET_REFRESH_TIMEOUT_S)
+            except TimeoutError:
+                state = mqtt.get_z_offset_state()
         return {
             "status": "ok",
-            "z_offset": _serialize_z_offset_state(mqtt.get_z_offset_state()),
+            "z_offset": _serialize_z_offset_state(state),
         }
 
 

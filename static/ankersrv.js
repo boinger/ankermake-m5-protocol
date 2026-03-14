@@ -289,6 +289,13 @@ $(function () {
     const Z_OFFSET_STEP_MM = 0.01;
     let _zOffsetCurrentMm = null;
 
+    function setZOffsetControlsEnabled(enabled) {
+        $("#z-offset-set-btn").prop("disabled", !enabled);
+        $("#z-offset-minus-btn").prop("disabled", !enabled);
+        $("#z-offset-plus-btn").prop("disabled", !enabled);
+        $("#z-offset-target").prop("disabled", !enabled);
+    }
+
     function normalizeZOffsetMm(value) {
         const number = Number(value);
         if (!Number.isFinite(number)) {
@@ -345,11 +352,13 @@ $(function () {
         const mm = extractZOffsetMm(zOffset);
         if (mm === null) {
             currentEl.textContent = "unknown";
+            setZOffsetControlsEnabled(false);
             return;
         }
 
         _zOffsetCurrentMm = mm;
         currentEl.textContent = formatZOffsetMm(mm);
+        setZOffsetControlsEnabled(true);
 
         if (options.populateTarget || !String(targetEl.value || "").trim()) {
             targetEl.value = mm.toFixed(2);
@@ -500,6 +509,7 @@ $(function () {
             _updatePrintControlButtons(PRINT_STATE.IDLE);
             _zOffsetCurrentMm = null;
             $("#z-offset-current").text("unknown");
+            setZOffsetControlsEnabled(false);
         },
     });
 
@@ -1020,6 +1030,7 @@ $(function () {
     $("#z-offset-refresh-btn").on("click", async function () {
         const btn = $(this);
         btn.prop("disabled", true);
+        setZOffsetControlsEnabled(false);
         setZOffsetStatus("Reading live Z-offset from MQTT 1021...", "info");
         try {
             const data = await loadZOffset(true, {
@@ -1094,12 +1105,14 @@ $(function () {
         }
     });
 
+    setZOffsetControlsEnabled(false);
     setZOffsetStatus("Reading live Z-offset from MQTT 1021...", "info");
     loadZOffset(true, {
         populateTarget: true,
         statusMessage: true,
         statusCategory: "secondary",
     }).catch(function (err) {
+        setZOffsetControlsEnabled(false);
         setZOffsetStatus(`Initial read failed: ${err.message}`, "warning");
     });
 
