@@ -59,30 +59,23 @@ def pppp_open_broadcast(dumpfile=None):
 
 
 def probe_printer_ip(printer, ip_addr, timeout=2.0):
-    """Try a short PPPP handshake against a specific IP using the async web path."""
+    """Check if a printer is reachable at a specific IP via a lightweight LAN search.
+
+    Sends a directed PktLanSearch and waits for a PktPunchPkt response.
+    Does NOT establish a full PPPP session, so it won't interfere with
+    subsequent connection attempts.
+    """
     if not ip_addr:
         return False
 
     api = AnkerPPPPAsyncApi.open_lan(Duid.from_string(printer.p2p_duid), host=ip_addr)
     try:
-        deadline = datetime.now() + timedelta(seconds=timeout)
         api.connect_lan_search()
-
-        while api.state != PPPPState.Connected:
-            remaining = (deadline - datetime.now()).total_seconds()
-            if remaining <= 0:
-                return False
-            try:
-                msg = api.recv(timeout=remaining)
-                api.process(msg)
-            except (TimeoutError, ConnectionResetError, StopIteration):
-                return False
-
         try:
-            api.send(PktClose())
-        except Exception:
-            pass
-        return True
+            msg = api.recv(timeout=timeout)
+        except (TimeoutError, ConnectionResetError, StopIteration):
+            return False
+        return isinstance(msg, PktPunchPkt)
     finally:
         try:
             api.sock.close()
