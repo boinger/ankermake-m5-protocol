@@ -2,7 +2,9 @@
 
 Welcome! This repository contains `ankerctl`, a command-line interface and web UI for monitoring, controlling and interfacing with AnkerMake M5 3D printers.
 
-**NOTE:** This is our first major release and while we have tested thoroughly there may be bugs. If you encounter one please open a [Github Issue](https://github.com/Ankermgmt/ankermake-m5-protocol/issues/new/choose)
+**NOTE:** While we test changes carefully, bugs still happen. If you encounter one please open a [GitHub Issue](https://github.com/Django1982/ankermake-m5-protocol/issues/new/choose).
+
+This repository continues the work started by the original `Ankermgmt/ankermake-m5-protocol` team. Thanks to the original authors for the reverse engineering work and the foundation this fork builds on.
 
 The `ankerctl` program uses [`libflagship`](documentation/developer-docs/libflagship.md), a library for communicating with the numerous different protocols required for connecting to an AnkerMake M5 printer. The `libflagship` library is also maintained in this repo, under [`libflagship/`](libflagship/).
 
