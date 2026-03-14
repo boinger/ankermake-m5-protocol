@@ -290,36 +290,10 @@ def pppp_lan_search(env):
     Works by broadcasting a LAN_SEARCH packet, and waiting for a reply.
     """
     env.load_config(required=False)
-    api = cli.pppp.pppp_open_broadcast(dumpfile=env.pppp_dump)
-    discovered = 0
-    try:
-        api.send(PktLanSearch())
-        deadline = datetime.now() + timedelta(seconds=1.0)
-        seen = set()
-        while datetime.now() < deadline:
-            try:
-                resp = api.recv(timeout=(deadline - datetime.now()).total_seconds())
-            except TimeoutError:
-                break
-
-            if not isinstance(resp, PktPunchPkt):
-                continue
-
-            duid = str(resp.duid)
-            ip_addr = str(api.addr[0])
-            if (duid, ip_addr) in seen:
-                continue
-
-            seen.add((duid, ip_addr))
-            discovered += 1
-            persisted = cli.pppp.persist_printer_ip(env.config, duid, ip_addr)
-            suffix = " [saved to default.json]" if persisted else ""
-            log.info(f"Printer [{duid}] is online at {ip_addr}{suffix}")
-    finally:
-        try:
-            api.sock.close()
-        except Exception:
-            pass
+    discovered = cli.pppp.lan_search(env.config, timeout=1.0, dumpfile=env.pppp_dump)
+    for result in discovered:
+        suffix = " [saved to default.json]" if result["persisted"] else ""
+        log.info(f"Printer [{result['duid']}] is online at {result['ip_addr']}{suffix}")
 
     if not discovered:
         log.error("No printers responded within timeout. Are you connected to the same network as the printer?")

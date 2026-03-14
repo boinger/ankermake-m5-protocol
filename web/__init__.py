@@ -628,6 +628,42 @@ def app_api_printers():
         })
 
 
+@app.post("/api/printers/lan-search")
+def app_api_printers_lan_search():
+    """Broadcast LAN search, persist matching printer IPs, and report findings."""
+    config = app.config["config"]
+    with config.open() as cfg:
+        if not cfg or not getattr(cfg, "printers", None):
+            return jsonify({"error": "No printers configured"}), 400
+        active_index = app.config.get("printer_index", 0)
+        active_printer = cfg.printers[active_index] if active_index < len(cfg.printers) else None
+
+    discovered = cli.pppp.lan_search(config, timeout=1.0, dumpfile=app.config.get("pppp_dump"))
+    if not discovered:
+        return jsonify({
+            "error": "No printers responded within timeout. Are you connected to the same network as the printer?",
+        }), 404
+
+    active_result = None
+    if active_printer:
+        for result in discovered:
+            if result["duid"] == active_printer.p2p_duid:
+                active_result = result
+                break
+
+    return jsonify({
+        "status": "ok",
+        "discovered": discovered,
+        "saved_count": sum(1 for item in discovered if item["persisted"]),
+        "active_printer": {
+            "name": getattr(active_printer, "name", None),
+            "duid": getattr(active_printer, "p2p_duid", None),
+            "ip_addr": active_result["ip_addr"] if active_result else getattr(active_printer, "ip_addr", ""),
+            "updated": bool(active_result),
+        },
+    })
+
+
 @app.post("/api/printers/active")
 def app_api_set_active_printer():
     """Switch the active printer. Blocked when PRINTER_INDEX env var is set or during a print."""

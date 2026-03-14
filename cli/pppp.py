@@ -58,6 +58,74 @@ def pppp_open_broadcast(dumpfile=None):
     return api
 
 
+def probe_printer_ip(printer, ip_addr, timeout=2.0):
+    """Try a short PPPP handshake against a specific IP."""
+    if not ip_addr:
+        return False
+
+    api = AnkerPPPPApi.open_lan(Duid.from_string(printer.p2p_duid), host=ip_addr)
+    try:
+        deadline = datetime.now() + timedelta(seconds=timeout)
+        api.connect_lan_search()
+
+        while api.state != PPPPState.Connected:
+            remaining = (deadline - datetime.now()).total_seconds()
+            if remaining <= 0:
+                return False
+            try:
+                msg = api.recv(timeout=remaining)
+                api.process(msg)
+            except (TimeoutError, ConnectionResetError, StopIteration):
+                return False
+
+        try:
+            api.send(PktClose())
+        except Exception:
+            pass
+        return True
+    finally:
+        try:
+            api.sock.close()
+        except Exception:
+            pass
+
+
+def lan_search(config, timeout=1.0, dumpfile=None):
+    discovered = []
+    api = pppp_open_broadcast(dumpfile=dumpfile)
+    try:
+        api.send(PktLanSearch())
+        deadline = datetime.now() + timedelta(seconds=timeout)
+        seen = set()
+        while datetime.now() < deadline:
+            try:
+                resp = api.recv(timeout=(deadline - datetime.now()).total_seconds())
+            except TimeoutError:
+                break
+
+            if not isinstance(resp, PktPunchPkt):
+                continue
+
+            duid = str(resp.duid)
+            ip_addr = str(api.addr[0])
+            if (duid, ip_addr) in seen:
+                continue
+
+            seen.add((duid, ip_addr))
+            discovered.append({
+                "duid": duid,
+                "ip_addr": ip_addr,
+                "persisted": persist_printer_ip(config, duid, ip_addr),
+            })
+    finally:
+        try:
+            api.sock.close()
+        except Exception:
+            pass
+
+    return discovered
+
+
 def persist_printer_ip(config, printer_duid, ip_addr, printer_index=None):
     ip_addr = (ip_addr or "").strip()
     if not ip_addr:
@@ -97,30 +165,21 @@ def persist_printer_ip(config, printer_duid, ip_addr, printer_index=None):
 def pppp_resolve_printer_ip(config, printer, printer_index, dumpfile=None, timeout=2.0):
     ip_addr = (printer.ip_addr or "").strip()
     if ip_addr:
-        return ip_addr
+        log.info(f"Validating saved printer IP {ip_addr}")
+        if probe_printer_ip(printer, ip_addr, timeout=timeout):
+            return ip_addr
+        log.warning(f"Saved printer IP {ip_addr} is unreachable; attempting LAN search")
 
-    log.warning("Printer IP missing; attempting LAN search")
-    api = pppp_open_broadcast(dumpfile=dumpfile)
-    try:
-        api.send(PktLanSearch())
-        deadline = datetime.now() + timedelta(seconds=timeout)
-        while datetime.now() < deadline:
-            try:
-                resp = api.recv(timeout=(deadline - datetime.now()).total_seconds())
-            except TimeoutError:
-                break
-            if isinstance(resp, PktPunchPkt) and str(resp.duid) == printer.p2p_duid:
-                ip_addr = str(api.addr[0])
-                log.info(f"Discovered printer IP: {ip_addr}")
+    discovered = lan_search(config, timeout=timeout, dumpfile=dumpfile)
+    for result in discovered:
+        if result["duid"] == printer.p2p_duid:
+            ip_addr = result["ip_addr"]
+            log.info(f"Discovered printer IP: {ip_addr}")
+            if not result["persisted"]:
                 persist_printer_ip(config, printer.p2p_duid, ip_addr, printer_index=printer_index)
-                return ip_addr
-    finally:
-        try:
-            api.sock.close()
-        except Exception:
-            pass
+            return ip_addr
 
-    return ip_addr
+    return ""
 
 
 def _pppp_send_file_handshake(api, fui, reply_timeout=2.0):
