@@ -83,6 +83,9 @@ app.config['MAX_CONTENT_LENGTH'] = max_upload_mb * 1024 * 1024
 app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
 app.config['SESSION_COOKIE_HTTPONLY'] = True
 
+# Resolve log directory once: honour env var, fall back to None on bare metal
+_log_dir = os.getenv("ANKERCTL_LOG_DIR") or ("/logs" if os.path.isdir("/logs") else None)
+
 sock = Sock(app)
 
 PRINTERS_WITHOUT_CAMERA = ["V8110"]
@@ -1139,18 +1142,18 @@ def _read_bed_leveling_grid():
     }
 
     # Persist grid to log directory as a timestamped .bed file
-    log_dir = os.getenv("ANKERCTL_LOG_DIR", "/logs")
-    bed_dir = os.path.join(log_dir, "bed_leveling")
-    try:
-        from datetime import datetime
-        os.makedirs(bed_dir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        bed_path = os.path.join(bed_dir, f"{ts}.bed")
-        with open(bed_path, "w") as f:
-            json.dump(data, f)
-        log.info(f"bed-leveling: saved grid to {bed_path}")
-    except Exception as exc:
-        log.warning(f"bed-leveling: could not save grid: {exc}")
+    if _log_dir:
+        bed_dir = os.path.join(_log_dir, "bed_leveling")
+        try:
+            from datetime import datetime
+            os.makedirs(bed_dir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            bed_path = os.path.join(bed_dir, f"{ts}.bed")
+            with open(bed_path, "w") as f:
+                json.dump(data, f)
+            log.info(f"bed-leveling: saved grid to {bed_path}")
+        except Exception as exc:
+            log.warning(f"bed-leveling: could not save grid: {exc}")
 
     return data, None
 
@@ -1173,8 +1176,9 @@ def app_api_printer_bed_leveling():
 def app_api_printer_bed_leveling_last():
     """Return the most recently saved bed leveling grid from the log directory."""
     import glob
-    log_dir = os.getenv("ANKERCTL_LOG_DIR", "/logs")
-    bed_dir = os.path.join(log_dir, "bed_leveling")
+    if not _log_dir:
+        return {"error": "No log directory configured (set ANKERCTL_LOG_DIR)"}, 404
+    bed_dir = os.path.join(_log_dir, "bed_leveling")
     files = sorted(glob.glob(os.path.join(bed_dir, "*.bed")))
     if not files:
         return {"error": "No saved bed leveling data found"}, 404
@@ -1712,19 +1716,21 @@ if os.getenv("ANKERCTL_DEV_MODE", "false").lower() == "true":
     @app.get("/api/debug/logs")
     def app_api_debug_logs_list():
         import glob
-        log_dir = os.getenv("ANKERCTL_LOG_DIR", "/logs")
-        files = glob.glob(os.path.join(log_dir, "*.log"))
+        if not _log_dir:
+            return {"files": [], "warning": "No log directory configured (set ANKERCTL_LOG_DIR)"}
+        files = glob.glob(os.path.join(_log_dir, "*.log"))
         return {"files": sorted([os.path.basename(f) for f in files])}
 
     @app.get("/api/debug/logs/<filename>")
     def app_api_debug_logs_content(filename):
         import collections
-        log_dir = os.getenv("ANKERCTL_LOG_DIR", "/logs")
+        if not _log_dir:
+            return {"error": "No log directory configured (set ANKERCTL_LOG_DIR)"}, 404
         # basic path traversal protection
         if "/" in filename or "\\" in filename or ".." in filename:
             return {"error": "Invalid filename"}, 400
 
-        filepath = os.path.join(log_dir, filename)
+        filepath = os.path.join(_log_dir, filename)
         if not os.path.exists(filepath):
             return {"error": "File not found"}, 404
 
