@@ -75,6 +75,14 @@ if not app.secret_key:
 app.svc = ServiceManager()
 app.filament_swap_lock = threading.Lock()
 app.filament_swap_state = None
+app.pppp_probe_lock = threading.Lock()
+app.pppp_probe = {
+    "result": None,          # None=never probed, True=reachable, False=unreachable
+    "last_time": 0.0,        # time.time() of last completed probe
+    "fail_count": 0,         # consecutive failures since last success
+    "thread": None,          # current probe Thread or None
+    "client_count": 0,       # active WS clients watching pppp-state
+}
 
 # Configurable upload size limit (default: 2 GB)
 max_upload_mb = int(os.getenv("UPLOAD_MAX_MB", "2048"))
@@ -385,6 +393,39 @@ def video(sock):
         sock.send(msg.data)
 
 
+def _maybe_start_pppp_probe(reason="scheduled"):
+    """Spawn a shared probe thread if one isn't already running and clients are watching."""
+    import web.service.pppp as pppp_svc
+
+    probe = app.pppp_probe
+    with app.pppp_probe_lock:
+        thread = probe["thread"]
+        if thread is not None and thread.is_alive():
+            return  # already running
+        if probe["client_count"] <= 0:
+            return  # no clients watching, don't probe
+
+        config = app.config["config"]
+        idx = app.config["printer_index"]
+
+        def _run():
+            result = pppp_svc.probe_pppp(config, idx)
+            with app.pppp_probe_lock:
+                probe["result"] = result
+                probe["last_time"] = time.time()
+                if result:
+                    probe["fail_count"] = 0
+                else:
+                    probe["fail_count"] += 1
+                fail_count = probe["fail_count"]
+            log.info(f"PPPP probe result: {'ok' if result else 'fail'} (fail_count={fail_count})")
+
+        t = threading.Thread(target=_run, daemon=True)
+        probe["thread"] = t
+        t.start()
+        log.info(f"Starting PPPP probe ({reason}, fail_count={probe['fail_count']})")
+
+
 @sock.route("/ws/pppp-state")
 def pppp_state(sock):
     """
@@ -409,39 +450,24 @@ def pppp_state(sock):
 
     log.info("Starting PPPP state websocket handler")
 
-    import web.service.pppp as pppp_svc
-
     last_status = None
     last_keepalive = 0.0
     pppp_was_connected = False  # True once we see "connected"; resets on dormant
+    mqtt_was_stale = False      # tracks previous stale state to detect recovery
 
-    # Probe state
-    last_probe_time = 0.0
+    # Scheduling constants
     PROBE_INTERVAL = 60.0    # back-off interval after MAX_RETRIES failures
     RETRY_INTERVAL = 15.0    # interval between retries after a failure
     MQTT_STALE_AFTER = 30.0  # MQTT considered stale after 30s silence
     MAX_RETRIES = 2          # retries after first failure before switching to PROBE_INTERVAL
-    probe_result = None      # None=never probed, True=reachable, False=unreachable
-    probe_thread = None
-    probe_fail_count = 0     # consecutive failures since last success
-    mqtt_was_stale = False   # tracks previous stale state to detect recovery
 
-    def _run_probe():
-        nonlocal probe_result, last_probe_time, probe_fail_count
-        config = app.config["config"]
-        idx = app.config["printer_index"]
-        probe_result = pppp_svc.probe_pppp(config, idx)
-        last_probe_time = time.time()
-        if probe_result:
-            probe_fail_count = 0
-        else:
-            probe_fail_count += 1
-        log.info(f"PPPP probe result: {'ok' if probe_result else 'fail'} (fail_count={probe_fail_count})")
+    # Register this client and kick off an immediate probe if we're the first.
+    with app.pppp_probe_lock:
+        app.pppp_probe["client_count"] += 1
+        is_first = app.pppp_probe["client_count"] == 1
 
-    # Kick off an immediate probe so the badge reflects reality as soon as the WS connects.
-    probe_thread = threading.Thread(target=_run_probe, daemon=True)
-    probe_thread.start()
-    log.info("Starting initial PPPP probe on WS connect")
+    if is_first:
+        _maybe_start_pppp_probe("first client")
 
     try:
         while True:
@@ -453,8 +479,9 @@ def pppp_state(sock):
             if pppp is not None and bool(getattr(pppp, "connected", False)):
                 current_status = "connected"
                 pppp_was_connected = True
-                probe_result = None  # reset probe state when actually connected
-                probe_fail_count = 0
+                with app.pppp_probe_lock:
+                    app.pppp_probe["result"] = None
+                    app.pppp_probe["fail_count"] = 0
             else:
                 # Check MQTT staleness and detect recovery transition
                 mqtt_svc = app.svc.svcs.get("mqttqueue")
@@ -463,27 +490,28 @@ def pppp_state(sock):
 
                 mqtt_recovered = mqtt_was_stale and not mqtt_stale
                 if mqtt_recovered:
-                    # MQTT just came back — reset stale probe result and re-probe immediately
                     log.info("MQTT recovered — resetting PPPP probe state")
-                    probe_result = None
-                    probe_fail_count = 0
+                    with app.pppp_probe_lock:
+                        app.pppp_probe["result"] = None
+                        app.pppp_probe["fail_count"] = 0
                 mqtt_was_stale = mqtt_stale
 
-                probe_running = probe_thread is not None and probe_thread.is_alive()
+                # Snapshot shared probe state under lock
+                with app.pppp_probe_lock:
+                    probe_result = app.pppp_probe["result"]
+                    last_probe_time = app.pppp_probe["last_time"]
+                    probe_fail_count = app.pppp_probe["fail_count"]
 
                 # Short retries for first MAX_RETRIES failures; long back-off once the printer is clearly offline
                 next_interval = RETRY_INTERVAL if probe_fail_count <= MAX_RETRIES else PROBE_INTERVAL
 
                 should_probe = (
                     (mqtt_stale or mqtt_recovered or probe_result is False)
-                    and not probe_running
                     and (now - last_probe_time) > next_interval
                 )
                 if should_probe:
-                    probe_thread = threading.Thread(target=_run_probe, daemon=True)
-                    probe_thread.start()
                     reason = "MQTT recovered" if mqtt_recovered else ("MQTT stale" if mqtt_stale else "retry after fail")
-                    log.info(f"Starting PPPP probe ({reason}, fail_count={probe_fail_count})")
+                    _maybe_start_pppp_probe(reason)
 
                 if probe_result is True:
                     current_status = "connected"
@@ -511,7 +539,11 @@ def pppp_state(sock):
         log.warning(f"Error in PPPP state websocket handler: {e}")
         log.info("Stack trace:", exc_info=True)
     finally:
-        # No put() needed — we never called get().
+        try:
+            with app.pppp_probe_lock:
+                app.pppp_probe["client_count"] -= 1
+        except Exception:
+            pass
         log.info("PPPP state websocket handler ending")
 
 
