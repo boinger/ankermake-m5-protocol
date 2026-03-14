@@ -239,6 +239,36 @@
                                     </div>
                                 </div>
                             </div>
+                            <div class="col-12">
+                                <div class="card">
+                                    <div class="card-header fs-4 d-flex justify-content-between align-items-center">
+                                        <span>{{ macro.bi_icon("cpu") }} Printer Settings Snapshot</span>
+                                        <button id="printer-settings-refresh-btn" type="button" class="btn btn-sm btn-outline-primary">
+                                            {{ macro.bi_icon("arrow-clockwise") }} Refresh
+                                        </button>
+                                    </div>
+                                    <div class="card-body">
+                                        <div id="printer-settings-summary-status" class="mb-3 text-muted small">
+                                            Reading printer settings...
+                                        </div>
+                                        <div class="row g-3">
+                                            <div class="col-lg-5">
+                                                <div id="printer-settings-highlights" class="vstack gap-2">
+                                                    <div class="text-muted small">No settings loaded yet.</div>
+                                                </div>
+                                            </div>
+                                            <div class="col-lg-7">
+                                                <div id="printer-settings-groups" class="vstack gap-3">
+                                                    <div class="text-muted small">No grouped settings loaded yet.</div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <div class="form-text mt-3">
+                                            Read-only snapshot from standard printer reports such as <code>M503</code>, <code>M851</code> and <code>M290 R</code>.
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
                     </div>
 

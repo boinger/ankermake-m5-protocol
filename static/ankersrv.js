@@ -1027,6 +1027,107 @@ $(function () {
         }
     });
 
+    function titleCaseWords(text) {
+        return String(text || "")
+            .split("_")
+            .filter(Boolean)
+            .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+            .join(" ");
+    }
+
+    function renderPrinterSettingsSummary(data) {
+        const statusEl = document.getElementById("printer-settings-summary-status");
+        const highlightsEl = document.getElementById("printer-settings-highlights");
+        const groupsEl = document.getElementById("printer-settings-groups");
+        if (!statusEl || !highlightsEl || !groupsEl) {
+            return;
+        }
+
+        const reportErrors = Object.values(data.reports || {})
+            .filter((report) => report && report.available === false && report.error)
+            .map((report) => report.label || report.name);
+
+        const updated = new Date().toLocaleTimeString();
+        statusEl.className = `mb-3 small ${reportErrors.length ? "text-warning" : "text-muted"}`;
+        statusEl.textContent = reportErrors.length
+            ? `Updated ${updated}. Partial data only: ${reportErrors.join(", ")}.`
+            : `Updated ${updated}.`;
+
+        const highlights = Array.isArray(data.highlights) ? data.highlights : [];
+        if (!highlights.length) {
+            highlightsEl.innerHTML = '<div class="text-muted small">No stable highlights available.</div>';
+        } else {
+            highlightsEl.innerHTML = highlights.map((item) => `
+                <div class="border rounded p-2">
+                    <div class="text-muted small">${escapeHtml(item.label || item.command || "Value")}</div>
+                    <div class="fw-semibold">${escapeHtml(item.value || "unknown")}</div>
+                    <div class="small font-monospace text-body-secondary">${escapeHtml(item.command || "")}</div>
+                </div>
+            `).join("");
+        }
+
+        const groups = data.groups || {};
+        const groupHtml = Object.entries(groups)
+            .filter(([, entries]) => Array.isArray(entries) && entries.length)
+            .map(([name, entries]) => `
+                <div>
+                    <div class="text-muted small mb-1">${escapeHtml(titleCaseWords(name))}</div>
+                    <div class="vstack gap-1">
+                        ${entries.map((entry) => `
+                            <div class="border rounded px-2 py-1 font-monospace small">
+                                <span class="text-body-secondary me-2">${escapeHtml(entry.command || "")}</span>
+                                <span>${escapeHtml(entry.value || "")}</span>
+                            </div>
+                        `).join("")}
+                    </div>
+                </div>
+            `).join("");
+
+        groupsEl.innerHTML = groupHtml || '<div class="text-muted small">No grouped settings available.</div>';
+    }
+
+    async function loadPrinterSettingsSummary() {
+        const statusEl = document.getElementById("printer-settings-summary-status");
+        if (!statusEl) {
+            return;
+        }
+        statusEl.className = "mb-3 text-muted small";
+        statusEl.textContent = "Reading printer settings...";
+
+        const resp = await fetch("/api/printer/settings-summary");
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+        renderPrinterSettingsSummary(data);
+    }
+
+    $("#printer-settings-refresh-btn").on("click", async function () {
+        const btn = $(this);
+        btn.prop("disabled", true);
+        try {
+            await loadPrinterSettingsSummary();
+        } catch (err) {
+            const statusEl = document.getElementById("printer-settings-summary-status");
+            if (statusEl) {
+                statusEl.className = "mb-3 text-danger small";
+                statusEl.textContent = `Refresh failed: ${err.message}`;
+            }
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    if (document.getElementById("printer-settings-summary-status")) {
+        loadPrinterSettingsSummary().catch(function (err) {
+            const statusEl = document.getElementById("printer-settings-summary-status");
+            if (statusEl) {
+                statusEl.className = "mb-3 text-warning small";
+                statusEl.textContent = `Initial read failed: ${err.message}`;
+            }
+        });
+    }
+
     $("#z-offset-refresh-btn").on("click", async function () {
         const btn = $(this);
         btn.prop("disabled", true);
@@ -2507,6 +2608,64 @@ $(function () {
         }
 
         document.getElementById("dbg-refresh-state").addEventListener("click", dbgRefreshState);
+
+        // ------------------------------------------------------------------
+        // Printer Reports
+        // ------------------------------------------------------------------
+
+        async function dbgLoadPrinterReport(name, buttonEl = null) {
+            const metaEl = document.getElementById("dbg-printer-report-meta");
+            const contentEl = document.getElementById("dbg-printer-report-content");
+            if (!metaEl || !contentEl) {
+                return;
+            }
+
+            $(".dbg-printer-report-btn").removeClass("active");
+            if (buttonEl) {
+                $(buttonEl).addClass("active");
+            }
+
+            metaEl.textContent = `Loading ${name}...`;
+            contentEl.textContent = "Reading printer report...";
+
+            const resp = await fetch(`/api/debug/printer-report/${encodeURIComponent(name)}`);
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+
+            const reportText = data.cleaned_output || data.raw_output || "(empty report)";
+            contentEl.textContent = reportText;
+            metaEl.textContent = `${data.label || name} · ${data.gcode || ""} · ${data.chunk_count || 0} chunk(s)`;
+        }
+
+        $(".dbg-printer-report-btn").on("click", async function () {
+            const btn = this;
+            const reportName = btn.getAttribute("data-report");
+            try {
+                await dbgLoadPrinterReport(reportName, btn);
+            } catch (err) {
+                const metaEl = document.getElementById("dbg-printer-report-meta");
+                const contentEl = document.getElementById("dbg-printer-report-content");
+                if (metaEl) {
+                    metaEl.textContent = `Error loading ${reportName}`;
+                }
+                if (contentEl) {
+                    contentEl.textContent = String(err.message || err);
+                }
+            }
+        });
+
+        const dbgReportsTab = document.getElementById("dbg-reports-tab");
+        if (dbgReportsTab) {
+            dbgReportsTab.addEventListener("shown.bs.tab", function () {
+                const activeBtn = document.querySelector(".dbg-printer-report-btn.active");
+                const firstBtn = activeBtn || document.querySelector(".dbg-printer-report-btn[data-report='settings']");
+                if (firstBtn) {
+                    firstBtn.click();
+                }
+            });
+        }
 
         // Auto-refresh state while the inspector sub-tab is active
         const dbgInspectorTab = document.getElementById("dbg-inspector-tab");

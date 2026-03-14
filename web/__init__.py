@@ -1359,6 +1359,240 @@ def _read_bed_leveling_grid():
     return data, None
 
 
+_PRINTER_REPORT_COMMANDS = {
+    "firmware": {
+        "label": "Firmware / Capabilities",
+        "gcode": "M115",
+        "window": 2.0,
+        "drain": 2,
+    },
+    "settings": {
+        "label": "Stored Settings",
+        "gcode": "M503",
+        "window": 4.0,
+        "drain": 8,
+    },
+    "probe_offset": {
+        "label": "Probe Offset",
+        "gcode": "M851",
+        "window": 2.0,
+        "drain": 2,
+    },
+    "babystep": {
+        "label": "Babystep / Z-Offset",
+        "gcode": "M290 R",
+        "window": 2.0,
+        "drain": 2,
+    },
+    "bed_mesh": {
+        "label": "Bed Mesh",
+        "gcode": "M420 V",
+        "window": 4.0,
+        "drain": 6,
+    },
+}
+
+
+_SUMMARY_COMMAND_GROUPS = {
+    "leveling": ("M851", "M420", "M290"),
+    "motion": ("M201", "M203", "M204", "M205", "M206"),
+    "thermal": ("M301", "M145"),
+    "motors": ("M907",),
+    "tooling": ("M218",),
+}
+
+
+def _disconnect_mqtt_client(client):
+    mqtt_client = getattr(client, "_mqtt", None)
+    if mqtt_client is None:
+        return
+    try:
+        mqtt_client.disconnect()
+    except Exception:
+        pass
+
+
+def _clean_printer_report_output(raw_output):
+    import re
+
+    if not raw_output:
+        return ""
+
+    text = re.sub(r"\x1b\[[0-9;]*m", "", raw_output).replace("\r", "\n")
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped == "ok" or stripped.startswith("+ringbuf") or stripped == "+rin":
+            continue
+        if stripped.startswith("Unknown com") or (stripped.startswith("X:") and "Count" in stripped):
+            continue
+        lines.append(stripped)
+    return "\n".join(lines)
+
+
+def _collect_printer_gcode_output(client, gcode, *, window, drain):
+    import cli.mqtt as cli_mqtt
+
+    chunks = []
+    msgs = cli_mqtt.mqtt_gcode_dump(client, gcode, collect_window=window)
+    if not msgs:
+        raise TimeoutError(f"No response from printer for {gcode}")
+
+    for msg in msgs:
+        chunks.append(msg.get("resData", ""))
+
+    for probe_num in range(max(0, int(drain))):
+        time.sleep(0.3)
+        probe_msgs = cli_mqtt.mqtt_gcode_dump(client, "M114", collect_window=1.0)
+        if not probe_msgs:
+            break
+        chunk = probe_msgs[0].get("resData", "")
+        chunks.append(chunk)
+        ringbuf_pos = probe_msgs[0].get("resLen", 0)
+        if probe_num > 0 and ringbuf_pos <= 64 and "echo:" not in chunk and "z1:" not in chunk:
+            break
+
+    raw_output = "".join(chunks)
+    cleaned_output = _clean_printer_report_output(raw_output)
+    return {
+        "raw_output": raw_output,
+        "cleaned_output": cleaned_output,
+        "chunks": chunks,
+        "chunk_count": len(chunks),
+    }
+
+
+def _read_printer_report(name):
+    import cli.mqtt as cli_mqtt
+
+    if name not in _PRINTER_REPORT_COMMANDS:
+        raise KeyError(name)
+
+    report = _PRINTER_REPORT_COMMANDS[name]
+    config = app.config.get("config")
+    if not config:
+        raise ConnectionError("No configuration loaded")
+
+    printer_index = app.config.get("printer_index", 0)
+    insecure = app.config.get("insecure", False)
+
+    try:
+        client = cli_mqtt.mqtt_open(config, printer_index, insecure)
+        output = _collect_printer_gcode_output(
+            client,
+            report["gcode"],
+            window=report["window"],
+            drain=report["drain"],
+        )
+    finally:
+        if "client" in locals():
+            _disconnect_mqtt_client(client)
+
+    return {
+        "name": name,
+        "label": report["label"],
+        "gcode": report["gcode"],
+        **output,
+    }
+
+
+def _extract_report_commands(*texts):
+    import re
+
+    pattern = re.compile(
+        r"(M(?:92|145|201|203|204|205|206|218|290|301|420|425|665|851|907)\b[^\r\n+]*)"
+    )
+
+    commands = {}
+    for text in texts:
+        if not text:
+            continue
+        for match in pattern.findall(text):
+            command = match.strip()
+            prefix = command.split()[0]
+            commands.setdefault(prefix, command)
+    return commands
+
+
+def _build_command_group(commands, keys):
+    return [
+        {"command": key, "value": commands[key]}
+        for key in keys
+        if key in commands
+    ]
+
+
+def _read_printer_settings_summary():
+    with app.svc.borrow("mqttqueue") as mqtt:
+        live_z_offset = mqtt.get_z_offset_state()
+        if not live_z_offset.get("available"):
+            try:
+                live_z_offset = mqtt.refresh_z_offset(timeout=Z_OFFSET_REFRESH_TIMEOUT_S)
+            except TimeoutError:
+                live_z_offset = mqtt.get_z_offset_state()
+
+    reports = {}
+    for name in ("settings", "probe_offset", "babystep"):
+        try:
+            reports[name] = _read_printer_report(name)
+        except Exception as exc:
+            reports[name] = {"name": name, "error": str(exc)}
+
+    commands = _extract_report_commands(
+        reports.get("settings", {}).get("cleaned_output", ""),
+        reports.get("probe_offset", {}).get("cleaned_output", ""),
+        reports.get("babystep", {}).get("cleaned_output", ""),
+    )
+
+    highlights = []
+    if live_z_offset.get("available"):
+        highlights.append({
+            "label": "Live Z-Offset",
+            "command": "MQTT 1021",
+            "value": f"{live_z_offset['mm']:.2f} mm",
+        })
+    if "M851" in commands:
+        highlights.append({
+            "label": "Stored Probe Offset",
+            "command": "M851",
+            "value": commands["M851"],
+        })
+    if "M420" in commands:
+        highlights.append({
+            "label": "Bed Leveling",
+            "command": "M420",
+            "value": commands["M420"],
+        })
+    if "M301" in commands:
+        highlights.append({
+            "label": "Hotend PID",
+            "command": "M301",
+            "value": commands["M301"],
+        })
+
+    groups = {
+        name: _build_command_group(commands, keys)
+        for name, keys in _SUMMARY_COMMAND_GROUPS.items()
+    }
+
+    return {
+        "status": "ok",
+        "live_z_offset": _serialize_z_offset_state(live_z_offset),
+        "highlights": highlights,
+        "groups": groups,
+        "reports": {
+            key: {
+                "name": value.get("name", key),
+                "label": value.get("label"),
+                "gcode": value.get("gcode"),
+                "available": "error" not in value,
+                "error": value.get("error"),
+            }
+            for key, value in reports.items()
+        },
+    }
+
+
 @app.get("/api/printer/bed-leveling")
 def app_api_printer_bed_leveling():
     """Read the bilinear bed leveling grid from the printer.
@@ -1371,6 +1605,16 @@ def app_api_printer_bed_leveling():
     if err is not None:
         return err
     return data
+
+
+@app.get("/api/printer/settings-summary")
+def app_api_printer_settings_summary():
+    try:
+        return _read_printer_settings_summary()
+    except TimeoutError as exc:
+        return {"error": str(exc)}, 504
+    except ConnectionError as exc:
+        return {"error": str(exc)}, 503
 
 
 @app.get("/api/printer/bed-leveling/last")
@@ -1993,6 +2237,17 @@ if os.getenv("ANKERCTL_DEV_MODE", "false").lower() == "true":
             return err
         return data
 
+    @app.get("/api/debug/printer-report/<name>")
+    def app_api_debug_printer_report(name):
+        try:
+            return _read_printer_report(name)
+        except KeyError:
+            return {"error": f"Unknown printer report: {name}"}, 404
+        except TimeoutError as exc:
+            return {"error": str(exc)}, 504
+        except ConnectionError as exc:
+            return {"error": str(exc)}, 503
+
 
 @app.after_request
 def add_security_headers(response):
@@ -2016,6 +2271,7 @@ _PROTECTED_GET_PATHS = {
     "/api/notifications/settings",
     # Exposes printer serial numbers, IP addresses, and MAC addresses
     "/api/printers",
+    "/api/printer/settings-summary",
     # Exposes full print history (filenames, timestamps, durations)
     "/api/history",
 }

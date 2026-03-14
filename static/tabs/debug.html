@@ -13,6 +13,12 @@
                         </button>
                     </li>
                     <li class="nav-item" role="presentation">
+                        <button class="nav-link" id="dbg-reports-tab" data-bs-toggle="pill"
+                            data-bs-target="#dbg-reports" type="button" role="tab">
+                            {{ macro.bi_icon("terminal") }} Reports
+                        </button>
+                    </li>
+                    <li class="nav-item" role="presentation">
                         <button class="nav-link" id="dbg-controls-tab" data-bs-toggle="pill"
                             data-bs-target="#dbg-controls" type="button" role="tab">
                             {{ macro.bi_icon("toggles") }} Controls
@@ -51,6 +57,38 @@
                             </div>
                             <div class="card-body" id="dbg-state-tables">
                                 <span class="text-muted small">Loading...</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ====== Reports ====== -->
+                    <div class="tab-pane fade" id="dbg-reports" role="tabpanel">
+                        <div class="card border-secondary">
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <span>{{ macro.bi_icon("terminal") }} Printer Reports</span>
+                                <span class="text-muted small" id="dbg-printer-report-meta">Idle</span>
+                            </div>
+                            <div class="card-body">
+                                <div class="d-flex flex-wrap gap-2 mb-3" id="dbg-printer-report-buttons">
+                                    <button class="btn btn-sm btn-outline-secondary dbg-printer-report-btn" data-report="firmware">
+                                        {{ macro.bi_icon("cpu") }} M115
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-secondary dbg-printer-report-btn" data-report="settings">
+                                        {{ macro.bi_icon("sliders") }} M503
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-secondary dbg-printer-report-btn" data-report="probe_offset">
+                                        {{ macro.bi_icon("bullseye") }} M851
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-secondary dbg-printer-report-btn" data-report="babystep">
+                                        {{ macro.bi_icon("arrow-down-up") }} M290 R
+                                    </button>
+                                    <button class="btn btn-sm btn-outline-secondary dbg-printer-report-btn" data-report="bed_mesh">
+                                        {{ macro.bi_icon("grid-3x3") }} M420 V
+                                    </button>
+                                </div>
+                                <pre class="bg-dark text-light p-2 border rounded mb-0"
+                                    style="height: 360px; overflow: auto; font-size: 0.8em;"
+                                    id="dbg-printer-report-pre"><code id="dbg-printer-report-content">Select a report.</code></pre>
                             </div>
                         </div>
                     </div>
