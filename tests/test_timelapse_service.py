@@ -146,3 +146,80 @@ def test_timelapse_finish_and_fail_paths(monkeypatch, tmp_path):
 
     assert any(call[:4] == (str(tmp_path / "failed"), "failed.gcode", 2, "_partial") for call in finalize_calls if len(call) == 4)
     assert disable_calls == [True]
+
+
+def test_timelapse_start_capture_resumes_pending_session(monkeypatch, tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+    resume_dir = str(tmp_path / _IN_PROGRESS_SUBDIR / "resume")
+    os.makedirs(resume_dir, exist_ok=True)
+    svc._resume_dir = resume_dir
+    svc._resume_filename = "cube.gcode"
+    svc._resume_frame_count = 4
+
+    calls = []
+
+    class FakeThread:
+        def __init__(self, target=None, daemon=None, name=None):
+            self.target = target
+
+        def start(self):
+            calls.append("thread-start")
+
+    monkeypatch.setattr("web.service.timelapse.shutil.which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(TimelapseService, "_stop_capture_thread", lambda self: calls.append("stop-thread"))
+    monkeypatch.setattr(TimelapseService, "_cancel_finalize_timer", lambda self: calls.append("cancel-finalize"))
+    monkeypatch.setattr(TimelapseService, "_cancel_pending_resume", lambda self: calls.append("cancel-pending"))
+    monkeypatch.setattr(TimelapseService, "_enable_video_for_timelapse", lambda self: calls.append("enable-video"))
+    monkeypatch.setattr("web.service.timelapse.threading.Thread", FakeThread)
+
+    svc.start_capture("cube.gcode")
+
+    assert svc._current_dir == resume_dir
+    assert svc._current_filename == "cube.gcode"
+    assert svc._frame_count == 4
+    assert svc._resume_dir is None
+    assert calls == ["stop-thread", "cancel-finalize", "enable-video", "thread-start"]
+
+
+def test_timelapse_take_snapshot_retries_and_restores_light(monkeypatch, tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+    svc._light_mode = "snapshot"
+    svc._current_dir = str(tmp_path / "capture")
+    svc._current_filename = "cube.gcode"
+    svc._frame_count = 0
+    os.makedirs(svc._current_dir, exist_ok=True)
+
+    light_calls = []
+    videoqueue = SimpleNamespace(saved_light_state=False, api_light_state=lambda state: light_calls.append(state))
+    old_svc = getattr(__import__("web").app, "svc")
+    old_api_key = __import__("web").app.config.get("api_key")
+    __import__("web").app.svc = SimpleNamespace(svcs={"videoqueue": videoqueue})
+    __import__("web").app.config["api_key"] = "secret-key"
+
+    runs = []
+
+    def fake_run(cmd, stdout=None, stderr=None, timeout=None):
+        runs.append(cmd)
+        frame_path = cmd[-1]
+        if len(runs) == 2:
+            with open(frame_path, "wb") as fh:
+                fh.write(b"jpg")
+            return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=1)
+
+    try:
+        monkeypatch.setattr(TimelapseService, "_await_video_frame", lambda self: True)
+        monkeypatch.setattr("web.service.timelapse.subprocess.run", fake_run)
+        monkeypatch.setattr("web.service.timelapse.time.sleep", lambda seconds: None)
+        svc._take_snapshot()
+    finally:
+        __import__("web").app.svc = old_svc
+        __import__("web").app.config["api_key"] = old_api_key
+
+    assert len(runs) == 2
+    assert any("apikey=secret-key" in part for part in runs[0] if isinstance(part, str))
+    assert light_calls == [True, False]
+    assert svc._frame_count == 1
+    assert os.path.exists(os.path.join(svc._current_dir, "frame_00000.jpg"))

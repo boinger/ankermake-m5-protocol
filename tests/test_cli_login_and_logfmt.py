@@ -25,6 +25,31 @@ class FakeConfigManager:
         return _Ctx()
 
 
+def test_config_decode_and_import_cli(monkeypatch, tmp_path):
+    runner = CliRunner()
+    fake_config = FakeConfigManager(SimpleNamespace(account=None))
+    imported = []
+
+    monkeypatch.setattr("ankerctl.cli.config.configmgr", lambda: fake_config)
+    monkeypatch.setattr("ankerctl.cli.logfmt.setup_logging", lambda level, log_dir=None: None)
+    monkeypatch.setattr("ankerctl.libflagship.logincache.load", lambda raw: {"data": {"auth_token": "abc", "email": "user@example.com"}})
+    monkeypatch.setattr(
+        "ankerctl.cli.config.import_config_from_server",
+        lambda config, cache, insecure: imported.append((config, cache, insecure)),
+    )
+
+    login_file = tmp_path / "login.json"
+    login_file.write_text('{"data": {"auth_token": "abc"}}')
+
+    decode = runner.invoke(ankerctl.main, ["config", "decode", str(login_file)])
+    imported_cli = runner.invoke(ankerctl.main, ["config", "import", str(login_file)])
+
+    assert decode.exit_code == 0
+    assert '"auth_token": "abc"' in decode.output
+    assert imported_cli.exit_code == 0
+    assert imported == [(fake_config, {"auth_token": "abc", "email": "user@example.com"}, False)]
+
+
 def test_find_login_file_detects_darwin_and_windows_locations(tmp_path, monkeypatch):
     darwin_file = tmp_path / "login.json"
     darwin_file.write_text("darwin")
@@ -104,3 +129,36 @@ def test_color_formatter_and_exit_handler_behaviour(monkeypatch):
         raise AssertionError("critical log should exit")
 
     assert click.unstyle(formatted) == "[W] careful"
+
+
+def test_setup_logging_creates_log_files_and_startup_entries(monkeypatch, tmp_path):
+    from cli import logfmt
+
+    root = logging.getLogger()
+    old_handlers = root.handlers[:]
+    old_level = root.level
+    root.handlers = []
+
+    def fake_basic_config(*, handlers=None, level=None):
+        root.handlers = list(handlers or [])
+        root.setLevel(level)
+
+    monkeypatch.setattr(logging, "basicConfig", fake_basic_config)
+
+    try:
+        logger = logfmt.setup_logging(level=logging.INFO, log_dir=str(tmp_path))
+        logger.info("root-message")
+        logging.getLogger("mqtt").info("mqtt-message")
+    finally:
+        for handler in root.handlers:
+            try:
+                handler.close()
+            except Exception:
+                pass
+        root.handlers = old_handlers
+        root.setLevel(old_level)
+
+    assert (tmp_path / "ankerctl.log").exists()
+    assert (tmp_path / "mqtt.log").exists()
+    assert "log initialized" in (tmp_path / "ankerctl.log").read_text()
+    assert "mqtt-message" in (tmp_path / "mqtt.log").read_text()
