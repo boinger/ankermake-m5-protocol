@@ -398,8 +398,8 @@ class MqttQueue(Service):
         return None
 
     def _forward_to_ha(self, payload):
-        """Forward relevant MQTT data to the Home Assistant service."""
-        if not isinstance(payload, dict) or not self._ha.enabled:
+        """Update cached MQTT state and forward relevant data to Home Assistant."""
+        if not isinstance(payload, dict):
             return
 
         command_type = payload.get("commandType")
@@ -470,7 +470,7 @@ class MqttQueue(Service):
             elif progress is not None and progress >= 100:
                 ha_updates["print_status"] = "complete"
 
-        if ha_updates:
+        if ha_updates and self._ha.enabled:
             self._ha.update_state(**ha_updates)
 
     def _handle_notification(self, payload):

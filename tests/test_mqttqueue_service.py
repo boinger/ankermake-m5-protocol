@@ -61,6 +61,22 @@ def test_forward_to_ha_updates_temperatures_and_progress():
     assert any(update.get("print_progress") == 50 and update.get("print_filename") == "cube.gcode" for update in ha_updates)
 
 
+def test_forward_to_ha_keeps_local_temperature_state_when_ha_is_disabled():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    queue._ha.enabled = False
+
+    queue._forward_to_ha({"commandType": 1003, "currentTemp": 21500, "targetTemp": 22000})
+    queue._forward_to_ha({"commandType": 1004, "currentTemp": 6500, "targetTemp": 7000})
+
+    assert queue.nozzle_temp == 215
+    assert queue.nozzle_temp_target == 220
+    assert queue._bed_temp == 65
+    assert queue._bed_temp_target == 70
+    assert ha_updates == []
+
+
 def test_emit_progress_respects_bucket_interval():
     global ha_updates, history_calls, timelapse_calls, events
     ha_updates, history_calls, timelapse_calls, events = [], [], [], []
