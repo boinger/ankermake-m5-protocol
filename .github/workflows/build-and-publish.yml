@@ -11,8 +11,9 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  docker-and-source:
+  docker-publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
@@ -57,6 +58,17 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  source-archives:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Create source release archives
         run: |
@@ -152,7 +164,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     needs:
-      - docker-and-source
+      - source-archives
       - native-bundles
     permissions:
       contents: write
