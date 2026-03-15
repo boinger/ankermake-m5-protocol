@@ -75,6 +75,9 @@ def default_filament_service_config():
     return {
         "allow_legacy_swap": os.getenv("FILAMENT_ALLOW_LEGACY_SWAP", "false").lower() in ("true", "1", "yes"),
         "manual_swap_preheat_temp_c": int(os.getenv("FILAMENT_MANUAL_SWAP_PREHEAT_TEMP_C", 140)),
+        "quick_move_length_mm": float(os.getenv("FILAMENT_QUICK_MOVE_LENGTH_MM", 40)),
+        "swap_unload_length_mm": float(os.getenv("FILAMENT_SWAP_UNLOAD_LENGTH_MM", 40)),
+        "swap_load_length_mm": float(os.getenv("FILAMENT_SWAP_LOAD_LENGTH_MM", 40)),
     }
 
 

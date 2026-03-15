@@ -160,6 +160,7 @@ def test_filament_service_preheat_and_move_routes(tmp_path):
 
     try:
         profile = app.filaments.create({"name": "PLA", "nozzle_temp": 220})
+        app.config["config"].cfg.filament_service["quick_move_length_mm"] = 12.5
         preheat = client.post(
             "/api/filaments/service/preheat",
             json={"profile_id": profile["id"]},
@@ -168,6 +169,11 @@ def test_filament_service_preheat_and_move_routes(tmp_path):
         move = client.post(
             "/api/filaments/service/move",
             json={"profile_id": profile["id"], "action": "retract", "length_mm": 25},
+            headers={"X-Api-Key": API_KEY},
+        )
+        move_default = client.post(
+            "/api/filaments/service/move",
+            json={"profile_id": profile["id"], "action": "extrude"},
             headers={"X-Api-Key": API_KEY},
         )
         invalid = client.post(
@@ -180,9 +186,11 @@ def test_filament_service_preheat_and_move_routes(tmp_path):
 
     assert preheat.status_code == 200
     assert move.status_code == 200
+    assert move_default.status_code == 200
     assert invalid.status_code == 400
     assert sent[0] == "M104 S220"
     assert "G1 E-25 F2700" in sent[1]
+    assert "G1 E12.5 F900" in sent[2]
 
 
 def test_filament_swap_routes_follow_manual_guided_flow_by_default(tmp_path):
@@ -234,6 +242,8 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
     client = app.test_client()
     old_values, old_svc, old_filaments, old_swap = _install_state(tmp_path, mqtt)
     app.config["config"].cfg.filament_service["allow_legacy_swap"] = True
+    app.config["config"].cfg.filament_service["swap_unload_length_mm"] = 55
+    app.config["config"].cfg.filament_service["swap_load_length_mm"] = 65
     background_calls = []
 
     def fake_start_background(target, token):
@@ -250,8 +260,6 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
             json={
                 "unload_profile_id": unload["id"],
                 "load_profile_id": load["id"],
-                "unload_length_mm": 40,
-                "load_length_mm": 55,
             },
             headers={"X-Api-Key": API_KEY},
         )
@@ -284,5 +292,5 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
     assert confirmed.get_json()["pending"] is True
     assert cancelled.status_code == 200
     assert cancelled.get_json()["pending"] is False
-    assert "G1 E-40 F240" in sent[0]
-    assert "G1 E55 F240" in sent[1]
+    assert "G1 E-55 F240" in sent[0]
+    assert "G1 E65 F240" in sent[1]

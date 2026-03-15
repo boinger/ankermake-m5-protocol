@@ -171,6 +171,8 @@ def _resolve_filament_service_settings(cfg):
 FILAMENT_SERVICE_DEFAULT_LENGTH_MM = 40.0
 FILAMENT_SERVICE_MAX_LENGTH_MM = 300.0
 FILAMENT_SERVICE_FEEDRATE_MM_MIN = 240
+FILAMENT_SERVICE_EXTRUDE_FEEDRATE_MM_MIN = 900
+FILAMENT_SERVICE_RETRACT_FEEDRATE_MM_MIN = 2700
 FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN = 240
 FILAMENT_SERVICE_SWAP_LOAD_FEEDRATE_MM_MIN = 240
 FILAMENT_SERVICE_HEAT_TIMEOUT_S = 240.0
@@ -212,6 +214,23 @@ def _filament_service_length(payload, key):
     return round(length_mm, 2)
 
 
+def _filament_service_setting_length(settings, key, default=FILAMENT_SERVICE_DEFAULT_LENGTH_MM):
+    try:
+        return _filament_service_length({key: settings.get(key, default)}, key)
+    except (AttributeError, ValueError):
+        return round(default, 2)
+
+
+def _normalize_filament_service_settings(settings):
+    normalized = dict(settings or {})
+    normalized["allow_legacy_swap"] = bool(normalized.get("allow_legacy_swap"))
+    normalized["manual_swap_preheat_temp_c"] = _filament_service_manual_swap_temp(normalized)
+    normalized["quick_move_length_mm"] = _filament_service_setting_length(normalized, "quick_move_length_mm")
+    normalized["swap_unload_length_mm"] = _filament_service_setting_length(normalized, "swap_unload_length_mm")
+    normalized["swap_load_length_mm"] = _filament_service_setting_length(normalized, "swap_load_length_mm")
+    return normalized
+
+
 def _filament_service_profile(payload, key):
     try:
         profile_id = int(payload.get(key))
@@ -228,26 +247,7 @@ def _format_extrusion_mm(length_mm):
     return text or "0"
 
 
-def _filament_service_feedrate_mm_min(profile, action):
-    defaults_mm_s = {
-        "extrude": 10.0,
-        "retract": 35.0,
-        "unload": 35.0,
-        "load": 10.0,
-    }
-    try:
-        feedrate_mm_s = float(profile.get("retract_speed", defaults_mm_s[action]))
-    except (AttributeError, TypeError, ValueError, KeyError):
-        feedrate_mm_s = defaults_mm_s.get(action, 10.0)
-
-    if action in {"extrude", "load"}:
-        feedrate_mm_s = max(5.0, min(feedrate_mm_s, 15.0))
-    else:
-        feedrate_mm_s = max(15.0, min(feedrate_mm_s, 60.0))
-    return int(round(feedrate_mm_s * 60))
-
-
-def _build_filament_move_gcode(temp_c, delta_mm, feedrate_mm_min=FILAMENT_SERVICE_FEEDRATE_MM_MIN):
+def _build_filament_move_gcode(delta_mm, feedrate_mm_min=FILAMENT_SERVICE_FEEDRATE_MM_MIN):
     extrusion = _format_extrusion_mm(delta_mm)
     return "\n".join([
         "M83",
@@ -376,7 +376,6 @@ def _run_legacy_swap_unload(token):
 
     try:
         gcode = _build_filament_move_gcode(
-            state["unload_temp_c"],
             -state["unload_length_mm"],
             feedrate_mm_min=state.get("unload_feedrate_mm_min", FILAMENT_SERVICE_FEEDRATE_MM_MIN),
         )
@@ -428,7 +427,6 @@ def _run_legacy_swap_load(token):
 
     try:
         gcode = _build_filament_move_gcode(
-            state["load_temp_c"],
             state["load_length_mm"],
             feedrate_mm_min=state.get("load_feedrate_mm_min", FILAMENT_SERVICE_FEEDRATE_MM_MIN),
         )
@@ -1412,9 +1410,7 @@ def app_api_settings_filament_service():
     with config.open() as cfg:
         if not cfg:
             return {"error": "No printers configured"}, 400
-        filament_config = _resolve_filament_service_settings(cfg)
-
-    filament_config["manual_swap_preheat_temp_c"] = _filament_service_manual_swap_temp(filament_config)
+        filament_config = _normalize_filament_service_settings(_resolve_filament_service_settings(cfg))
     return {"filament_service": filament_config}
 
 
@@ -1436,6 +1432,12 @@ def app_api_settings_filament_service_update():
             fs_payload["manual_swap_preheat_temp_c"] = int(fs_payload["manual_swap_preheat_temp_c"])
         except (TypeError, ValueError):
             return {"error": "manual_swap_preheat_temp_c must be an integer"}, 400
+    for key in ("quick_move_length_mm", "swap_unload_length_mm", "swap_load_length_mm"):
+        if key in fs_payload:
+            try:
+                fs_payload[key] = _filament_service_length({key: fs_payload[key]}, key)
+            except ValueError as exc:
+                return {"error": str(exc)}, 400
 
     with config.modify() as cfg:
         if not cfg:
@@ -1443,7 +1445,7 @@ def app_api_settings_filament_service_update():
 
         current = _resolve_filament_service_settings(cfg)
         new_config = _deep_update(current, fs_payload)
-        new_config["manual_swap_preheat_temp_c"] = _filament_service_manual_swap_temp(new_config)
+        new_config = _normalize_filament_service_settings(new_config)
         cfg.filament_service = new_config
 
     return {"status": "ok", "filament_service": new_config}
@@ -2131,14 +2133,24 @@ def app_api_filament_service_move():
         return {"error": "action must be 'extrude' or 'retract'"}, 400
 
     try:
+        config = app.config["config"]
+        with config.open() as cfg:
+            filament_settings = _normalize_filament_service_settings(
+                _resolve_filament_service_settings(cfg) if cfg else cli.model.default_filament_service_config()
+            )
         profile = _filament_service_profile(payload, "profile_id")
         temp_c = _filament_service_temp(profile)
-        length_mm = _filament_service_length(payload, "length_mm")
+        raw_length_mm = payload.get("length_mm", filament_settings["quick_move_length_mm"])
+        length_mm = _filament_service_length({"length_mm": raw_length_mm}, "length_mm")
         delta_mm = length_mm if action == "extrude" else -length_mm
+        feedrate_mm_min = (
+            FILAMENT_SERVICE_EXTRUDE_FEEDRATE_MM_MIN
+            if action == "extrude"
+            else FILAMENT_SERVICE_RETRACT_FEEDRATE_MM_MIN
+        )
         gcode = _build_filament_move_gcode(
-            temp_c,
             delta_mm,
-            feedrate_mm_min=_filament_service_feedrate_mm_min(profile, action),
+            feedrate_mm_min=feedrate_mm_min,
         )
         with app.svc.borrow("mqttqueue") as mqtt:
             _assert_filament_service_ready(mqtt)
@@ -2179,7 +2191,7 @@ def app_api_filament_service_swap_start():
     with config.open() as cfg:
         if not cfg:
             return {"error": "No printers configured"}, 400
-        filament_settings = _resolve_filament_service_settings(cfg)
+        filament_settings = _normalize_filament_service_settings(_resolve_filament_service_settings(cfg))
 
     allow_legacy_swap = bool(filament_settings.get("allow_legacy_swap"))
     manual_swap_preheat_temp_c = _filament_service_manual_swap_temp(filament_settings)
@@ -2199,8 +2211,14 @@ def app_api_filament_service_swap_start():
             load_profile = _filament_service_profile(payload, "load_profile_id")
             unload_temp_c = _filament_service_temp(unload_profile)
             load_temp_c = _filament_service_temp(load_profile)
-            unload_length_mm = _filament_service_length(payload, "unload_length_mm")
-            load_length_mm = _filament_service_length(payload, "load_length_mm")
+            unload_length_mm = _filament_service_length(
+                {"unload_length_mm": payload.get("unload_length_mm", filament_settings["swap_unload_length_mm"])},
+                "unload_length_mm",
+            )
+            load_length_mm = _filament_service_length(
+                {"load_length_mm": payload.get("load_length_mm", filament_settings["swap_load_length_mm"])},
+                "load_length_mm",
+            )
         except ValueError as exc:
             return {"error": str(exc)}, 400
         except LookupError as exc:

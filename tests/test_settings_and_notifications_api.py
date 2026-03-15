@@ -216,7 +216,15 @@ def test_filament_service_settings_endpoints_persist_manual_and_legacy_modes():
         got = client.get("/api/settings/filament-service", headers={"X-Api-Key": "secret-key-123456"})
         updated = client.post(
             "/api/settings/filament-service",
-            json={"filament_service": {"allow_legacy_swap": True, "manual_swap_preheat_temp_c": 149}},
+            json={
+                "filament_service": {
+                    "allow_legacy_swap": True,
+                    "manual_swap_preheat_temp_c": 149,
+                    "quick_move_length_mm": 12.5,
+                    "swap_unload_length_mm": 55,
+                    "swap_load_length_mm": 65,
+                }
+            },
             headers={"X-Api-Key": "secret-key-123456"},
         )
         clamped = client.post(
@@ -230,10 +238,17 @@ def test_filament_service_settings_endpoints_persist_manual_and_legacy_modes():
     assert unauthorized.status_code == 401
     assert got.status_code == 200
     assert got.get_json()["filament_service"]["allow_legacy_swap"] is False
+    assert got.get_json()["filament_service"]["quick_move_length_mm"] == 40
     assert updated.status_code == 200
     assert updated.get_json()["filament_service"]["allow_legacy_swap"] is True
     assert updated.get_json()["filament_service"]["manual_swap_preheat_temp_c"] == 149
+    assert updated.get_json()["filament_service"]["quick_move_length_mm"] == 12.5
+    assert updated.get_json()["filament_service"]["swap_unload_length_mm"] == 55
+    assert updated.get_json()["filament_service"]["swap_load_length_mm"] == 65
     assert clamped.status_code == 200
     assert cfg.filament_service["allow_legacy_swap"] is True
+    assert cfg.filament_service["quick_move_length_mm"] == 12.5
+    assert cfg.filament_service["swap_unload_length_mm"] == 55
+    assert cfg.filament_service["swap_load_length_mm"] == 65
     assert cfg.filament_service["manual_swap_preheat_temp_c"] == 150
     assert clamped.get_json()["filament_service"]["manual_swap_preheat_temp_c"] == 150

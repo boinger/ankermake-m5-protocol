@@ -11,7 +11,6 @@ from web import (
     _deep_update,
     _env_int,
     _extract_report_commands,
-    _filament_service_feedrate_mm_min,
     _filament_service_length,
     _filament_service_temp,
     _format_signed_mm,
@@ -82,9 +81,7 @@ def test_deep_update_merges_nested_dicts():
 def test_filament_and_z_offset_helpers():
     assert _filament_service_temp({"nozzle_temp_other_layer": "220"}) == 220
     assert _filament_service_length({"length_mm": "42.345"}, "length_mm") == 42.34
-    assert _filament_service_feedrate_mm_min({"retract_speed": 45}, "extrude") == 900
-    assert _filament_service_feedrate_mm_min({"retract_speed": 45}, "retract") == 2700
-    assert _build_filament_move_gcode(220, 12.5).splitlines()[1] == "G1 E12.5 F240"
+    assert _build_filament_move_gcode(12.5).splitlines()[1] == "G1 E12.5 F240"
     assert _z_offset_steps_to_mm(37) == 0.37
     assert _z_offset_mm_to_steps(0.37) == 37
     assert _format_signed_mm(-0.12) == "-0.12"

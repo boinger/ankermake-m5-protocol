@@ -3260,6 +3260,9 @@ $(function () {
     let _filamentSwapSettings = {
         allow_legacy_swap: false,
         manual_swap_preheat_temp_c: 140,
+        quick_move_length_mm: 40,
+        swap_unload_length_mm: 40,
+        swap_load_length_mm: 40,
     };
 
     function filamentFindProfileById(profileId) {
@@ -3341,10 +3344,16 @@ $(function () {
                 return;
             }
             _filamentSwapSettings = data.filament_service || _filamentSwapSettings;
+            const quickLengthEl = document.getElementById("filament-service-length");
             const tempEl = document.getElementById("filament-manual-swap-temp");
             const legacyEl = document.getElementById("filament-allow-legacy-swap");
+            const unloadLengthEl = document.getElementById("filament-swap-unload-length");
+            const loadLengthEl = document.getElementById("filament-swap-load-length");
+            if (quickLengthEl) quickLengthEl.value = _filamentSwapSettings.quick_move_length_mm ?? 40;
             if (tempEl) tempEl.value = _filamentSwapSettings.manual_swap_preheat_temp_c ?? 140;
             if (legacyEl) legacyEl.checked = !!_filamentSwapSettings.allow_legacy_swap;
+            if (unloadLengthEl) unloadLengthEl.value = _filamentSwapSettings.swap_unload_length_mm ?? 40;
+            if (loadLengthEl) loadLengthEl.value = _filamentSwapSettings.swap_load_length_mm ?? 40;
             filamentUpdateSwapModeUi();
             filamentSetSwapSettingsStatus(
                 _filamentSwapSettings.allow_legacy_swap
@@ -3706,23 +3715,32 @@ $(function () {
     const filamentSaveSwapSettingsBtn = document.getElementById("filament-save-swap-settings-btn");
     if (filamentSaveSwapSettingsBtn) {
         filamentSaveSwapSettingsBtn.addEventListener("click", async function () {
+            const quickLengthEl = document.getElementById("filament-service-length");
             const tempEl = document.getElementById("filament-manual-swap-temp");
             const legacyEl = document.getElementById("filament-allow-legacy-swap");
+            const unloadLengthEl = document.getElementById("filament-swap-unload-length");
+            const loadLengthEl = document.getElementById("filament-swap-load-length");
             const tempC = parseInt(tempEl?.value || "140", 10);
             try {
                 const res = await filamentServiceRequest("/api/settings/filament-service", {
                     filament_service: {
                         allow_legacy_swap: !!legacyEl?.checked,
                         manual_swap_preheat_temp_c: tempC,
+                        quick_move_length_mm: parseFloat(quickLengthEl?.value || "40"),
+                        swap_unload_length_mm: parseFloat(unloadLengthEl?.value || "40"),
+                        swap_load_length_mm: parseFloat(loadLengthEl?.value || "40"),
                     },
                 });
                 _filamentSwapSettings = res.filament_service || _filamentSwapSettings;
+                if (quickLengthEl) quickLengthEl.value = _filamentSwapSettings.quick_move_length_mm ?? 40;
                 if (tempEl) tempEl.value = _filamentSwapSettings.manual_swap_preheat_temp_c ?? 140;
                 if (legacyEl) legacyEl.checked = !!_filamentSwapSettings.allow_legacy_swap;
+                if (unloadLengthEl) unloadLengthEl.value = _filamentSwapSettings.swap_unload_length_mm ?? 40;
+                if (loadLengthEl) loadLengthEl.value = _filamentSwapSettings.swap_load_length_mm ?? 40;
                 filamentUpdateSwapModeUi();
-                filamentSetSwapSettingsStatus("Swap settings saved.", "success");
+                filamentSetSwapSettingsStatus("Filament service settings saved.", "success");
             } catch (err) {
-                filamentSetSwapSettingsStatus(`Failed to save swap settings: ${err.message}`, "danger");
+                filamentSetSwapSettingsStatus(`Failed to save filament service settings: ${err.message}`, "danger");
             }
         });
     }
