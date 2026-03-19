@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from cli.model import Account, Config, Printer
-from libflagship.pppp import P2PCmdType
+from libflagship.pppp import P2PCmdType, P2PSubCmdType
 from libflagship.ppppapi import PPPPError, PPPPState
 from web import app
 from web.lib.service import RunState, ServiceRestartSignal
@@ -84,6 +84,11 @@ def test_video_queue_worker_start_stop_and_handler(monkeypatch):
     queue.saved_video_profile_id = "hd"
     queue.last_frame_at = None
     queue._live_started_at = None
+    queue._last_live_refresh_at = 0.0
+    queue._last_no_frame_log_at = 0.0
+    queue._last_start_live_at = 0.0
+    queue._live_active = False
+    queue.api_id = None
     queue._enable_generation = 0
     notifications = []
     queue.notify = lambda msg: notifications.append(msg)
@@ -120,7 +125,7 @@ def test_video_queue_worker_start_stop_and_handler(monkeypatch):
         app.svc = old_svc
 
     assert queue.pppp is None
-    assert queue.api_id == id(fake_api)
+    assert queue.api_id is None
     assert puts == ["pppp"]
     assert len(commands) == 4
     assert queue.last_frame_at == 123.0
@@ -134,6 +139,10 @@ def test_video_queue_worker_run_detects_disconnect_api_swap_and_stall(monkeypatc
     queue.idle = lambda timeout=None: None
     queue._live_started_at = 100.0
     queue.last_frame_at = None
+    queue._last_live_refresh_at = 0.0
+    queue._last_no_frame_log_at = 0.0
+    queue._last_start_live_at = 0.0
+    queue._live_active = False
     queue.api_id = 1
     queue.pppp = SimpleNamespace(connected=False, _api=object())
 
@@ -147,9 +156,15 @@ def test_video_queue_worker_run_detects_disconnect_api_swap_and_stall(monkeypatc
     api = object()
     queue.pppp = SimpleNamespace(connected=True, _api=api)
     queue.api_id = id(api)
-    monkeypatch.setattr("web.service.video.time.monotonic", lambda: 100.0 + _STALL_TIMEOUT + 1)
-    with pytest.raises(ServiceRestartSignal, match="No video frames received"):
-        queue.worker_run(timeout=0.1)
+    commands = []
+    queue.pppp.api_command = lambda command, data=None: commands.append((command, data))
+    times = iter([100.0 + _STALL_TIMEOUT + 1, 100.0 + _STALL_TIMEOUT + 1, 100.0 + _STALL_TIMEOUT + 1])
+    monkeypatch.setattr("web.service.video.time.monotonic", lambda: next(times))
+    monkeypatch.setattr("web.service.video.time.sleep", lambda seconds: None)
+    queue.worker_run(timeout=0.1)
+
+    assert commands[0][0] == P2PSubCmdType.CLOSE_LIVE
+    assert commands[1][0] == P2PSubCmdType.START_LIVE
 
 
 def test_video_queue_api_profile_and_mode_validation():
