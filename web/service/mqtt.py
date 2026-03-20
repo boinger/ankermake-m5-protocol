@@ -44,7 +44,10 @@ class MqttQueue(Service):
         # Home Assistant MQTT Discovery
         printer_sn = None
         printer_name = None
+        self._control_username = None
         with app.config["config"].open() as cfg:
+            if cfg and getattr(cfg, "account", None):
+                self._control_username = getattr(cfg.account, "email", None)
             if cfg and cfg.printers:
                 printer = cfg.printers[self.printer_index]
                 printer_sn = getattr(printer, "sn", None)
@@ -80,6 +83,7 @@ class MqttQueue(Service):
 
     def _reset_print_state(self):
         self._print_active = False
+        self._last_state_value = 0
         self._print_started_at = None
         self._last_progress = None
         self._last_progress_bucket = None
@@ -97,6 +101,10 @@ class MqttQueue(Service):
     @property
     def is_printing(self):
         return self._print_active
+
+    @property
+    def is_preparing_print(self):
+        return self._last_state_value == 8 and not self._print_active
 
     @property
     def history(self):
@@ -505,6 +513,8 @@ class MqttQueue(Service):
         # --- commandType 1000: printer state machine transitions ---
         if command_type == 1000:
             value = payload.get("value")
+            was_preparing_print = self.is_preparing_print
+            self._last_state_value = value
             if value == 1 and not self._print_active:
                 # Print is now running
                 self._print_active = True
@@ -524,10 +534,33 @@ class MqttQueue(Service):
                     EVENT_PRINT_STARTED,
                     self._build_payload(payload, 0),
                 )
-            elif value == 0 and self._print_active:
-                if self._stop_requested:
-                    # Print was cancelled via stop command
-                    log.info(f"History: print cancelled (ct 1000 value=0 after stop), filename={self._last_filename!r}")
+            elif value == 0 and (self._print_active or was_preparing_print):
+                if self._print_active:
+                    if self._stop_requested:
+                        # Print was cancelled via stop command
+                        log.info(f"History: print cancelled (ct 1000 value=0 after stop), filename={self._last_filename!r}")
+                        self._history.record_fail(filename=self._last_filename, reason="cancelled", task_id=self._last_task_id)
+                        self._timelapse.fail_capture()
+                        self._ha.update_state(print_status="failed")
+                        self._send_event(
+                            EVENT_PRINT_FAILED,
+                            self._build_payload(payload, self._last_progress or 0, failure_reason="cancelled"),
+                        )
+                        self._failure_sent = True
+                    else:
+                        # Print ended normally
+                        log.info(f"History: print finished (ct 1000 value=0), filename={self._last_filename!r}")
+                        self._history.record_finish(filename=self._last_filename, task_id=self._last_task_id)
+                        self._timelapse.finish_capture(final=True)
+                        self._ha.update_state(print_status="complete", print_progress=100)
+                        self._send_event(
+                            EVENT_PRINT_FINISHED,
+                            self._build_payload(payload, 100),
+                            include_image=True,
+                        )
+                elif self._stop_requested:
+                    # Pre-print preparation was cancelled before the print became active.
+                    log.info(f"History: pre-print preparation cancelled, filename={self._last_filename!r}")
                     self._history.record_fail(filename=self._last_filename, reason="cancelled", task_id=self._last_task_id)
                     self._timelapse.fail_capture()
                     self._ha.update_state(print_status="failed")
@@ -537,21 +570,18 @@ class MqttQueue(Service):
                     )
                     self._failure_sent = True
                 else:
-                    # Print ended normally
-                    log.info(f"History: print finished (ct 1000 value=0), filename={self._last_filename!r}")
-                    self._history.record_finish(filename=self._last_filename, task_id=self._last_task_id)
-                    self._timelapse.finish_capture(final=True)
-                    self._ha.update_state(print_status="complete", print_progress=100)
-                    self._send_event(
-                        EVENT_PRINT_FINISHED,
-                        self._build_payload(payload, 100),
-                        include_image=True,
-                    )
+                    log.info("Pre-print preparation ended without an active print; resetting state")
                 self._reset_print_state()
             elif value == 8 and self._print_active:
-                # Print aborted directly on the printer (user cancelled via touchscreen)
-                log.info(f"History: print aborted on printer (ct 1000 value=8), filename={self._last_filename!r}")
-                self._history.record_fail(filename=self._last_filename, reason="aborted", task_id=self._last_task_id)
+                log.info(
+                    "History: print aborted (ct 1000 value=8), filename=%r",
+                    self._last_filename,
+                )
+                self._history.record_fail(
+                    filename=self._last_filename,
+                    reason="aborted",
+                    task_id=self._last_task_id,
+                )
                 self._timelapse.fail_capture()
                 self._ha.update_state(print_status="failed")
                 self._send_event(
@@ -741,6 +771,8 @@ class MqttQueue(Service):
         return {
             "print": {
                 "active": self._print_active,
+                "state": self._last_state_value,
+                "preparing": self.is_preparing_print,
                 "started_at": self._print_started_at,
                 "last_progress": self._last_progress,
                 "last_filename": self._last_filename,
@@ -858,11 +890,25 @@ class MqttQueue(Service):
             time.sleep(0.1)
 
     def send_print_control(self, value):
-        if int(value) == 4:
+        value = int(value)
+        if value in (0, 4):
             self._stop_requested = True
+        prepare_cancel = value in (0, 4) and self.is_preparing_print
+        if value == 4 and self.is_preparing_print:
+            log.info("Mapping print stop value=4 to value=0 during pre-print preparation")
+            value = 0
+        if prepare_cancel:
+            nested_data = {"value": value}
+            if self._control_username:
+                nested_data["userName"] = self._control_username
+            log.info("Sending app-style nested print control during pre-print preparation")
+            self.client.command({
+                "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
+                "data": nested_data,
+            })
         cmd = {
             "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
-            "value": int(value)
+            "value": value
         }
         self.client.command(cmd)
 

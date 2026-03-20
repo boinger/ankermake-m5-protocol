@@ -23,9 +23,18 @@ $(function () {
         $("[data-clipboard-src]").each(function (i, elm) {
             $(elm).on("click", function () {
                 const src = $(elm).attr("data-clipboard-src");
-                const value = $(src).text();
+                if (!/^#[A-Za-z][A-Za-z0-9_:.~-]*$/.test(src || "")) {
+                    console.warn("Ignored invalid clipboard source");
+                    return;
+                }
+                const source = document.getElementById(src.slice(1));
+                if (!source) {
+                    console.warn("Clipboard source not found");
+                    return;
+                }
+                const value = source.textContent || "";
                 navigator.clipboard.writeText(value);
-                console.log(`Copied ${value} to clipboard`);
+                console.log("Copied value to clipboard");
             });
         });
     } else {
@@ -1240,6 +1249,7 @@ $(function () {
     }
 
     const PRINT_CONTROL = {
+        PREPARE_CANCEL: 0,
         PAUSE: 2,
         RESUME: 3,
         STOP: 4,
@@ -1254,7 +1264,8 @@ $(function () {
         _currentPrintState = state;
         const printing = state === PRINT_STATE.PRINTING;
         const paused = state === PRINT_STATE.PAUSED;
-        const active = printing || paused;
+        const preparing = state === PRINT_STATE.CALIBRATING;
+        const active = printing || paused || preparing;
         $("#print-pause").toggleClass("d-none", !printing);
         $("#print-resume").toggleClass("d-none", !paused);
         $("#print-stop").toggleClass("d-none", !active);
@@ -2059,9 +2070,15 @@ $(function () {
         return false;
     });
     $("#print-stop").on("click", function () {
-        if (confirm("Are you sure you want to stop the print? This will also turn off heaters.")) {
-            sendPrintControl(PRINT_CONTROL.STOP);
-            sendPrinterGCode("M104 S0\nM140 S0\nM106 S0");
+        const preparing = _currentPrintState === PRINT_STATE.CALIBRATING;
+        const confirmText = preparing
+            ? "Cancel the pending print before it starts?"
+            : "Are you sure you want to stop the print? This will also turn off heaters.";
+        if (confirm(confirmText)) {
+            sendPrintControl(preparing ? PRINT_CONTROL.PREPARE_CANCEL : PRINT_CONTROL.STOP);
+            if (!preparing) {
+                sendPrinterGCode("M104 S0\nM140 S0\nM106 S0");
+            }
             _updatePrintControlButtons(PRINT_STATE.IDLE);
         }
         return false;

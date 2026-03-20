@@ -35,6 +35,7 @@ def _queue():
     queue._nozzle_temp_target = None
     queue._bed_temp = None
     queue._bed_temp_target = None
+    queue._control_username = "tester@example.com"
     queue._debug_log_payloads = False
     queue._reset_print_state()
     return queue
@@ -132,6 +133,105 @@ def test_handle_notification_start_finish_and_failure_paths(monkeypatch):
         "print_progress",
         "print_failed",
     ]
+
+
+def test_handle_notification_aborts_active_print_on_value_8(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    monkeypatch.setattr("web.service.mqtt.time.monotonic", lambda: 100.0)
+
+    queue._handle_notification({"commandType": 1044, "filePath": "/tmp/active.gcode"})
+    queue._handle_notification({"commandType": 1000, "value": 1})
+    queue._handle_notification({"commandType": 1000, "value": 8})
+
+    assert history_calls == [
+        ("start", ("active.gcode",), {"task_id": None}),
+        ("fail", (), {"filename": "active.gcode", "reason": "aborted", "task_id": None}),
+    ]
+    assert timelapse_calls == [("start", "active.gcode"), ("fail",)]
+    assert events[-1][0] == "print_failed"
+    assert events[-1][2] is False
+    assert events[-1][1]["filename"] == "active.gcode"
+    assert events[-1][1]["reason"] == "aborted"
+    assert queue.get_state()["print"]["state"] == 0
+
+
+def test_send_print_control_maps_stop_to_restart_during_prepare_state():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    sent = []
+    queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
+    queue._handle_notification({"commandType": 1000, "value": 8})
+
+    queue.send_print_control(4)
+
+    assert sent == [
+        {"commandType": 1008, "data": {"value": 0, "userName": "tester@example.com"}},
+        {"commandType": 1008, "value": 0},
+    ]
+    assert queue._stop_requested is True
+
+
+def test_1044_captures_filename_without_marking_prepare_state():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._handle_notification({"commandType": 1044, "filePath": "/tmp/prepare.gcode"})
+
+    state = queue.get_state()["print"]
+    assert state["preparing"] is False
+    assert state["active"] is False
+    assert state["last_filename"] == "prepare.gcode"
+
+
+def test_value_8_marks_prepare_state_before_print_start():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._handle_notification({"commandType": 1000, "value": 8})
+
+    state = queue.get_state()["print"]
+    assert state["preparing"] is True
+    assert state["active"] is False
+
+
+def test_upload_only_idle_transition_does_not_create_fake_print_history():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._handle_notification({"commandType": 1044, "filePath": "/tmp/upload-only.gcode"})
+    queue._handle_notification({"commandType": 1000, "value": 0})
+
+    assert history_calls == []
+    assert timelapse_calls == []
+    assert events == []
+    assert queue.get_state()["print"]["preparing"] is False
+
+
+def test_prepare_state_cancels_on_value_zero_after_stop():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 0,
+        "name": "warmup.gcode",
+        "task_id": "task-1",
+    })
+    queue._handle_notification({"commandType": 1000, "value": 8})
+    queue._stop_requested = True
+    queue._handle_notification({"commandType": 1000, "value": 0})
+
+    assert history_calls == [("fail", (), {"filename": "warmup.gcode", "reason": "cancelled", "task_id": "task-1"})]
+    assert timelapse_calls == [("fail",)]
+    assert events == [("print_failed", {"filename": "warmup.gcode", "percent": 0, "elapsed_seconds": "", "remaining_seconds": "", "duration_seconds": "", "elapsed": "", "remaining": "", "duration": "", "reason": "cancelled"}, False)]
+    assert queue.get_state()["print"]["preparing"] is False
 
 
 def test_build_payload_get_state_and_simulate_event(monkeypatch):
