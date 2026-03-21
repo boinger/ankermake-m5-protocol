@@ -132,9 +132,10 @@ def _restore_app_state(module, old_values, old_svc):
 
 def test_mqtt_and_upload_websockets_forward_stream_messages():
     sock = FakeSock()
+    mqtt_name = web_module.mqtt_service_name(0)
     services = FakeServices(
         streams={
-            "mqttqueue": [{"hello": "mqtt"}],
+            mqtt_name: [{"hello": "mqtt"}],
             "filetransfer": [{"status": "done"}],
         }
     )
@@ -217,10 +218,11 @@ def test_pppp_probe_helper_and_state_websocket_emit_status(monkeypatch):
         if thread is not None:
             thread.join(timeout=1.0)
         sock = FakeSock(close_after_sends=1)
+        mqtt_name = web_module.mqtt_service_name(0)
         services = FakeServices(
             svcs={
                 "pppp": SimpleNamespace(connected=False, wanted=False),
-                "mqttqueue": SimpleNamespace(last_message_time=0.0),
+                mqtt_name: SimpleNamespace(last_message_time=0.0),
             }
         )
         web_module.app.svc = services
@@ -264,10 +266,11 @@ def test_dev_debug_routes_register_and_dispatch(monkeypatch):
             wanted=True,
             restart=lambda: restart_calls.append(True),
         )
+        mqtt_name = web_module.mqtt_service_name(0)
         services = SimpleNamespace(
-            borrow=lambda name: _borrow_debug(mqtt if name == "mqttqueue" else None),
-            svcs={"mqttqueue": mqtt, "pppp": pppp},
-            refs={"mqttqueue": 1, "pppp": 0},
+            borrow=lambda name: _borrow_debug(mqtt if name == mqtt_name else None),
+            svcs={mqtt_name: mqtt, "pppp": pppp},
+            refs={mqtt_name: 1, "pppp": 0},
         )
         app.svc = services
         app.config["api_key"] = API_KEY

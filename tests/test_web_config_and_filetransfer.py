@@ -158,9 +158,9 @@ def test_filetransfer_send_file_happy_path(monkeypatch):
         app.config["pppp_dump"] = old_pppp_dump
 
     assert send_calls and send_calls[0][0] == "cube.gcode"
-    assert any(item.get("status") == "start" for item in notifications if isinstance(item, dict))
+    assert any(item.get("status") == "start" and item.get("start_print") is True for item in notifications if isinstance(item, dict))
     assert any(item.get("layer_count") == 12 for item in notifications if isinstance(item, dict))
-    assert any(item.get("status") == "done" for item in notifications if isinstance(item, dict))
+    assert any(item.get("status") == "done" and item.get("start_print") is True for item in notifications if isinstance(item, dict))
     assert any(item.get("print_started") is True for item in notifications if isinstance(item, dict))
     assert any(item.get("stopped") is True for item in notifications if isinstance(item, dict))
     assert apprise_calls == [("cube.gcode", 11, True)]

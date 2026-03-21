@@ -231,19 +231,27 @@ $(function () {
             $(this.badge).removeClass("text-bg-warning text-bg-success text-bg-secondary").addClass("text-bg-danger");
             console.log(`${this.name} close`);
             this.is_open = false;
+            const old = this.ws;
+            this.ws = null;
             if (this.autoReconnect) {
                 setTimeout(() => this.connect(), this.reconnect);
             }
             if (this.close)
-                this.close(this.ws);
+                this.close(old);
         }
 
         _error() {
             console.log(`${this.name} error`);
-            this.ws.close();
+            const old = this.ws;
+            this.ws = null;
             this.is_open = false;
+            try {
+                if (old) {
+                    old.close();
+                }
+            } catch (_) {}
             if (this.error)
-                this.error(this.ws);
+                this.error(old);
         }
 
         _message(event) {
@@ -664,7 +672,17 @@ $(function () {
                 setUploadProgress(100);
                 const total = data.size || uploadSize;
                 const sizeText = total ? ` (${formatBytes(total)})` : "";
-                uploadMeta.text(uploadName ? `Upload complete: ${uploadName}${sizeText}` : "Upload complete");
+                if (data.start_print === true) {
+                    uploadMeta.text(uploadName ? `Upload complete, printer preparing: ${uploadName}${sizeText}` : "Upload complete, printer preparing");
+                    if (_currentPrintState === PRINT_STATE.IDLE) {
+                        if (uploadName) {
+                            $("#print-name").text(uploadName);
+                        }
+                        _updatePrintControlButtons(PRINT_STATE.CALIBRATING);
+                    }
+                } else {
+                    uploadMeta.text(uploadName ? `Upload complete: ${uploadName}${sizeText}` : "Upload complete");
+                }
             } else if (data.status === "error") {
                 uploadBar.addClass("bg-danger");
                 setUploadProgress(0);
@@ -699,7 +717,9 @@ $(function () {
         if (videoEnabled) {
             $("#vplayer").show();
             $(this).html('<i class="bi bi-camera-video-off"></i> Disable Video');
-            sockets.ctrl.ws.send(JSON.stringify({ video_enabled: true }));
+            if (sockets.ctrl.ws) {
+                sockets.ctrl.ws.send(JSON.stringify({ video_enabled: true }));
+            }
             sockets.video.autoReconnect = true;
             if (!sockets.video.ws) {
                 sockets.video.connect();
@@ -707,10 +727,14 @@ $(function () {
         } else {
             $("#vplayer").hide();
             $(this).html('<i class="bi bi-camera-video"></i> Enable Video');
-            sockets.ctrl.ws.send(JSON.stringify({ video_enabled: false }));
+            if (sockets.ctrl.ws) {
+                sockets.ctrl.ws.send(JSON.stringify({ video_enabled: false }));
+            }
             sockets.video.autoReconnect = false;
             if (sockets.video.ws) {
-                sockets.video.ws.close();
+                try {
+                    sockets.video.ws.close();
+                } catch (_) {}
                 sockets.video.ws = null;
             }
             $("#video-resolution").text("Current: -");
@@ -1256,7 +1280,7 @@ $(function () {
     };
 
     // ct=1000 state values
-    const PRINT_STATE = { IDLE: 0, PRINTING: 1, PAUSED: 2, CALIBRATING: 8 };
+    const PRINT_STATE = { IDLE: 0, PRINTING: 1, PAUSED: 2, CALIBRATING: 8, STOPPING: 9 };
 
     let _currentPrintState = PRINT_STATE.IDLE;
 
@@ -1264,11 +1288,15 @@ $(function () {
         _currentPrintState = state;
         const printing = state === PRINT_STATE.PRINTING;
         const paused = state === PRINT_STATE.PAUSED;
+        const stopping = state === PRINT_STATE.STOPPING;
         const preparing = state === PRINT_STATE.CALIBRATING;
-        const active = printing || paused || preparing;
-        $("#print-pause").toggleClass("d-none", !printing);
-        $("#print-resume").toggleClass("d-none", !paused);
+        const active = printing || paused || preparing || stopping;
+        $("#print-pause").toggleClass("d-none", !printing || stopping);
+        $("#print-resume").toggleClass("d-none", !paused || stopping);
         $("#print-stop").toggleClass("d-none", !active);
+        $("#print-pause").prop("disabled", stopping);
+        $("#print-resume").prop("disabled", stopping);
+        $("#print-stop").prop("disabled", stopping);
     }
 
     const getStepDist = () => $('input[name="step-dist"]:checked').val() || "1";
@@ -2070,6 +2098,9 @@ $(function () {
         return false;
     });
     $("#print-stop").on("click", function () {
+        if (_currentPrintState === PRINT_STATE.STOPPING) {
+            return false;
+        }
         const preparing = _currentPrintState === PRINT_STATE.CALIBRATING;
         const confirmText = preparing
             ? "Cancel the pending print before it starts?"
@@ -2079,7 +2110,7 @@ $(function () {
             if (!preparing) {
                 sendPrinterGCode("M104 S0\nM140 S0\nM106 S0");
             }
-            _updatePrintControlButtons(PRINT_STATE.IDLE);
+            _updatePrintControlButtons(PRINT_STATE.STOPPING);
         }
         return false;
     });

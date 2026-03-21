@@ -1,36 +1,52 @@
 #!/usr/bin/env python3
-"""Probe undocumented PPPP commands on AnkerMake M5 printer.
+"""Probe PPPP JSON commands on the AnkerMake M5 printer.
 
 Reconnects for each command since the printer drops the connection
-after receiving unknown command types.
+after receiving some commands or malformed payloads.
 """
 
 import json
+import logging
 import sys
 import time
-import logging
 
 sys.path.insert(0, ".")
 
 import cli.config
 import cli.pppp
+from libflagship.mqtt import MqttMsgType
 from libflagship.pppp import P2PCmdType
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-PROBE_CMDS = [
-    (0x0462, "APP_CMD_GET_ADMIN_PWD"),
-    (0x0463, "APP_CMD_GET_WIFI_PWD"),
-    (0x0464, "APP_CMD_GET_EXCEPTION_LOG"),
-    (0x0461, "APP_CMD_GET_UPDATE_STATUS"),
-    (0x0465, "APP_CMD_GET_NEWVESION"),
-    (0x044c, "APP_CMD_GET_ASEKEY"),
-    (0x044e, "APP_CMD_SDINFO"),
-    (0x044f, "APP_CMD_CAMERA_INFO"),
-    (0x0468, "APP_CMD_GET_HUB_NAME"),
-    (0x0469, "APP_CMD_GET_DEVS_NAME"),
-    (0x046a, "APP_CMD_GET_P2P_CONN_STATUS"),
+MOVE_ZERO = MqttMsgType.ZZ_MQTT_CMD_MOVE_ZERO.value
+
+PROBE_PAYLOADS = [
+    ("APP_CMD_GET_ADMIN_PWD", {"commandType": 0x0462}),
+    ("APP_CMD_GET_WIFI_PWD", {"commandType": 0x0463}),
+    ("APP_CMD_GET_EXCEPTION_LOG", {"commandType": 0x0464}),
+    ("APP_CMD_GET_UPDATE_STATUS", {"commandType": 0x0461}),
+    ("APP_CMD_GET_NEWVESION", {"commandType": 0x0465}),
+    ("APP_CMD_GET_ASEKEY", {"commandType": 0x044C}),
+    ("APP_CMD_SDINFO", {"commandType": 0x044E}),
+    ("APP_CMD_CAMERA_INFO", {"commandType": 0x044F}),
+    ("APP_CMD_GET_HUB_NAME", {"commandType": 0x0468}),
+    ("APP_CMD_GET_DEVS_NAME", {"commandType": 0x0469}),
+    ("APP_CMD_GET_P2P_CONN_STATUS", {"commandType": 0x046A}),
+    ("MOVE_ZERO bare", {"commandType": MOVE_ZERO}),
+    ("MOVE_ZERO axis=z", {"commandType": MOVE_ZERO, "axis": "z"}),
+    ("MOVE_ZERO axis=xy", {"commandType": MOVE_ZERO, "axis": "xy"}),
+    ("MOVE_ZERO axis=all", {"commandType": MOVE_ZERO, "axis": "all"}),
+    ("MOVE_ZERO cmdData axis=z", {"commandType": MOVE_ZERO, "cmdData": {"axis": "z"}}),
+    ("MOVE_ZERO cmdData axis=xy", {"commandType": MOVE_ZERO, "cmdData": {"axis": "xy"}}),
+    ("MOVE_ZERO cmdData axis=all", {"commandType": MOVE_ZERO, "cmdData": {"axis": "all"}}),
+    ("MOVE_ZERO cmdData type=0", {"commandType": MOVE_ZERO, "cmdData": {"type": 0}}),
+    ("MOVE_ZERO cmdData type=1", {"commandType": MOVE_ZERO, "cmdData": {"type": 1}}),
+    ("MOVE_ZERO cmdData type=2", {"commandType": MOVE_ZERO, "cmdData": {"type": 2}}),
+    ("MOVE_ZERO cmdData axis=0", {"commandType": MOVE_ZERO, "cmdData": {"axis": 0}}),
+    ("MOVE_ZERO cmdData axis=1", {"commandType": MOVE_ZERO, "cmdData": {"axis": 1}}),
+    ("MOVE_ZERO cmdData axis=2", {"commandType": MOVE_ZERO, "cmdData": {"axis": 2}}),
 ]
 
 
@@ -39,9 +55,9 @@ def connect():
     return cli.pppp.pppp_open(config, 0, timeout=10)
 
 
-def probe_one(cmd_type, cmd_name):
-    """Connect, send one command, collect response, disconnect."""
-    log.info(f"--- {cmd_name} (0x{cmd_type:04x}) ---")
+def probe_one(cmd_name, payload):
+    """Connect, send one payload, collect responses, disconnect."""
+    log.info(f"--- {cmd_name} ---")
 
     try:
         api = connect()
@@ -49,17 +65,19 @@ def probe_one(cmd_type, cmd_name):
         log.error(f"  Connect failed: {e}")
         return {"cmd": cmd_name, "status": "connect_fail", "data": str(e)}
 
-    payload = json.dumps({"commandType": cmd_type}).encode()
-    log.info(f"  TX: {payload}")
+    tx = json.dumps(payload).encode()
+    log.info(f"  TX: {tx}")
 
     try:
-        api.send_xzyh(payload, cmd=P2PCmdType.P2P_JSON_CMD, chan=0)
+        api.send_xzyh(tx, cmd=P2PCmdType.P2P_JSON_CMD, chan=0)
     except Exception as e:
         log.error(f"  Send failed: {e}")
-        api.stop()
+        try:
+            api.stop()
+        except Exception:
+            pass
         return {"cmd": cmd_name, "status": "send_fail", "data": str(e)}
 
-    # Collect responses for up to 3 seconds
     responses = []
     deadline = time.time() + 3.0
     while time.time() < deadline:
@@ -74,7 +92,6 @@ def probe_one(cmd_type, cmd_name):
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     log.info(f"  RX (hex): {raw.hex()}")
                     log.info(f"  RX (len): {len(raw)} bytes")
-                    # Try printing as string with errors replaced
                     log.info(f"  RX (str): {raw.decode('utf-8', errors='replace')}")
                     responses.append({"type": "binary", "hex": raw.hex(), "len": len(raw)})
         except Exception:
@@ -86,31 +103,30 @@ def probe_one(cmd_type, cmd_name):
         pass
 
     if not responses:
-        log.info(f"  No response")
-        return {"cmd": cmd_name, "status": "no_response"}
+        log.info("  No response")
+        return {"cmd": cmd_name, "status": "no_response", "payload": payload}
 
-    return {"cmd": cmd_name, "status": "ok", "responses": responses}
+    return {"cmd": cmd_name, "status": "ok", "payload": payload, "responses": responses}
 
 
 def main():
     log.info("PPPP Command Probe - AnkerMake M5\n")
 
     results = []
-    for cmd_type, cmd_name in PROBE_CMDS:
-        result = probe_one(cmd_type, cmd_name)
+    for cmd_name, payload in PROBE_PAYLOADS:
+        result = probe_one(cmd_name, payload)
         results.append(result)
-        time.sleep(2)  # Let the printer recover between connections
+        time.sleep(2)
 
     log.info("\n" + "=" * 60)
     log.info("SUMMARY")
     log.info("=" * 60)
-    for r in results:
-        if r["status"] == "ok":
-            log.info(f"  [RESPONSE] {r['cmd']}: {r['responses']}")
+    for result in results:
+        if result["status"] == "ok":
+            log.info(f"  [RESPONSE] {result['cmd']}: {result['responses']}")
         else:
-            log.info(f"  [{r['status'].upper()}] {r['cmd']}")
+            log.info(f"  [{result['status'].upper()}] {result['cmd']}")
 
-    # Dump full results as JSON
     log.info("\nFull JSON results:")
     log.info(json.dumps(results, indent=2, default=str))
 
