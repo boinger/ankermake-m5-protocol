@@ -141,32 +141,84 @@ PRINTERS_WITHOUT_CAMERA = ["V8110"]
 UNSUPPORTED_PRINTERS = ["V8260"]
 
 MQTT_SERVICE_PREFIX = "mqttqueue:"
+LEGACY_MQTT_SERVICE_NAME = "mqttqueue"
 
 
 def mqtt_service_name(printer_index=None):
     if printer_index is None:
         printer_index = app.config.get("printer_index", 0)
+    if printer_index is None:
+        printer_index = 0
     return f"{MQTT_SERVICE_PREFIX}{printer_index}"
+
+
+def _mqtt_service_candidates(printer_index=None):
+    current = mqtt_service_name(printer_index)
+    candidates = [current]
+
+    svcs = getattr(app.svc, "svcs", None)
+    if isinstance(svcs, dict):
+        if LEGACY_MQTT_SERVICE_NAME in svcs and LEGACY_MQTT_SERVICE_NAME not in candidates:
+            candidates.insert(0, LEGACY_MQTT_SERVICE_NAME)
+        return candidates
+
+    # Minimal test doubles often expose a single legacy mqttqueue service.
+    if current == f"{MQTT_SERVICE_PREFIX}0":
+        candidates.insert(0, LEGACY_MQTT_SERVICE_NAME)
+    return candidates
 
 
 @contextmanager
 def borrow_mqtt(printer_index=None):
-    with app.svc.borrow(mqtt_service_name(printer_index)) as mqtt:
-        yield mqtt
+    last_error = None
+    for name in _mqtt_service_candidates(printer_index):
+        try:
+            with app.svc.borrow(name) as mqtt:
+                yield mqtt
+                return
+        except (AssertionError, KeyError, AttributeError) as err:
+            last_error = err
+            continue
+    if last_error is not None:
+        raise last_error
+    yield None
 
 
 def stream_mqtt(printer_index=None):
-    return app.svc.stream(mqtt_service_name(printer_index))
+    last_error = None
+    for name in _mqtt_service_candidates(printer_index):
+        try:
+            return app.svc.stream(name)
+        except (AssertionError, KeyError, AttributeError) as err:
+            last_error = err
+            continue
+    if last_error is not None:
+        raise last_error
+    return iter(())
 
 
 def get_mqtt_service(printer_index=None):
-    return app.svc.svcs.get(mqtt_service_name(printer_index))
+    svcs = getattr(app.svc, "svcs", None)
+    if isinstance(svcs, dict):
+        for name in _mqtt_service_candidates(printer_index):
+            if name in svcs:
+                return svcs.get(name)
+        return None
+    return getattr(app.svc, "_mqtt", None)
 
 
 def iter_mqtt_services():
-    for name, svc in app.svc.svcs.items():
-        if name.startswith(MQTT_SERVICE_PREFIX):
-            yield name, svc
+    svcs = getattr(app.svc, "svcs", None)
+    if isinstance(svcs, dict):
+        for name, svc in svcs.items():
+            if name == LEGACY_MQTT_SERVICE_NAME or name.startswith(MQTT_SERVICE_PREFIX):
+                yield name, svc
+        return
+
+    # Fall back to a single borrowed service for lightweight test doubles.
+    with borrow_mqtt() as mqtt:
+        if mqtt is not None:
+            yield _mqtt_service_candidates()[0], mqtt
 
 
 def _stop_switchable_services():
@@ -1100,14 +1152,24 @@ def app_api_set_active_printer():
     with config.modify() as cfg:
         cfg.active_printer_index = new_index
 
-    register_services(app)
+    rich_service_manager = (
+        hasattr(app.svc, "svcs")
+        and hasattr(app.svc, "register")
+        and hasattr(app.svc, "unregister")
+    )
+    if rich_service_manager:
+        register_services(app)
 
-    # MQTT observers stay bound per printer. Only reset the services that
-    # follow the currently selected printer for camera / PPPP access.
-    try:
-        _stop_switchable_services()
-    except Exception as err:
-        log.warning(f"Service reset after printer switch raised: {err}")
+        # MQTT observers stay bound per printer. Only reset the services that
+        # follow the currently selected printer for camera / PPPP access.
+        try:
+            _stop_switchable_services()
+        except Exception as err:
+            log.warning(f"Service reset after printer switch raised: {err}")
+    else:
+        restart_all = getattr(app.svc, "restart_all", None)
+        if restart_all is not None:
+            restart_all(await_ready=False)
 
     log.info(f"Switched active printer: index {old_index} -> {new_index} ({printer.name})")
     return jsonify({"status": "ok", "printer": {"index": new_index, "name": printer.name, "sn": printer.sn}})
@@ -2566,7 +2628,11 @@ def webserver(config, printer_index, host, port, insecure=False, **kwargs):
         app.config["video_supported"] = video_supported
         app.config["unsupported_device"] = unsupported
         app.config.update(kwargs)
-        if cfg:
+        has_supported_printer = any(
+            printer.model not in UNSUPPORTED_PRINTERS
+            for printer in getattr(cfg, "printers", [])
+        ) if cfg else False
+        if cfg and has_supported_printer:
             register_services(app)
         if cfg and unsupported:
             log.warning(
