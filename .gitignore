@@ -13,5 +13,10 @@ dump/
 .env.*
 !.env.example
 .claude/
+.claude-flow/
+.swarm/
+.mcp.json
 .venv/
 *.log
+SECURITY_AUDIT_REPORT.json
+TEST_COVERAGE_ANALYSIS.md
