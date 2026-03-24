@@ -255,6 +255,20 @@ $(function () {
         }
 
         _message(event) {
+            // Check for server-side auth rejection before processing
+            if (typeof event.data === "string") {
+                try {
+                    const parsed = JSON.parse(event.data);
+                    if (parsed.error === "unauthorized") {
+                        console.warn(`${this.name}: server rejected connection (unauthorized)`);
+                        this.autoReconnect = false;
+                        if (this.ws) this.ws.close();
+                        return;
+                    }
+                } catch (_) {
+                    // Not JSON — continue to normal message handling
+                }
+            }
             if (!this.is_open) {
                 $(this.badge).removeClass("text-bg-danger text-bg-warning").addClass("text-bg-success");
                 this.is_open = true;

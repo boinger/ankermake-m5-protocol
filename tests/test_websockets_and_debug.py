@@ -321,6 +321,57 @@ def test_dev_debug_routes_register_and_dispatch(monkeypatch):
     assert restart_calls == [True]
 
 
+def test_ws_ctrl_rejects_without_api_key():
+    """WebSocket handlers must reject unauthenticated connections when
+    an API key is configured, sending {"error": "unauthorized"} before closing."""
+    sock = FakeSock()
+    services = FakeServices()
+    old_values, old_svc = _install_app_state(
+        web_module, svc=services, api_key=API_KEY
+    )
+
+    try:
+        with web_module.app.test_request_context():
+            _ws_handler(web_module, "ctrl")(sock)
+    finally:
+        _restore_app_state(web_module, old_values, old_svc)
+
+    assert len(sock.sent) == 1
+    msg = json.loads(sock.sent[0])
+    assert msg == {"error": "unauthorized"}
+
+
+def test_ws_ctrl_allows_with_session():
+    """WebSocket handlers should allow access when session is authenticated."""
+    ctrl_msg = json.dumps({"light": True})
+    sock = FakeSock(receives=[ctrl_msg])
+    light_calls = []
+    vq = SimpleNamespace(
+        saved_video_profile_id="hd",
+        api_light_state=lambda v: light_calls.append(v),
+        api_video_profile=lambda v: None,
+    )
+    services = FakeServices(
+        svcs={"videoqueue": vq},
+        borrowed={"videoqueue": vq},
+    )
+    old_values, old_svc = _install_app_state(
+        web_module, svc=services, api_key=API_KEY
+    )
+
+    try:
+        with web_module.app.test_request_context():
+            from flask import session as flask_session
+            flask_session["authenticated"] = True
+            _ws_handler(web_module, "ctrl")(sock)
+    finally:
+        _restore_app_state(web_module, old_values, old_svc)
+
+    # Should have received ankerctl handshake + video_profile + processed light command
+    assert any('"ankerctl"' in s for s in sock.sent)
+    assert light_calls == [True]
+
+
 @contextmanager
 def _borrow_debug(value):
     yield value

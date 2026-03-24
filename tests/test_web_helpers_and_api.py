@@ -323,3 +323,21 @@ def test_printer_control_guard_without_login():
     finally:
         app.config["login"] = old_login
         app.config["api_key"] = old_api_key
+
+
+def test_apikey_url_param_redirects_no_session():
+    """?apikey= should validate the key and redirect to strip it from the
+    URL, but must NOT set session['authenticated']."""
+    client = app.test_client()
+    old_api_key = app.config.get("api_key")
+    app.config["api_key"] = "test-secret-key"
+    try:
+        resp = client.get("/api/health?apikey=test-secret-key")
+        assert resp.status_code == 302, f"Expected redirect, got {resp.status_code}"
+        assert "apikey" not in resp.headers.get("Location", "")
+
+        with client.session_transaction() as sess:
+            assert not sess.get("authenticated"), \
+                "Session should NOT be authenticated after ?apikey= redirect"
+    finally:
+        app.config["api_key"] = old_api_key

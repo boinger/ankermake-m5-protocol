@@ -671,12 +671,40 @@ from web.service.filament import FilamentStore
 # autopep8: on
 
 
+def _validate_ws_auth(sock):
+    """Check API key auth for WebSocket routes.
+
+    Flask's before_request middleware does not run for WebSocket routes,
+    so each handler must call this explicitly.  Auth succeeds if ANY of:
+      - No API key is configured (backwards compatible)
+      - Session cookie has authenticated=True
+      - X-Api-Key header matches the configured key
+
+    Returns True if authorized, False otherwise.  On failure, sends an
+    error JSON message and the caller should return to close the socket.
+    """
+    api_key = app.config.get("api_key")
+    if not api_key:
+        return True
+    if session.get("authenticated"):
+        return True
+    if request.headers.get("X-Api-Key") == api_key:
+        return True
+    try:
+        sock.send(json.dumps({"error": "unauthorized"}))
+    except Exception:
+        pass
+    return False
+
+
 @sock.route("/ws/mqtt")
 def mqtt(sock):
     """
     Handles receiving and sending messages on the 'mqttqueue' stream service through websocket
     """
     if not app.config["login"] or app.config.get("unsupported_device"):
+        return
+    if not _validate_ws_auth(sock):
         return
 
     for data in stream_mqtt():
@@ -694,6 +722,8 @@ def video(sock):
     so multiple tabs can independently enable/disable without interfering.
     """
     if not app.config["login"] or not app.config.get("video_supported") or app.config.get("unsupported_device"):
+        return
+    if not _validate_ws_auth(sock):
         return
 
     vq = app.svc.svcs.get("videoqueue")
@@ -764,6 +794,8 @@ def pppp_state(sock):
     """
     if not app.config["login"] or app.config.get("unsupported_device"):
         log.info("Websocket connection rejected: no printer configured (use 'config import' or 'config login')")
+        return
+    if not _validate_ws_auth(sock):
         return
 
     log.info("Starting PPPP state websocket handler")
@@ -879,6 +911,8 @@ def upload(sock):
     """
     if not app.config["login"] or app.config.get("unsupported_device"):
         return
+    if not _validate_ws_auth(sock):
+        return
 
     for data in app.svc.stream("filetransfer"):
         sock.send(json.dumps(data))
@@ -890,6 +924,8 @@ def ctrl(sock):
     Handles controlling of light and video quality through websocket
     """
     if not app.config["login"] or app.config.get("unsupported_device"):
+        return
+    if not _validate_ws_auth(sock):
         return
 
     # send a response on connect, to let the client know the connection is ready
@@ -2895,12 +2931,11 @@ def _check_api_key():
     if request.path.startswith("/static/"):
         return None
 
-    # Check ?apikey= URL parameter early (before GET shortcut) so it always
-    # sets the session cookie — even on unprotected GET requests.
+    # Check ?apikey= URL parameter early so the browser UI can bootstrap an
+    # authenticated session, then redirect to strip it from the visible URL.
     url_key = request.args.get("apikey")
     if url_key and secrets.compare_digest(url_key, api_key):
         session["authenticated"] = True
-        # Strip ?apikey= from URL so it doesn't stay in browser history
         from urllib.parse import urlencode, parse_qs, urlparse
         from flask import redirect
         params = parse_qs(urlparse(request.url).query)
