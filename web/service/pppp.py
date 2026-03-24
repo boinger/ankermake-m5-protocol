@@ -1,5 +1,6 @@
 import json
 import logging as log
+import threading
 
 from datetime import datetime, timedelta
 
@@ -37,6 +38,7 @@ class PPPPService(Service):
 
     def __init__(self):
         self.xzyh_handlers = []
+        self._handler_lock = threading.Lock()
         super().__init__()
 
     def api_command(self, commandType, **kwargs):
@@ -118,7 +120,9 @@ class PPPPService(Service):
                     return
                 xzyh.data = pkt[16:]
 
-            for handler in self.xzyh_handlers[:]:
+            with self._handler_lock:
+                handlers = self.xzyh_handlers[:]
+            for handler in handlers:
                 try:
                     handler((chan, xzyh))
                 except Exception as e:

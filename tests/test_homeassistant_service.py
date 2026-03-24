@@ -109,8 +109,9 @@ def test_homeassistant_on_connect_and_light_command(monkeypatch):
     app.svc = SimpleNamespace(svcs={"videoqueue": SimpleNamespace(api_light_state=lambda state: light_calls.append(state))})
 
     class FakeThread:
-        def __init__(self, target=None, daemon=None, name=None):
+        def __init__(self, target=None, args=None, daemon=None, name=None):
             self.target = target
+            self.args = args or ()
             self.daemon = daemon
             self.name = name
             self.started = False
@@ -197,3 +198,31 @@ def test_homeassistant_disconnect_and_publish_failures_are_non_fatal():
     svc._on_disconnect(None, None, 1)
 
     assert svc._connected is False
+
+
+def test_rapid_reconnect_no_thread_leak():
+    """Rapid _on_connect calls should not accumulate availability threads.
+    The generation counter ensures stale threads self-terminate."""
+    import threading
+    import time
+
+    svc = HomeAssistantService(FakeConfigManager(_service_config()), printer_sn="SN123", printer_name="Printer")
+    svc._enabled = True
+    svc._connected = True
+    svc._client = SimpleNamespace(
+        subscribe=lambda *a, **kw: None,
+        publish=lambda *a, **kw: None,
+    )
+    svc._publish_discovery = lambda: None
+
+    for _ in range(5):
+        svc._on_connect(svc._client, None, None, 0)
+
+    assert svc._availability_generation == 5
+    time.sleep(0.2)
+    alive = [t for t in threading.enumerate() if t.name == "ha-mqtt-avail"]
+    assert len(alive) <= 1, f"Expected <=1 availability threads, found {len(alive)}"
+
+    svc._stop_event.set()
+    if svc._availability_thread:
+        svc._availability_thread.join(timeout=2)

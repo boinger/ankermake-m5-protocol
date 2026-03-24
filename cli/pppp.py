@@ -79,8 +79,8 @@ def probe_printer_ip(printer, ip_addr, timeout=2.0):
     finally:
         try:
             api.sock.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug(f"PPPP socket close failed: {exc}")
 
 
 def lan_search(config, timeout=1.0, dumpfile=None):
@@ -113,8 +113,8 @@ def lan_search(config, timeout=1.0, dumpfile=None):
     finally:
         try:
             api.sock.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug(f"PPPP socket close failed: {exc}")
 
     return discovered
 

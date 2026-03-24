@@ -193,8 +193,9 @@ class VideoQueue(Service):
 
         self.api_id = id(self.pppp._api)
 
-        if self._handler not in self.pppp.xzyh_handlers:
-            self.pppp.xzyh_handlers.append(self._handler)
+        with self.pppp._handler_lock:
+            if self._handler not in self.pppp.xzyh_handlers:
+                self.pppp.xzyh_handlers.append(self._handler)
         self._start_live_if_needed(force=False)
 
         if self.saved_light_state is not None:
@@ -219,18 +220,25 @@ class VideoQueue(Service):
                 time.sleep(0.5)
                 return
 
-        if not getattr(self.pppp, "connected", False):
+        # Snapshot the PPPP reference to avoid TOCTOU races if the service
+        # restarts between checks.  All subsequent accesses use this local.
+        pppp = self.pppp
+        if pppp is None:
+            raise ServiceRestartSignal("PPPP reference lost during video session")
+
+        if not getattr(pppp, "connected", False):
             raise ServiceRestartSignal("No pppp connection")
 
         if getattr(self, "api_id", None) is None:
-            if not hasattr(self.pppp, "_api"):
+            if not hasattr(pppp, "_api"):
                 log.info("VideoQueue: PPPP connected but API not ready yet")
                 time.sleep(0.5)
                 return
 
-            self.api_id = id(self.pppp._api)
-            if self._handler not in self.pppp.xzyh_handlers:
-                self.pppp.xzyh_handlers.append(self._handler)
+            self.api_id = id(pppp._api)
+            with pppp._handler_lock:
+                if self._handler not in pppp.xzyh_handlers:
+                    pppp.xzyh_handlers.append(self._handler)
 
             started = self._start_live_if_needed(force=False)
             if not started:
@@ -251,10 +259,10 @@ class VideoQueue(Service):
             log.info("VideoQueue: Live video started after PPPP became ready")
             return
 
-        if not hasattr(self.pppp, "_api"):
+        if not hasattr(pppp, "_api"):
             raise ServiceRestartSignal("PPPP lost during video session")
 
-        if id(self.pppp._api) != self.api_id:
+        if id(pppp._api) != self.api_id:
             raise ServiceRestartSignal("New pppp connection detected, restarting video feed")
 
         if self.handlers:
@@ -269,7 +277,7 @@ class VideoQueue(Service):
                             self._live_active = False
                             self.api_stop_live()
                             time.sleep(0.5)
-                            if not self.pppp or not getattr(self.pppp, "connected", False):
+                            if not pppp or not getattr(pppp, "connected", False):
                                 log.warning("VideoQueue: PPPP unavailable during live refresh")
                                 time.sleep(0.5)
                                 return
@@ -299,7 +307,7 @@ class VideoQueue(Service):
                             self._live_active = False
                             self.api_stop_live()
                             time.sleep(0.5)
-                            if not self.pppp or not getattr(self.pppp, "connected", False):
+                            if not pppp or not getattr(pppp, "connected", False):
                                 log.warning("VideoQueue: PPPP unavailable during initial-frame refresh")
                                 time.sleep(0.5)
                                 return
@@ -323,8 +331,10 @@ class VideoQueue(Service):
         except Exception as E:
             log.warning(f"{self.name}: Failed to send stop command ({E})")
 
-        if self.pppp and self._handler in self.pppp.xzyh_handlers:
-            self.pppp.xzyh_handlers.remove(self._handler)
+        if self.pppp:
+            with self.pppp._handler_lock:
+                if self._handler in self.pppp.xzyh_handlers:
+                    self.pppp.xzyh_handlers.remove(self._handler)
 
         if self.pppp:
             app.svc.put("pppp")
