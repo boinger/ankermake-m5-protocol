@@ -18,6 +18,7 @@ from web import (
     _format_signed_mm,
     _parse_z_offset_mm,
     _resolve_apprise,
+    _safe_same_site_redirect_target,
     _serialize_z_offset_state,
     _z_offset_mm_to_steps,
     _z_offset_steps_to_mm,
@@ -325,19 +326,26 @@ def test_printer_control_guard_without_login():
         app.config["api_key"] = old_api_key
 
 
-def test_apikey_url_param_redirects_no_session():
-    """?apikey= should validate the key and redirect to strip it from the
-    URL, but must NOT set session['authenticated']."""
+def test_safe_same_site_redirect_target_rejects_external_style_paths():
+    with app.test_request_context("/"):
+        assert _safe_same_site_redirect_target("//evil.example/path", {"x": ["1"]}) == "/"
+        assert _safe_same_site_redirect_target("https:/evil.example", None) == "/"
+
+
+def test_apikey_url_param_redirects_and_sets_session():
+    """?apikey= should validate the key, strip itself from the URL, and
+    bootstrap the browser session auth used by the web UI."""
     client = app.test_client()
     old_api_key = app.config.get("api_key")
     app.config["api_key"] = "test-secret-key"
     try:
-        resp = client.get("/api/health?apikey=test-secret-key")
+        resp = client.get("/api/health?apikey=test-secret-key&foo=bar")
         assert resp.status_code == 302, f"Expected redirect, got {resp.status_code}"
         assert "apikey" not in resp.headers.get("Location", "")
+        assert resp.headers.get("Location", "").endswith("/api/health?foo=bar")
 
         with client.session_transaction() as sess:
-            assert not sess.get("authenticated"), \
-                "Session should NOT be authenticated after ?apikey= redirect"
+            assert sess.get("authenticated"), \
+                "Session should be authenticated after ?apikey= redirect"
     finally:
         app.config["api_key"] = old_api_key

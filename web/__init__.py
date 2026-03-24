@@ -2914,6 +2914,27 @@ def _block_unsupported_device():
     return None
 
 
+def _safe_same_site_redirect_target(path, params=None):
+    """Build a redirect target that is guaranteed to stay on this app."""
+    from urllib.parse import urlencode, urlparse
+
+    target = path or "/"
+    if params:
+        query = urlencode(params, doseq=True)
+        if query:
+            target = f"{target}?{query}"
+
+    # Browsers accept several malformed slash variants as external URLs.
+    normalized = target.replace("\\", "")
+    parsed = urlparse(normalized)
+    if parsed.scheme or parsed.netloc or normalized.startswith("//"):
+        return url_for("app_root")
+
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized.lstrip("/")
+    return normalized
+
+
 @app.before_request
 def _check_api_key():
     """Middleware: enforce API key on write operations (POST/PUT/DELETE).
@@ -2936,13 +2957,9 @@ def _check_api_key():
     url_key = request.args.get("apikey")
     if url_key and secrets.compare_digest(url_key, api_key):
         session["authenticated"] = True
-        from urllib.parse import urlencode, parse_qs, urlparse
         from flask import redirect
-        params = parse_qs(urlparse(request.url).query)
-        params.pop("apikey", None)
-        clean_url = request.path
-        if params:
-            clean_url += "?" + urlencode(params, doseq=True)
+        params = {key: values for key, values in request.args.lists() if key != "apikey"}
+        clean_url = _safe_same_site_redirect_target(request.path, params)
         return redirect(clean_url)
 
     # Check X-Api-Key header (slicer / programmatic access)
