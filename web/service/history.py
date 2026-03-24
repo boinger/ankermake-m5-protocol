@@ -38,6 +38,7 @@ class PrintHistory:
         self._retention_days = int(os.getenv("PRINT_HISTORY_RETENTION_DAYS", retention_days or _DEFAULT_RETENTION_DAYS))
         self._max_entries = int(os.getenv("PRINT_HISTORY_MAX_ENTRIES", max_entries or _DEFAULT_MAX_ENTRIES))
         self._lock = threading.Lock()
+        self._memory_conn = None
         self._init_db()
 
     def _recreate_db_after_corruption(self, exc):
@@ -76,6 +77,11 @@ class PrintHistory:
 
 
     def _connect(self):
+        if os.fspath(self._db_path) == ":memory:":
+            if self._memory_conn is None:
+                self._memory_conn = sqlite3.connect(":memory:", check_same_thread=False)
+                self._memory_conn.row_factory = sqlite3.Row
+            return self._memory_conn
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
