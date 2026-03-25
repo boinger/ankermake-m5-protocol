@@ -92,6 +92,7 @@ class AppriseNotifier:
         self._snapshot_timer = None
         self._snapshot_hold_until = 0.0
         self._snapshot_enabled_by_notifier = False
+        self._load_lock = threading.Lock()
 
     def _load(self):
         if self._explicit_settings:
@@ -102,31 +103,37 @@ class AppriseNotifier:
         if self._client and (now - self._last_load) < self._reload_interval:
             return
 
-        try:
-            with self._config_manager.open() as cfg:
-                if not cfg:
-                    self._client = None
-                    self._settings = None
-                    self._last_load = now
-                    return
-                notifications = merge_dict_defaults(
-                    getattr(cfg, "notifications", None),
-                    default_notifications_config(),
-                )
-                apprise_config = merge_dict_defaults(
-                    notifications.get("apprise"),
-                    default_apprise_config(),
-                )
-        except Exception as err:
-            log.warning(f"Failed to load apprise config: {err}")
-            self._client = None
-            self._settings = None
-            self._last_load = now
-            return
+        with self._load_lock:
+            # Re-check after acquiring lock (another thread may have loaded)
+            now = time.monotonic()
+            if self._client and (now - self._last_load) < self._reload_interval:
+                return
 
-        self._client = AppriseClient(apprise_config)
-        self._settings = self._client.settings
-        self._last_load = now
+            try:
+                with self._config_manager.open() as cfg:
+                    if not cfg:
+                        self._client = None
+                        self._settings = None
+                        self._last_load = now
+                        return
+                    notifications = merge_dict_defaults(
+                        getattr(cfg, "notifications", None),
+                        default_notifications_config(),
+                    )
+                    apprise_config = merge_dict_defaults(
+                        notifications.get("apprise"),
+                        default_apprise_config(),
+                    )
+            except Exception as err:
+                log.warning(f"Failed to load apprise config: {err}")
+                self._client = None
+                self._settings = None
+                self._last_load = now
+                return
+
+            self._client = AppriseClient(apprise_config)
+            self._settings = self._client.settings
+            self._last_load = now
 
     def client(self):
         self._load()

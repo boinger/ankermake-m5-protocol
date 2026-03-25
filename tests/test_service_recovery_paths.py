@@ -99,6 +99,7 @@ def test_video_queue_worker_start_stop_and_handler(monkeypatch):
         _api=fake_api,
         connected=True,
         xzyh_handlers=[],
+        _handler_lock=__import__("threading").Lock(),
         api_command=lambda command, data=None: commands.append((command, data)),
     )
 
@@ -211,6 +212,7 @@ def test_pppp_service_api_command_and_connected_property():
 
 def test_pppp_service_drains_xzyh_and_tolerates_handler_errors(monkeypatch):
     svc = object.__new__(PPPPService)
+    svc._handler_lock = __import__("threading").Lock()
     captured = []
     svc.xzyh_handlers = [
         lambda item: (_ for _ in ()).throw(RuntimeError("ignore")),

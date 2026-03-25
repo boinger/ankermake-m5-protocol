@@ -397,12 +397,18 @@ class TimelapseService:
 
     def _capture_loop(self):
         """Periodically capture snapshots from the video stream."""
-        while not self._stop_event.is_set():
-            try:
-                self._take_snapshot()
-            except Exception as err:
-                log.warning(f"Timelapse: snapshot failed: {err}")
-            self._stop_event.wait(self._interval)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    self._take_snapshot()
+                except Exception as err:
+                    log.warning(f"Timelapse: snapshot failed: {err}")
+                self._stop_event.wait(self._interval)
+        except Exception as err:
+            log.warning(f"Timelapse: capture loop crashed: {err}")
+        finally:
+            with self._lock:
+                self._capture_thread = None
 
     def _take_snapshot(self):
         """Capture a single frame using ffmpeg."""

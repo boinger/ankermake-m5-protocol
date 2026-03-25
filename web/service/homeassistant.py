@@ -44,6 +44,7 @@ class HomeAssistantService:
         self._lock = threading.Lock()
         self._availability_thread = None
         self._stop_event = threading.Event()
+        self._availability_generation = 0
 
         # Cached state for publishing
         self._state = {
@@ -208,13 +209,18 @@ class HomeAssistantService:
         client.subscribe(light_cmd_topic, qos=1)
         log.info(f"HA MQTT: subscribed to {light_cmd_topic}")
 
-        # Start availability heartbeat — stop any existing thread first to avoid leaks
+        # Start availability heartbeat — stop any existing thread first to avoid leaks.
+        # Bump generation so stale threads self-terminate even if they miss the
+        # stop event (prevents thread accumulation on rapid reconnects).
         if self._availability_thread and self._availability_thread.is_alive():
             self._stop_event.set()
             self._availability_thread.join(timeout=2)
+            self._availability_thread = None
+        self._availability_generation += 1
         self._stop_event.clear()
+        gen = self._availability_generation
         self._availability_thread = threading.Thread(
-            target=self._availability_loop, daemon=True, name="ha-mqtt-avail"
+            target=self._availability_loop, args=(gen,), daemon=True, name="ha-mqtt-avail"
         )
         self._availability_thread.start()
 
@@ -295,9 +301,12 @@ class HomeAssistantService:
     def _state_topic(self):
         return f"{self._topic_prefix}/{self._printer_sn}/state"
 
-    def _availability_loop(self):
+    def _availability_loop(self, my_generation):
         """Periodically publish availability to keep HA happy."""
         while not self._stop_event.is_set():
+            if self._availability_generation != my_generation:
+                log.debug("HA MQTT: stale availability thread exiting")
+                return
             self._publish(self._availability_topic(), "online", retain=True)
             self._stop_event.wait(_AVAILABILITY_TIMEOUT)
 

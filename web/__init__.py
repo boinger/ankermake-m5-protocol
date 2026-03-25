@@ -230,8 +230,8 @@ def _stop_switchable_services():
         vq.stop()
         try:
             vq.await_stopped()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug(f"VideoQueue stop wait failed: {exc}")
 
     pppp = app.svc.svcs.get("pppp")
     if pppp:
@@ -692,8 +692,8 @@ def _validate_ws_auth(sock):
         return True
     try:
         sock.send(json.dumps({"error": "unauthorized"}))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug(f"WS auth rejection send failed (client may have disconnected): {exc}")
     return False
 
 
@@ -899,8 +899,8 @@ def pppp_state(sock):
         try:
             with app.pppp_probe_lock:
                 app.pppp_probe["client_count"] -= 1
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug(f"PPPP state cleanup failed: {exc}")
         log.info("PPPP state websocket handler ending")
 
 
@@ -1852,8 +1852,8 @@ def _disconnect_mqtt_client(client):
         return
     try:
         mqtt_client.disconnect()
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug(f"MQTT client disconnect failed: {exc}")
 
 
 def _clean_printer_report_output(raw_output):
@@ -2593,8 +2593,8 @@ def register_services(app):
         svc.stop()
         try:
             svc.await_stopped()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug(f"Service {name} stop wait failed: {exc}")
         app.svc.unregister(name)
 
     if not supported_indexes:

@@ -223,3 +223,32 @@ def test_timelapse_take_snapshot_retries_and_restores_light(monkeypatch, tmp_pat
     assert light_calls == [True, False]
     assert svc._frame_count == 1
     assert os.path.exists(os.path.join(svc._current_dir, "frame_00000.jpg"))
+
+
+def test_capture_thread_crash_clears_ref(tmp_path):
+    """If _capture_loop() crashes from an uncaught exception, the
+    try/finally should clear _capture_thread so start_capture() knows
+    the thread is dead."""
+    import threading
+    from types import SimpleNamespace
+
+    class CaptureLoopCrash(BaseException):
+        """Uncatchable by except Exception — simulates a fatal crash."""
+
+    config_mgr = SimpleNamespace(config_root=str(tmp_path))
+    svc = TimelapseService(config_mgr, captures_dir=str(tmp_path))
+    svc._interval = 0.01
+
+    call_count = [0]
+
+    def crashing_snapshot():
+        call_count[0] += 1
+        if call_count[0] >= 2:
+            raise CaptureLoopCrash("Simulated fatal crash")
+
+    svc._take_snapshot = crashing_snapshot
+    svc._capture_thread = threading.Thread(target=svc._capture_loop, daemon=True)
+    svc._capture_thread.start()
+    svc._capture_thread.join(timeout=2)
+
+    assert svc._capture_thread is None, "_capture_thread should be None after crash"
