@@ -930,29 +930,47 @@ class MqttQueue(Service):
 
     def send_print_control(self, value):
         value = int(value)
-        if value in (0, 4) and (self._print_active or self.is_preparing_print or self.has_pending_print_start):
+
+        pre_start_window = self.is_preparing_print or self.has_pending_print_start
+
+        log.info(
+            "send_print_control(value=%s, print_active=%s, preparing=%s, pending_start=%s)",
+            value,
+            self._print_active,
+            self.is_preparing_print,
+            self.has_pending_print_start,
+        )
+
+        if value in (0, 4) and (self._print_active or pre_start_window):
             self._stop_requested = True
-        prepare_cancel = value in (0, 4) and self.is_preparing_print
-        if value == 4 and self.is_preparing_print:
-            log.info("Mapping print stop value=4 to value=0 during pre-print preparation")
-            value = 0
-        if prepare_cancel:
-            # During the pre-print preparation phase (ct=1000 value=8) the printer only
-            # responds to the app-style nested command format. We send both the nested and
-            # the flat format so the cancel lands regardless of which the firmware accepts.
-            nested_data = {"value": value}
-            if self._control_username:
-                nested_data["userName"] = self._control_username
-            log.info("Sending app-style nested print control during pre-print preparation")
-            self.client.command({
+
+        if value in (0, 4) and pre_start_window:
+            # Firmware variants differ in which cancel payload they accept during the
+            # pre-print window (G28 / calibration / pending-start). Send both value=0
+            # and value=4 in nested and flat form so the cancel lands regardless.
+            for candidate in (0, 4):
+                nested_data = {"value": candidate}
+                if self._control_username:
+                    nested_data["userName"] = self._control_username
+                nested_cmd = {
+                    "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
+                    "data": nested_data,
+                }
+                flat_cmd = {
+                    "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
+                    "value": candidate,
+                }
+                log.info("Pre-start cancel attempt value=%s (nested + flat)", candidate)
+                self.client.command(nested_cmd)
+                time.sleep(0.12)
+                self.client.command(flat_cmd)
+                time.sleep(0.18)
+        else:
+            cmd = {
                 "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
-                "data": nested_data,
-            })
-        cmd = {
-            "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
-            "value": value
-        }
-        self.client.command(cmd)
+                "value": value,
+            }
+            self.client.command(cmd)
 
     def send_auto_leveling(self):
         cmd = {

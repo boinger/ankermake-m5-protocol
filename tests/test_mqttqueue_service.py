@@ -157,7 +157,9 @@ def test_handle_notification_aborts_active_print_on_value_8(monkeypatch):
     assert queue.get_state()["print"]["state"] == 0
 
 
-def test_send_print_control_maps_stop_to_restart_during_prepare_state():
+def test_send_print_control_shotgun_during_prepare_state():
+    # During the prepare phase (ct=1000 value=8, not yet active), stop sends both
+    # value=0 and value=4 in nested+flat form for firmware compatibility.
     global ha_updates, history_calls, timelapse_calls, events
     ha_updates, history_calls, timelapse_calls, events = [], [], [], []
     queue = _queue()
@@ -170,6 +172,8 @@ def test_send_print_control_maps_stop_to_restart_during_prepare_state():
     assert sent == [
         {"commandType": 1008, "data": {"value": 0, "userName": "tester@example.com"}},
         {"commandType": 1008, "value": 0},
+        {"commandType": 1008, "data": {"value": 4, "userName": "tester@example.com"}},
+        {"commandType": 1008, "value": 4},
     ]
     assert queue._stop_requested is True
 
@@ -248,7 +252,13 @@ def test_pending_start_stop_cancels_before_print_becomes_active():
     queue.send_print_control(4)
     queue._handle_notification({"commandType": 1000, "value": 0})
 
-    assert sent == [{"commandType": 1008, "value": 4}]
+    # pending_start counts as pre_start_window → shotgun (value=0 and value=4, nested+flat)
+    assert sent == [
+        {"commandType": 1008, "data": {"value": 0, "userName": "tester@example.com"}},
+        {"commandType": 1008, "value": 0},
+        {"commandType": 1008, "data": {"value": 4, "userName": "tester@example.com"}},
+        {"commandType": 1008, "value": 4},
+    ]
     assert history_calls == [("fail", (), {"filename": "queued.gcode", "reason": "cancelled", "task_id": None})]
     assert timelapse_calls == [("fail",)]
     assert events == [("print_failed", {"filename": "queued.gcode", "percent": 0, "elapsed_seconds": "", "remaining_seconds": "", "duration_seconds": "", "elapsed": "", "remaining": "", "duration": "", "reason": "cancelled"}, False)]

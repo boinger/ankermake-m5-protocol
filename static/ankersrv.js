@@ -2124,7 +2124,7 @@ $(function () {
                 ? "Cancel the pending print before it starts?"
                 : "Are you sure you want to stop the print? This will also turn off heaters.";
         if (confirm(confirmText)) {
-            sendPrintControl(preparing ? PRINT_CONTROL.PREPARE_CANCEL : PRINT_CONTROL.STOP);
+            sendPrintControl((preparing || pendingStart) ? PRINT_CONTROL.PREPARE_CANCEL : PRINT_CONTROL.STOP);
             if (!preparing && !pendingStart) {
                 sendPrinterGCode("M104 S0\nM140 S0\nM106 S0");
             }
