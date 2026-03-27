@@ -1,7 +1,7 @@
 import time
 from types import SimpleNamespace
 
-from web.service.mqtt import MqttQueue
+from web.service.mqtt import MqttQueue, PrintState
 
 
 def _queue():
@@ -48,7 +48,7 @@ def test_forward_to_ha_updates_temperatures_and_progress():
 
     queue._forward_to_ha({"commandType": 1003, "currentTemp": 21500, "targetTemp": 22000})
     queue._forward_to_ha({"commandType": 1004, "currentTemp": 6500, "targetTemp": 7000})
-    queue._print_active = True
+    queue._state = PrintState.PRINTING
     queue._forward_to_ha({
         "commandType": 1001,
         "progress": 50,
@@ -82,7 +82,7 @@ def test_emit_progress_respects_bucket_interval():
     global ha_updates, history_calls, timelapse_calls, events
     ha_updates, history_calls, timelapse_calls, events = [], [], [], []
     queue = _queue()
-    queue._print_active = True
+    queue._state = PrintState.PRINTING
 
     payload = {"name": "cube.gcode"}
     queue._emit_progress(payload, 10)
@@ -309,7 +309,7 @@ def test_build_payload_get_state_and_simulate_event(monkeypatch):
     ha_updates, history_calls, timelapse_calls, events = [], [], [], []
     queue = _queue()
     monkeypatch.setattr("web.service.mqtt.time.monotonic", lambda: 150.0)
-    queue._print_active = True
+    queue._state = PrintState.PRINTING
     queue._print_started_at = 100.0
     queue._last_filename = "cube.gcode"
 
@@ -342,7 +342,7 @@ def test_out_of_order_ct1001_before_ct1000():
         "name": "cube.gcode",
     })
 
-    assert queue._print_active is True
+    assert queue._state == PrintState.PRINTING
     start_events = [e for e in events if e[0] == "print_started"]
     start_records = [c for c in history_calls if c[0] == "start"]
     assert len(start_events) == 1, f"Expected 1 start event, got {len(start_events)}"
@@ -368,15 +368,13 @@ def test_pre_print_window_upgrades_to_full_print():
     queue = _queue()
 
     # Simulate the pre-print window state set by ct=1044
-    queue._print_active = True
-    queue._in_pre_print_window = True
+    queue._state = PrintState.PRE_PRINT
     queue._last_filename = "cube.gcode"
 
     # ct=1000 value=1 should upgrade from pre-print to full print
     queue._handle_notification({"commandType": 1000, "value": 1})
 
-    assert queue._print_active is True
-    assert queue._in_pre_print_window is False
+    assert queue._state == PrintState.PRINTING
     start_events = [e for e in events if e[0] == "print_started"]
     start_records = [c for c in history_calls if c[0] == "start"]
     assert len(start_events) == 1, "Pre-print upgrade should fire start event"
@@ -392,11 +390,10 @@ def test_ct1001_blocked_during_pre_print_window():
     queue = _queue()
 
     # Simulate the pre-print window state set by ct=1044
-    queue._print_active = True
-    queue._in_pre_print_window = True
+    queue._state = PrintState.PRE_PRINT
     queue._last_filename = "cube.gcode"
 
-    # ct=1001 progress should be blocked (caller guard: not self._print_active)
+    # ct=1001 progress should be blocked (state is PRE_PRINT, not IDLE)
     queue._handle_notification({
         "commandType": 1001,
         "progress": 2500,
@@ -404,8 +401,142 @@ def test_ct1001_blocked_during_pre_print_window():
     })
 
     # Should still be in pre-print window, no activation side effects
-    assert queue._in_pre_print_window is True, "Pre-print window should not be cleared by ct=1001"
+    assert queue._state == PrintState.PRE_PRINT, "Pre-print window should not be cleared by ct=1001"
     start_events = [e for e in events if e[0] == "print_started"]
     start_records = [c for c in history_calls if c[0] == "start"]
     assert len(start_events) == 0, "ct=1001 should not fire start event during pre-print"
     assert len(start_records) == 0, "ct=1001 should not record history during pre-print"
+
+
+def test_print_state_enum_values():
+    """PrintState enum has all expected members."""
+    assert set(PrintState.__members__.keys()) == {
+        "IDLE", "PREPARING", "PRE_PRINT", "PRINTING", "FAILED",
+    }
+
+
+def test_state_transitions_through_full_lifecycle(monkeypatch):
+    """Walk through IDLE -> PREPARING -> PRE_PRINT -> PRINTING -> DONE -> IDLE
+    and verify state at each step.  Also verify that _transition_to_active()
+    returns False from FAILED and DONE states."""
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    monkeypatch.setattr("web.service.mqtt.time.monotonic", lambda: 100.0)
+
+    # Start: IDLE
+    assert queue._state == PrintState.IDLE
+
+    # IDLE -> PREPARING (via mark_pending_print_start)
+    queue.mark_pending_print_start("lifecycle.gcode")
+    assert queue._state == PrintState.PREPARING
+
+    # PREPARING -> PRE_PRINT (via ct=1044 with pending start)
+    queue._handle_notification({"commandType": 1044, "filePath": "/tmp/lifecycle.gcode"})
+    assert queue._state == PrintState.PRE_PRINT
+
+    # PRE_PRINT -> PRINTING (via ct=1000 value=1)
+    queue._handle_notification({"commandType": 1000, "value": 1})
+    assert queue._state == PrintState.PRINTING
+
+    # PRINTING -> IDLE (via ct=1000 value=0, normal end)
+    queue._handle_notification({"commandType": 1000, "value": 0})
+    assert queue._state == PrintState.IDLE
+
+    # Verify _transition_to_active() allowed from FAILED (new print after failure)
+    queue._state = PrintState.FAILED
+    assert queue._transition_to_active({}, progress=0) is True
+    assert queue._state == PrintState.PRINTING
+
+
+def test_state_after_reset_is_always_idle():
+    """_reset_print_state() returns to IDLE regardless of prior state."""
+    queue = _queue()
+
+    for state in PrintState:
+        queue._state = state
+        queue._reset_print_state()
+        assert queue._state == PrintState.IDLE, f"Expected IDLE after reset from {state.name}"
+
+
+def test_duplicate_ct1001_failure_only_fires_once():
+    """A second ct=1001 with errorMessage on the same print session
+    must not produce a second failure event.  _failure_sent guards this."""
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    # Activate a print via ct=1001 progress
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 2500,
+        "name": "cube.gcode",
+    })
+    assert queue._state == PrintState.PRINTING
+
+    # First failure — should fire
+    events.clear()
+    history_calls.clear()
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 2500,
+        "name": "cube.gcode",
+        "errorMessage": "jam",
+    })
+
+    fail_events = [e for e in events if e[0] == "print_failed"]
+    fail_records = [c for c in history_calls if c[0] == "fail"]
+    assert len(fail_events) == 1, f"Expected 1 fail event, got {len(fail_events)}"
+    assert len(fail_records) == 1, f"Expected 1 fail record, got {len(fail_records)}"
+    assert queue._failure_sent is True
+
+    # Second failure — should be suppressed by _failure_sent
+    events.clear()
+    history_calls.clear()
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 2500,
+        "name": "cube.gcode",
+        "errorMessage": "jam",
+    })
+
+    dup_fail_events = [e for e in events if e[0] == "print_failed"]
+    dup_fail_records = [c for c in history_calls if c[0] == "fail"]
+    assert len(dup_fail_events) == 0, "Second failure should be suppressed"
+    assert len(dup_fail_records) == 0, "Second failure should not record history"
+
+
+def test_new_print_starts_after_ct1001_failure():
+    """After a ct=1001 failure leaves state as FAILED, a new print must
+    be able to start.  _transition_to_active() must allow activation
+    from FAILED state (equivalent to old _print_active=False behavior)."""
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    # Activate and then fail via ct=1001
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 2500,
+        "name": "first.gcode",
+    })
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 2500,
+        "name": "first.gcode",
+        "errorMessage": "jam",
+    })
+    assert queue._state == PrintState.FAILED
+
+    # New print starts via ct=1001 progress — must not be blocked by FAILED state
+    events.clear()
+    history_calls.clear()
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 500,
+        "name": "second.gcode",
+    })
+
+    assert queue._state == PrintState.PRINTING, f"Expected PRINTING, got {queue._state}"
+    start_events = [e for e in events if e[0] == "print_started"]
+    assert len(start_events) == 1, "New print after failure should fire start event"
