@@ -325,3 +325,87 @@ def test_build_payload_get_state_and_simulate_event(monkeypatch):
     assert state_before["print"]["active"] is True
     assert queue.get_state()["debug_logging"] is True
     assert [call[0] for call in history_calls[-3:]] == ["start", "finish", "fail"]
+
+
+def test_out_of_order_ct1001_before_ct1000():
+    """ct=1001 (progress) arriving before ct=1000 (state=1) must not
+    produce duplicate history records or duplicate PRINT_STARTED events.
+    The consolidated _transition_to_active() guards against this."""
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    # Progress arrives first (out of order) — should activate print
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 2500,       # 25% on the 0-10000 scale
+        "name": "cube.gcode",
+    })
+
+    assert queue._print_active is True
+    start_events = [e for e in events if e[0] == "print_started"]
+    start_records = [c for c in history_calls if c[0] == "start"]
+    assert len(start_events) == 1, f"Expected 1 start event, got {len(start_events)}"
+    assert len(start_records) == 1, f"Expected 1 history start, got {len(start_records)}"
+
+    # State change arrives later — should be a no-op (already active)
+    events.clear()
+    history_calls.clear()
+    queue._handle_notification({"commandType": 1000, "value": 1})
+
+    late_start_events = [e for e in events if e[0] == "print_started"]
+    late_start_records = [c for c in history_calls if c[0] == "start"]
+    assert len(late_start_events) == 0, "ct=1000 should not fire a second start event"
+    assert len(late_start_records) == 0, "ct=1000 should not record a second history start"
+
+
+def test_pre_print_window_upgrades_to_full_print():
+    """When ct=1044 activates the pre-print window (G28/calibration),
+    ct=1000 value=1 should upgrade to full print activation with all
+    side effects (history, timelapse, event)."""
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    # Simulate the pre-print window state set by ct=1044
+    queue._print_active = True
+    queue._in_pre_print_window = True
+    queue._last_filename = "cube.gcode"
+
+    # ct=1000 value=1 should upgrade from pre-print to full print
+    queue._handle_notification({"commandType": 1000, "value": 1})
+
+    assert queue._print_active is True
+    assert queue._in_pre_print_window is False
+    start_events = [e for e in events if e[0] == "print_started"]
+    start_records = [c for c in history_calls if c[0] == "start"]
+    assert len(start_events) == 1, "Pre-print upgrade should fire start event"
+    assert len(start_records) == 1, "Pre-print upgrade should record history start"
+    assert len(timelapse_calls) > 0, "Pre-print upgrade should start timelapse"
+
+
+def test_ct1001_blocked_during_pre_print_window():
+    """Progress messages (ct=1001) during the pre-print window should NOT
+    upgrade to full print activation. Only ct=1000 value=1 does that."""
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    # Simulate the pre-print window state set by ct=1044
+    queue._print_active = True
+    queue._in_pre_print_window = True
+    queue._last_filename = "cube.gcode"
+
+    # ct=1001 progress should be blocked (caller guard: not self._print_active)
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 2500,
+        "name": "cube.gcode",
+    })
+
+    # Should still be in pre-print window, no activation side effects
+    assert queue._in_pre_print_window is True, "Pre-print window should not be cleared by ct=1001"
+    start_events = [e for e in events if e[0] == "print_started"]
+    start_records = [c for c in history_calls if c[0] == "start"]
+    assert len(start_events) == 0, "ct=1001 should not fire start event during pre-print"
+    assert len(start_records) == 0, "ct=1001 should not record history during pre-print"
