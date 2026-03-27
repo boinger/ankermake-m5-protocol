@@ -2834,9 +2834,9 @@ def add_security_headers(response):
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline'; "
         "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; "
+        "img-src 'self' data: blob:; "
         "connect-src 'self' ws: wss:; "
-        "media-src 'self';"
+        "media-src 'self' blob:;"
     )
     return response
 
