@@ -160,11 +160,12 @@ def load_config_from_api(auth_token, region, insecure):
     ), printers=[])
 
     log.info("Requesting printer list..")
-    printers = appapi.query_fdm_list()
+    printers = appapi.query_fdm_list() or []
 
     log.info("Requesting pppp keys..")
     sns = [pr["station_sn"] for pr in printers]
-    dsks = {dsk["station_sn"]: dsk for dsk in appapi.equipment_get_dsk_keys(station_sns=sns)["dsk_keys"]}
+    dsk_data = appapi.equipment_get_dsk_keys(station_sns=sns) or {}
+    dsks = {dsk["station_sn"]: dsk for dsk in dsk_data.get("dsk_keys") or []}
 
     # populate config object with printer list
     # Sort the list of printers by printer.id
