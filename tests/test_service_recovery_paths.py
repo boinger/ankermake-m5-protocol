@@ -324,3 +324,10 @@ def test_filetransfer_notify_upload_swallow_and_error_paths(monkeypatch):
     assert any(item.get("status") == "error" and "broken" in item.get("error", "") for item in uploads)
     assert {"status": "stopped"} in uploads
     assert notifier_events == []
+
+
+def test_holdoff_passed_safe_when_not_reset():
+    """Holdoff.passed must not crash when deadline has never been set."""
+    from web.lib.service import Holdoff
+    h = Holdoff()
+    assert h.passed is True

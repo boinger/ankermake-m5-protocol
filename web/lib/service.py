@@ -21,7 +21,7 @@ class Holdoff:
 
     @property
     def passed(self):
-        return datetime.now() > self.deadline
+        return self.deadline is None or datetime.now() > self.deadline
 
 
 class ServiceError(Exception):
@@ -196,7 +196,7 @@ class Service(Thread):
         pass
 
     def notify(self, data):
-        for handler in self.handlers:
+        for handler in list(self.handlers):
             handler(data)
 
     @contextlib.contextmanager
