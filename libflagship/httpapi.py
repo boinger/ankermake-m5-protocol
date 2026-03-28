@@ -86,7 +86,7 @@ class AnkerHTTPApi:
             full_headers["Gtoken"] = hashlib.md5(self._user_id.encode("utf-8")).hexdigest()
         if headers:
             full_headers.update(headers)
-        return requests.get(f"{self._base}{self.scope}{url}", headers=full_headers, verify=self._verify)
+        return requests.get(f"{self._base}{self.scope}{url}", headers=full_headers, verify=self._verify, timeout=(10, 30))
 
     @unwrap_api
     def _post(self, url, headers=None, data=None):
@@ -95,7 +95,7 @@ class AnkerHTTPApi:
             full_headers["Gtoken"] = hashlib.md5(self._user_id.encode("utf-8")).hexdigest()
         if headers:
             full_headers.update(headers)
-        return requests.post(f"{self._base}{self.scope}{url}", headers=full_headers, verify=self._verify, json=data)
+        return requests.post(f"{self._base}{self.scope}{url}", headers=full_headers, verify=self._verify, json=data, timeout=(10, 30))
 
 
 class AnkerHTTPAppApiV1(AnkerHTTPApi):
