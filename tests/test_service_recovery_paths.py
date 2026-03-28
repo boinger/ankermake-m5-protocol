@@ -331,3 +331,12 @@ def test_holdoff_passed_safe_when_not_reset():
     from web.lib.service import Holdoff
     h = Holdoff()
     assert h.passed is True
+
+
+def test_pppp_worker_stop_safe_without_api():
+    """worker_stop must not crash when worker_start failed before assigning _api."""
+    from web.service.pppp import PPPPService
+    svc = PPPPService.__new__(PPPPService)
+    # Simulate state after a failed worker_start (no _api attribute)
+    assert not hasattr(svc, "_api")
+    svc.worker_stop()  # should not raise

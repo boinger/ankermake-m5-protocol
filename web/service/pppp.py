@@ -178,8 +178,9 @@ class PPPPService(Service):
             self._drain_xzyh(chan=msg.chan)
 
     def worker_stop(self):
-        self._api.send(PktClose())
-        del self._api
+        if hasattr(self, "_api"):
+            self._api.send(PktClose())
+            del self._api
 
     @property
     def connected(self):
