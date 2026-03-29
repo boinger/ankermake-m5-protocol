@@ -1033,11 +1033,11 @@ def app_root():
         printers_list = []
         if cfg:
             anker_config = str(web.config.config_show(cfg))
-            config_existing_email = cfg.account.email
+            config_existing_email = cfg.account.email if cfg.account else ""
             printer = cfg.printers[app.config["printer_index"]]
             upload_rate_mbps, upload_rate_source = cli.util.resolve_upload_rate_mbps_with_source(cfg)
             upload_rate_config = getattr(cfg, "upload_rate_mbps", None)
-            country = cfg.account.country
+            country = cfg.account.country if cfg.account else ""
             for i, p in enumerate(cfg.printers):
                 printers_list.append({
                     "index": i,

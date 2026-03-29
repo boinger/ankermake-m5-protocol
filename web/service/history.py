@@ -44,7 +44,7 @@ class PrintHistory:
     def _recreate_db_after_corruption(self, exc):
         db_path = os.fspath(self._db_path)
         if db_path == ":memory:":
-            raise
+            raise exc
         log.warning(f"History: database corruption detected at {db_path}: {exc}. Recreating database.")
         try:
             os.unlink(db_path)
