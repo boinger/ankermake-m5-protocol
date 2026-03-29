@@ -249,8 +249,9 @@ class HomeAssistantService:
             if vq:
                 turn_on = payload.upper() == "ON"
                 vq.api_light_state(turn_on)
-                self._state["light"] = turn_on
-                self._publish_state()
+                with self._lock:
+                    self._state["light"] = turn_on
+                    self._publish_state()
                 log.info(f"HA MQTT: light {'ON' if turn_on else 'OFF'}")
             else:
                 log.warning("HA MQTT: videoqueue not available for light control")
@@ -273,14 +274,15 @@ class HomeAssistantService:
         if not self._enabled or not self._connected:
             return
 
-        changed = False
-        for key, value in kwargs.items():
-            if key in self._state and self._state[key] != value:
-                self._state[key] = value
-                changed = True
+        with self._lock:
+            changed = False
+            for key, value in kwargs.items():
+                if key in self._state and self._state[key] != value:
+                    self._state[key] = value
+                    changed = True
 
-        if changed:
-            self._publish_state()
+            if changed:
+                self._publish_state()
 
     # ------------------------------------------------------------------
     # MQTT Publishing
