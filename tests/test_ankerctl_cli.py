@@ -108,3 +108,37 @@ def test_config_password_commands_validate_generate_and_remove(monkeypatch):
     assert removed.exit_code == 0
     assert fake_config.api_keys == ["RANDOMKEY1234567890"]
     assert fake_config.removed == 1
+
+
+class FakeConfigContext:
+    """Minimal config manager for testing mqtt_open/pppp_open bounds checks."""
+    def __init__(self, printers):
+        self._printers = printers
+
+    def open(self):
+        return self
+
+    def __enter__(self):
+        return SimpleNamespace(
+            printers=self._printers,
+            account=SimpleNamespace(region="eu", auth_token="fake", user_id="fake"),
+        )
+
+    def __exit__(self, *args):
+        pass
+
+
+def test_mqtt_open_raises_on_invalid_printer_index():
+    import cli.mqtt
+    config = FakeConfigContext(printers=[])
+    import pytest
+    with pytest.raises(ValueError, match="out of range"):
+        cli.mqtt.mqtt_open(config, printer_index=0, insecure=False)
+
+
+def test_pppp_open_raises_on_invalid_printer_index():
+    import cli.pppp
+    config = FakeConfigContext(printers=[])
+    import pytest
+    with pytest.raises(ValueError, match="out of range"):
+        cli.pppp.pppp_open(config, printer_index=0)

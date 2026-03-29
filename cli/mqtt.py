@@ -19,7 +19,7 @@ def mqtt_open(config, printer_index, insecure):
 
     with config.open() as cfg:
         if printer_index >= len(cfg.printers):
-            log.critical(f"Printer number {printer_index} out of range, max printer number is {len(cfg.printers)-1} ")
+            raise ValueError(f"Printer number {printer_index} out of range, max printer number is {len(cfg.printers)-1}")
         printer = cfg.printers[printer_index]
         acct = cfg.account
         server = servertable[acct.region]
