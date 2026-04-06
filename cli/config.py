@@ -84,6 +84,7 @@ class BaseConfigManager:
     def save(self, name, value):
         path = self.config_path(name)
         path.write_text(json.dumps(value, default=self._save_json, indent=2) + "\n")
+        path.chmod(0o600)
 
 
 class AnkerConfigManager(BaseConfigManager):

@@ -271,27 +271,12 @@ class VideoQueue(Service):
                 gap = now - self.last_frame_at
                 if gap > _STALL_TIMEOUT:
                     if now - self._last_live_refresh_at >= _LIVE_REFRESH_COOLDOWN:
-                        self._last_live_refresh_at = now
-                        log.warning(f"VideoQueue: No video frames for {gap:.1f}s; restarting live stream")
-                        try:
-                            self._live_active = False
-                            self.api_stop_live()
-                            time.sleep(0.5)
-                            if not pppp or not getattr(pppp, "connected", False):
-                                log.warning("VideoQueue: PPPP unavailable during live refresh")
-                                time.sleep(0.5)
-                                return
-                            if not self._start_live_if_needed(force=True):
-                                self._stall_retry_count += 1
-                                log.warning(f"VideoQueue: Failed to restart live stream (attempt {self._stall_retry_count}/{_STALL_MAX_RETRIES})")
-                                if self._stall_retry_count >= _STALL_MAX_RETRIES:
-                                    raise ServiceRestartSignal("Video stall recovery exhausted")
-                            else:
-                                self._stall_retry_count = 0
-                        except ServiceRestartSignal:
-                            raise
-                        except Exception as exc:
-                            log.warning(f"VideoQueue: Failed to refresh live stream ({exc})")
+                        self._attempt_stall_recovery(
+                            pppp,
+                            f"VideoQueue: No video frames for {gap:.1f}s; restarting live stream",
+                            "VideoQueue: Failed to restart live stream",
+                            "Video stall recovery exhausted",
+                        )
                     time.sleep(0.5)
                     return
             elif self._live_started_at is not None:
@@ -301,29 +286,44 @@ class VideoQueue(Service):
                         log.info(f"VideoQueue: No initial frame yet after {since_start:.1f}s; waiting")
                         self._last_no_frame_log_at = now
                     if now - self._last_live_refresh_at >= _LIVE_REFRESH_COOLDOWN:
-                        self._last_live_refresh_at = now
-                        log.warning("VideoQueue: Re-requesting live stream (no initial frame)")
-                        try:
-                            self._live_active = False
-                            self.api_stop_live()
-                            time.sleep(0.5)
-                            if not pppp or not getattr(pppp, "connected", False):
-                                log.warning("VideoQueue: PPPP unavailable during initial-frame refresh")
-                                time.sleep(0.5)
-                                return
-                            if not self._start_live_if_needed(force=True):
-                                self._stall_retry_count += 1
-                                log.warning(f"VideoQueue: Failed to restart live stream for initial-frame recovery (attempt {self._stall_retry_count}/{_STALL_MAX_RETRIES})")
-                                if self._stall_retry_count >= _STALL_MAX_RETRIES:
-                                    raise ServiceRestartSignal("Video stall recovery exhausted (no initial frame)")
-                            else:
-                                self._stall_retry_count = 0
-                        except ServiceRestartSignal:
-                            raise
-                        except Exception as exc:
-                            log.warning(f"VideoQueue: Failed to refresh live stream ({exc})")
+                        self._attempt_stall_recovery(
+                            pppp,
+                            "VideoQueue: Re-requesting live stream (no initial frame)",
+                            "VideoQueue: Failed to restart live stream for initial-frame recovery",
+                            "Video stall recovery exhausted (no initial frame)",
+                        )
                     time.sleep(0.5)
                     return
+
+    def _attempt_stall_recovery(self, pppp, warn_msg, retry_fail_msg, exhaust_msg):
+        """Stop and restart the live stream after a stall.
+
+        Updates self._last_live_refresh_at, increments self._stall_retry_count on
+        failure, resets it on success.  Raises ServiceRestartSignal when max retries
+        are exceeded.  All other exceptions are logged and swallowed so the caller
+        can continue the polling loop.
+        """
+        self._last_live_refresh_at = time.monotonic()
+        log.warning(warn_msg)
+        try:
+            self._live_active = False
+            self.api_stop_live()
+            time.sleep(0.5)
+            if not pppp or not getattr(pppp, "connected", False):
+                log.warning("VideoQueue: PPPP unavailable during live refresh")
+                time.sleep(0.5)
+                return
+            if not self._start_live_if_needed(force=True):
+                self._stall_retry_count += 1
+                log.warning(f"{retry_fail_msg} (attempt {self._stall_retry_count}/{_STALL_MAX_RETRIES})")
+                if self._stall_retry_count >= _STALL_MAX_RETRIES:
+                    raise ServiceRestartSignal(exhaust_msg)
+            else:
+                self._stall_retry_count = 0
+        except ServiceRestartSignal:
+            raise
+        except Exception as exc:
+            log.warning(f"VideoQueue: Failed to refresh live stream ({exc})")
 
     def worker_stop(self):
         try:
@@ -345,6 +345,7 @@ class VideoQueue(Service):
         self._live_started_at = None
 
     def set_video_enabled(self, enabled):
+        self.persistent = enabled
         if enabled == self.video_enabled:
             return True
 

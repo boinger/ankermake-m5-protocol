@@ -32,7 +32,7 @@ class PPPPError(Exception):
 @dataclass
 class FileUploadInfo:
     name: str
-    size: str
+    size: int
     md5: str
     user_name: str
     user_id: str
@@ -56,7 +56,7 @@ class FileUploadInfo:
     def from_file(cls, filename, user_name, user_id, machine_id, type=0):
         with open(filename, "rb") as f:
             data = f.read()
-        return cls.from_data(data, filename, user_name, user_id, machine_id, type=0)
+        return cls.from_data(data, filename, user_name, user_id, machine_id, type=type)
 
     @classmethod
     def from_data(cls, data, filename, user_name, user_id, machine_id, type=0):

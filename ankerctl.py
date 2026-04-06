@@ -163,11 +163,11 @@ def mqtt_send(env, command_type, args, force):
     if not force:
         if command_type == MqttMsgType.ZZ_MQTT_CMD_RECOVER_FACTORY.value:
             log.fatal("Refusing to perform factory reset (override with --force)")
-            return
+            raise SystemExit(1)
 
         if command_type == MqttMsgType.ZZ_MQTT_CMD_DEVICE_NAME_SET and "devName" not in cmd:
             log.fatal("Sending DEVICE_NAME_SET without devName=<name> will crash printer (override with --force)")
-            return
+            raise SystemExit(1)
 
     client = cli.mqtt.mqtt_open(env.config, env.printer_index, env.insecure)
     cli.mqtt.mqtt_command(client, cmd)
@@ -222,7 +222,7 @@ def mqtt_gcode_dump(env, gcode, window, drain):
     msgs = cli.mqtt.mqtt_gcode_dump(client, gcode, collect_window=window)
     if not msgs:
         log.error("No response from printer")
-        return
+        raise SystemExit(1)
     for m in msgs:
         all_data.append(m.get("resData", ""))
 
@@ -627,10 +627,10 @@ def config_set_password(env, key):
         ok, err = cli.config.validate_api_key(key)
         if not ok:
             log.critical(err)
-            return
+            raise SystemExit(1)
 
     env.config.set_api_key(key)
-    log.info(f"API key set: {key}")
+    click.echo(f"API key: {key}")
     log.info("Use this key as X-Api-Key header in your slicer,")
     log.info("or pass it as ?apikey= URL parameter in your browser.")
 
@@ -655,7 +655,7 @@ def webserver(env):
 @click.option("--host", default='127.0.0.1', envvar="FLASK_HOST", help="Network interface to bind to")
 @click.option("--port", default=4470, envvar="FLASK_PORT", help="Port to bind to")
 @pass_env
-def webserver(env, host, port):
+def webserver_run(env, host, port):
     import web
     web.webserver(env.config, env.printer_index, host, port, env.insecure, pppp_dump=env.pppp_dump)
 

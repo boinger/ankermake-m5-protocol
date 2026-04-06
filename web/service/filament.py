@@ -316,9 +316,16 @@ class FilamentStore:
                     f"ALTER TABLE filaments RENAME COLUMN {old_col} TO {new_col}"
                 )
                 log.info("Filament store: renamed column %s -> %s", old_col, new_col)
-            except Exception:
+            except sqlite3.OperationalError:
                 # Column doesn't exist (already renamed) or SQLite too old — skip
                 pass
+            except Exception as exc:
+                log.warning(
+                    "Filament store: could not rename column %s -> %s: %s",
+                    old_col,
+                    new_col,
+                    exc,
+                )
 
         # Add any missing new columns
         existing = {

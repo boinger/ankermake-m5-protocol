@@ -58,21 +58,28 @@ class FileSizeType(click.ParamType):
     name = "filesize"
 
     def convert(self, value, param, ctx):
-        value = value.lower().rstrip("b")
-        try:
-            num = int(value[:-1])
-            if value.endswith("k"):
-                return num * 1024**1
-            elif value.endswith("m"):
-                return num * 1024**2
-            elif value.endswith("g"):
-                return num * 1024**3
-            elif value.endswith("t"):
-                return num * 1024**4
-            else:
-                raise ValueError()
-        except ValueError:
-            self.fail("Invalid file size: use {kb,gb,mb,tb} suffix (examples: 1337kb, 42mb, 17gb)", param, ctx)
+        value = str(value).strip().lower()
+        match = re.fullmatch(r"(\d+)([kmgt])?b?", value)
+        if not match:
+            self.fail(
+                "Invalid file size: use a whole number of bytes or a {k,m,g,t}[b] suffix "
+                "(examples: 1, 1337kb, 42mb, 17gb)",
+                param,
+                ctx
+            )
+
+        num = int(match.group(1))
+        unit = match.group(2)
+        if unit == "k":
+            return num * 1024**1
+        elif unit == "m":
+            return num * 1024**2
+        elif unit == "g":
+            return num * 1024**3
+        elif unit == "t":
+            return num * 1024**4
+        else:
+            return num
 
 
 def parse_json(msg):

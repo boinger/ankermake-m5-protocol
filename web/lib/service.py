@@ -349,8 +349,6 @@ class ServiceManager:
         if not self.refs[name]:
             if getattr(svc, "persistent", False):
                 return
-            if name == "videoqueue" and getattr(svc, "video_enabled", False):
-                return
             svc.stop()
 
     @contextlib.contextmanager

@@ -696,7 +696,8 @@ def _validate_ws_auth(sock):
         return True
     if session.get("authenticated"):
         return True
-    if request.headers.get("X-Api-Key") == api_key:
+    header_key = request.headers.get("X-Api-Key")
+    if header_key and secrets.compare_digest(header_key, api_key):
         return True
     try:
         sock.send(json.dumps({"error": "unauthorized"}))
@@ -1647,6 +1648,8 @@ def app_api_printer_control():
         value = int(payload["value"])
     except (ValueError, TypeError):
         return {"error": "Value must be an integer"}, 400
+    if value not in {0, 2, 3, 4}:
+        return {"error": "Invalid control value"}, 400
 
     with borrow_mqtt() as mqtt:
         mqtt.send_print_control(value)
@@ -2856,15 +2859,23 @@ _PROTECTED_GET_PATHS = {
     "/api/debug/state",
     "/api/debug/logs",
     "/api/debug/services",
+    "/api/snapshot",
     # Sensitive credential exposure: HA MQTT password, Apprise URLs/keys
     "/api/settings/mqtt",
     "/api/settings/filament-service",
+    "/api/settings/timelapse",
     "/api/notifications/settings",
     # Exposes printer serial numbers, IP addresses, and MAC addresses
     "/api/printers",
+    "/api/printer/bed-leveling",
+    "/api/printer/bed-leveling/last",
     "/api/printer/settings-summary",
+    "/api/printer/z-offset",
     # Exposes full print history (filenames, timestamps, durations)
+    "/api/filaments",
+    "/api/filaments/service/swap",
     "/api/history",
+    "/api/timelapses",
 }
 
 # POST endpoints needed for initial printer setup (config import / login)
@@ -2978,7 +2989,8 @@ def _check_api_key():
     # Allow read-only (GET/HEAD/OPTIONS) unless the path is explicitly protected.
     # Also protect any path under /api/debug/ (prefix match for dynamic segments).
     is_debug_path = request.path.startswith("/api/debug/")
-    if request.method in ("GET", "HEAD", "OPTIONS") and request.path not in _PROTECTED_GET_PATHS and not is_debug_path:
+    is_timelapse_path = request.path.startswith("/api/timelapse/")
+    if request.method in ("GET", "HEAD", "OPTIONS") and request.path not in _PROTECTED_GET_PATHS and not is_debug_path and not is_timelapse_path:
         return None
 
     # Allow setup endpoints when no printer is configured yet

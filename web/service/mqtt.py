@@ -78,6 +78,7 @@ class MqttQueue(Service):
         self._ha = HomeAssistantService(app.config["config"], printer_sn=printer_sn, printer_name=printer_name)
         self._ha.start()
 
+        self._state_lock = threading.RLock()
         self._reset_print_state()
         self._gcode_layer_count = None  # Override from GCode header, survives print resets
         self._last_message_time = 0.0
@@ -121,6 +122,18 @@ class MqttQueue(Service):
         if not hasattr(self, "_debug_log_payloads"):
              self._debug_log_payloads = False
 
+    def _record_failure(self, payload, progress, reason):
+        """Record a print failure: history, timelapse, HA state, and notification event."""
+        self._history.record_fail(filename=self._last_filename, reason=reason, task_id=self._last_task_id)
+        self._timelapse.fail_capture()
+        self._ha.update_state(print_status="failed")
+        self._send_event(
+            EVENT_PRINT_FAILED,
+            self._build_payload(payload, progress, failure_reason=reason),
+        )
+        self._failure_sent = True
+        self._state = PrintState.FAILED
+
     def _transition_to_active(self, payload, progress, filename=None):
         """Activate print state.  Handles both fresh activation and upgrade
         from the pre-print window.  No-op if already fully active.
@@ -155,17 +168,20 @@ class MqttQueue(Service):
 
     @property
     def is_printing(self):
-        return self._state in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED)
+        with self._state_lock:
+            return self._state in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED)
 
     @property
     def is_preparing_print(self):
         # Hardware preparing state (firmware sent value=8) while not actively printing.
         # Distinct from PREPARING enum state (software pending start from FileTransferService).
-        return self._last_state_value == 8 and self._state not in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED)
+        with self._state_lock:
+            return self._last_state_value == 8 and self._state not in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED)
 
     @property
     def has_pending_print_start(self):
-        return self._state == PrintState.PREPARING
+        with self._state_lock:
+            return self._state == PrintState.PREPARING
 
     @property
     def history(self):
@@ -205,12 +221,13 @@ class MqttQueue(Service):
         self._send_status_query()
 
     def mark_pending_print_start(self, filename=None, task_id=None):
-        if filename:
-            self._last_filename = filename
-        if task_id:
-            self._last_task_id = task_id
-        self._state = PrintState.PREPARING
-        self._stop_requested = False
+        with self._state_lock:
+            if filename:
+                self._last_filename = filename
+            if task_id:
+                self._last_task_id = task_id
+            self._state = PrintState.PREPARING
+            self._stop_requested = False
         log.info("Marked pending print start for %r", self._last_filename)
 
     @staticmethod
@@ -333,7 +350,8 @@ class MqttQueue(Service):
                     obj = dict(obj, total_layer=self._gcode_layer_count)
                 self.notify(obj)
                 self._forward_to_ha(obj)
-                self._handle_notification(obj)
+                with self._state_lock:
+                    self._handle_notification(obj)
 
     def worker_stop(self):
         self._ha.update_state(mqtt_connected=False)
@@ -348,7 +366,7 @@ class MqttQueue(Service):
         }
         try:
             self.client.query(cmd)
-        except Exception as e:
+        except (OSError, TimeoutError) as e:
             log.warning(f"Failed to query printer status: {e}")
 
     @staticmethod
@@ -614,15 +632,7 @@ class MqttQueue(Service):
                     if self._stop_requested:
                         # Print was cancelled via stop command
                         log.info(f"History: print cancelled (ct 1000 value=0 after stop), filename={self._last_filename!r}")
-                        self._history.record_fail(filename=self._last_filename, reason="cancelled", task_id=self._last_task_id)
-                        self._timelapse.fail_capture()
-                        self._ha.update_state(print_status="failed")
-                        self._send_event(
-                            EVENT_PRINT_FAILED,
-                            self._build_payload(payload, self._last_progress or 0, failure_reason="cancelled"),
-                        )
-                        self._failure_sent = True
-                        self._state = PrintState.FAILED
+                        self._record_failure(payload, self._last_progress or 0, "cancelled")
                     else:
                         # Print ended normally
                         log.info(f"History: print finished (ct 1000 value=0), filename={self._last_filename!r}")
@@ -637,15 +647,7 @@ class MqttQueue(Service):
                 elif self._stop_requested:
                     # Pre-print setup or a queued start was cancelled before the print became active.
                     log.info(f"History: pre-print start cancelled, filename={self._last_filename!r}")
-                    self._history.record_fail(filename=self._last_filename, reason="cancelled", task_id=self._last_task_id)
-                    self._timelapse.fail_capture()
-                    self._ha.update_state(print_status="failed")
-                    self._send_event(
-                        EVENT_PRINT_FAILED,
-                        self._build_payload(payload, self._last_progress or 0, failure_reason="cancelled"),
-                    )
-                    self._failure_sent = True
-                    self._state = PrintState.FAILED
+                    self._record_failure(payload, self._last_progress or 0, "cancelled")
                 else:
                     log.info("Pending print start ended without an active print; resetting state")
                 self._reset_print_state()
@@ -661,19 +663,7 @@ class MqttQueue(Service):
                         "History: print aborted (ct 1000 value=8), filename=%r",
                         self._last_filename,
                     )
-                    self._history.record_fail(
-                        filename=self._last_filename,
-                        reason="aborted",
-                        task_id=self._last_task_id,
-                    )
-                    self._timelapse.fail_capture()
-                    self._ha.update_state(print_status="failed")
-                    self._send_event(
-                        EVENT_PRINT_FAILED,
-                        self._build_payload(payload, self._last_progress or 0, failure_reason="aborted"),
-                    )
-                    self._failure_sent = True
-                    self._state = PrintState.FAILED
+                    self._record_failure(payload, self._last_progress or 0, "aborted")
                     self._reset_print_state()
             elif value == 8:
                 self._state = PrintState.IDLE
@@ -726,15 +716,7 @@ class MqttQueue(Service):
 
         failure_reason = self._extract_failure_reason(payload)
         if failure_reason and self._state == PrintState.PRINTING and not self._failure_sent:
-            self._send_event(
-                EVENT_PRINT_FAILED,
-                self._build_payload(payload, progress, failure_reason=failure_reason),
-            )
-            self._history.record_fail(filename=self._last_filename, reason=failure_reason, task_id=self._last_task_id)
-            self._timelapse.fail_capture()
-            self._ha.update_state(print_status="failed")
-            self._failure_sent = True
-            self._state = PrintState.FAILED
+            self._record_failure(payload, progress, failure_reason)
             return
 
         if 0 < progress < 100 and self._state not in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED):
@@ -977,7 +959,8 @@ class MqttQueue(Service):
         )
 
         if value in (0, 4) and (self._state in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED) or pre_start_window):
-            self._stop_requested = True
+            with self._state_lock:
+                self._stop_requested = True
 
         if value in (0, 4) and pre_start_window:
             # Firmware variants differ in which cancel payload they accept during the
