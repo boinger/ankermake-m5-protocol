@@ -29,6 +29,7 @@ def _queue():
     queue._z_offset_updated_at = 0.0
     queue._z_offset_seq = 0
     queue._z_offset_cond = __import__("threading").Condition()
+    queue._state_lock = __import__("threading").RLock()
     queue._gcode_layer_count = None
     queue._last_message_time = 0.0
     queue._nozzle_temp = None
