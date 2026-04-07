@@ -40,6 +40,18 @@ from contextlib import contextmanager
 log = logging.getLogger("web")
 
 
+class _StaticAssetAccessLogFilter(logging.Filter):
+    def filter(self, record):
+        message = record.getMessage()
+        return '"GET /static/' not in message and '"GET /favicon.ico' not in message
+
+
+def _configure_access_log_noise():
+    werkzeug_log = logging.getLogger("werkzeug")
+    if not any(isinstance(f, _StaticAssetAccessLogFilter) for f in werkzeug_log.filters):
+        werkzeug_log.addFilter(_StaticAssetAccessLogFilter())
+
+
 from secrets import token_urlsafe as token
 from flask import Flask, flash, request, render_template, Response, session, url_for, jsonify
 from flask_sock import Sock
@@ -716,9 +728,17 @@ def mqtt(sock):
     if not _validate_ws_auth(sock):
         return
 
-    for data in stream_mqtt():
-        log.debug(f"MQTT message: {data}")
-        sock.send(json.dumps(data))
+    try:
+        for data in stream_mqtt():
+            log.debug(f"MQTT message: {data}")
+            sock.send(json.dumps(data))
+    except ConnectionClosed:
+        log.debug("/ws/mqtt closed by client")
+    except OSError as exc:
+        log.debug(f"/ws/mqtt closed during send: {exc}")
+    except Exception as exc:
+        log.warning(f"/ws/mqtt error: {exc}")
+        log.info("Stack trace:", exc_info=True)
 
 
 @sock.route("/ws/video")
@@ -739,15 +759,30 @@ def video(sock):
     if not vq:
         return
 
-    vq.set_video_enabled(True)
+    vq.viewer_connected()
     try:
         for msg in app.svc.stream("videoqueue"):
-            sock.send(msg.data)
+            payload = getattr(msg, "data", None)
+            if not payload:
+                continue
+            sock.send(payload)
+    except ConnectionClosed:
+        log.debug("/ws/video closed by client")
+    except OSError as exc:
+        log.debug(f"/ws/video closed during send: {exc}")
+    except Exception as exc:
+        log.warning(f"/ws/video error: {exc}")
+        log.info("Stack trace:", exc_info=True)
     finally:
-        # Only disable video if no other clients are consuming the stream.
-        # refs > 0 means other /ws/video handlers are still inside stream() → borrow().
-        if app.svc.refs.get("videoqueue", 0) == 0:
-            vq.set_video_enabled(False)
+        # /ws/video is only a consumer of the shared video service.
+        # The explicit owner of video enable/disable is /ws/ctrl via
+        # {"video_enabled": true/false}.  Do not tear the service down here,
+        # because transient websocket disconnects or reconnects would otherwise
+        # stop live video for the whole app.
+        try:
+            vq.viewer_disconnected()
+        except Exception as exc:
+            log.debug(f"/ws/video cleanup failed: {exc}")
 
 
 def _maybe_start_pppp_probe(reason="scheduled"):
@@ -900,7 +935,7 @@ def pppp_state(sock):
 
             time.sleep(1.0)
     except ConnectionClosed:
-        log.info("WebSocket connection closed by client")
+        log.debug("WebSocket connection closed by client")
     except Exception as e:
         log.warning(f"Error in PPPP state websocket handler: {e}")
         log.info("Stack trace:", exc_info=True)
@@ -910,7 +945,7 @@ def pppp_state(sock):
                 app.pppp_probe["client_count"] -= 1
         except Exception as exc:
             log.debug(f"PPPP state cleanup failed: {exc}")
-        log.info("PPPP state websocket handler ending")
+        log.debug("PPPP state websocket handler ending")
 
 
 @sock.route("/ws/upload")
@@ -923,8 +958,16 @@ def upload(sock):
     if not _validate_ws_auth(sock):
         return
 
-    for data in app.svc.stream("filetransfer"):
-        sock.send(json.dumps(data))
+    try:
+        for data in app.svc.stream("filetransfer"):
+            sock.send(json.dumps(data))
+    except ConnectionClosed:
+        log.debug("/ws/upload closed by client")
+    except OSError as exc:
+        log.debug(f"/ws/upload closed during send: {exc}")
+    except Exception as exc:
+        log.warning(f"/ws/upload error: {exc}")
+        log.info("Stack trace:", exc_info=True)
 
 
 @sock.route("/ws/ctrl")
@@ -2708,6 +2751,7 @@ def webserver(config, printer_index, host, port, insecure=False, **kwargs):
     def inject_debug():
         return {"debug_mode": os.getenv("ANKERCTL_DEV_MODE", "false").lower() == "true"}
 
+    _configure_access_log_noise()
     app.run(host=host, port=port)
 
 

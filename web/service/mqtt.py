@@ -59,6 +59,10 @@ class MqttQueue(Service):
         self.persistent = True
         self._state_lock = threading.RLock()
 
+    @property
+    def name(self):
+        return f"MqttQueue[{self.printer_index}]"
+
     def worker_init(self):
         self._notifier = AppriseNotifier(app.config["config"])
         config_root = str(app.config["config"].config_root)
@@ -333,7 +337,7 @@ class MqttQueue(Service):
 
         for msg, body in self.client.fetch(timeout=timeout):
             self._last_message_time = time.time()
-            log.info(f"TOPIC [{msg.topic}]")
+            log.debug(f"TOPIC [{msg.topic}]")
             log.debug(enhex(msg.payload[:]))
             if body and getattr(self, "_debug_log_payloads", False):
                 import json

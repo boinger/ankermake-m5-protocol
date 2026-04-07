@@ -555,32 +555,93 @@ $(function () {
         reconnect: 2000,
 
         open: function () {
+            this.videoQueue = [];
+            this.videoBufferMinPackets = 4;
+            this.videoBufferDelayMs = 300;
+            this.videoBufferMaxPackets = 300;
+            this.videoPumpMaxPacketsPerTick = 12;
+            this.videoBuffering = true;
             this.jmuxer = new JMuxer({
                 node: "player",
                 mode: "video",
                 flushingTime: 0,
                 fps: 15,
                 // debug: true,
-                onReady: function (data) {
-                    console.log(data);
-                },
                 onError: function (data) {
-                    console.log(data);
+                    console.warn("JMuxer video error", data);
                 },
             });
+            this.videoPump = window.setInterval(() => {
+                if (!this.jmuxer)
+                    return;
+
+                const now = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
+                if (this.videoBuffering) {
+                    const firstPacket = this.videoQueue[0];
+                    const firstPacketAge = firstPacket ? now - firstPacket.receivedAt : 0;
+                    if (this.videoQueue.length < this.videoBufferMinPackets && firstPacketAge < this.videoBufferDelayMs) {
+                        return;
+                    }
+                    this.videoBuffering = false;
+                }
+
+                let fedPackets = 0;
+                while (this.videoQueue.length && fedPackets < this.videoPumpMaxPacketsPerTick) {
+                    const packet = this.videoQueue[0];
+                    const packetAge = now - packet.receivedAt;
+                    if (packetAge < this.videoBufferDelayMs && this.videoQueue.length <= this.videoBufferMinPackets) {
+                        break;
+                    }
+                    this.videoQueue.shift();
+                    try {
+                        this.jmuxer.feed({
+                            video: new Uint8Array(packet.data),
+                        });
+                    } catch (err) {
+                        console.log({ type: "video", name: err?.name || "feed", error: err?.message || String(err) });
+                        this.videoBuffering = true;
+                        return;
+                    }
+                    fedPackets++;
+                }
+
+                if (!fedPackets && !this.videoQueue.length) {
+                    this.videoBuffering = true;
+                }
+            }, 16);
         },
 
         message: function (event) {
-            this.jmuxer.feed({
-                video: new Uint8Array(event.data),
+            if (!(event.data instanceof ArrayBuffer) || event.data.byteLength === 0) {
+                return;
+            }
+            if (!this.videoQueue) {
+                this.videoQueue = [];
+            }
+            const now = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
+            this.videoQueue.push({
+                data: event.data.slice(0),
+                receivedAt: now,
             });
+            if (this.videoQueue.length > this.videoBufferMaxPackets) {
+                this.videoQueue.splice(0, this.videoQueue.length - this.videoBufferMaxPackets);
+                this.videoBuffering = true;
+            }
         },
 
         close: function () {
+            if (this.videoPump) {
+                window.clearInterval(this.videoPump);
+                this.videoPump = null;
+            }
+            this.videoQueue = [];
+            this.videoBuffering = true;
+
             if (!this.jmuxer)
                 return;
 
             this.jmuxer.destroy();
+            this.jmuxer = null;
 
             /* Clear video source (to show loading animation) */
             $("#player").attr("src", "");
@@ -607,10 +668,42 @@ $(function () {
         videoPlayer.addEventListener("resize", updateVideoResolution);
     }
 
+    const ctrlPendingMessages = [];
+    function sendCtrlMessage(payload) {
+        const message = JSON.stringify(payload);
+        if (sockets.ctrl.ws && sockets.ctrl.ws.readyState === WebSocket.OPEN) {
+            try {
+                sockets.ctrl.ws.send(message);
+                return true;
+            } catch (err) {
+                console.warn("ctrl socket: send failed, queueing message", err);
+            }
+        }
+        ctrlPendingMessages.push(message);
+        return false;
+    }
+
+    function flushCtrlMessages() {
+        if (!sockets.ctrl.ws || sockets.ctrl.ws.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        while (ctrlPendingMessages.length) {
+            const message = ctrlPendingMessages.shift();
+            try {
+                sockets.ctrl.ws.send(message);
+            } catch (err) {
+                ctrlPendingMessages.unshift(message);
+                console.warn("ctrl socket: failed to flush queued message", err);
+                return;
+            }
+        }
+    }
+
     sockets.ctrl = new AutoWebSocket({
         name: "Control socket",
         url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/ctrl`,
         badge: "#badge-ctrl",
+        opened: flushCtrlMessages,
         message: function (event) {
             let data = null;
             try {
@@ -618,6 +711,7 @@ $(function () {
             } catch (err) {
                 return;
             }
+            flushCtrlMessages();
             if (data.video_profile) {
                 setVideoProfileActive(data.video_profile);
             }
@@ -731,9 +825,7 @@ $(function () {
         if (videoEnabled) {
             $("#vplayer").show();
             $(this).html('<i class="bi bi-camera-video-off"></i> Disable Video');
-            if (sockets.ctrl.ws) {
-                sockets.ctrl.ws.send(JSON.stringify({ video_enabled: true }));
-            }
+            sendCtrlMessage({ video_enabled: true });
             sockets.video.autoReconnect = true;
             if (!sockets.video.ws) {
                 sockets.video.connect();
@@ -741,9 +833,7 @@ $(function () {
         } else {
             $("#vplayer").hide();
             $(this).html('<i class="bi bi-camera-video"></i> Enable Video');
-            if (sockets.ctrl.ws) {
-                sockets.ctrl.ws.send(JSON.stringify({ video_enabled: false }));
-            }
+            sendCtrlMessage({ video_enabled: false });
             sockets.video.autoReconnect = false;
             if (sockets.video.ws) {
                 try {
@@ -768,7 +858,7 @@ $(function () {
      * On click of element with id "light-on", sends JSON data to wsctrl to turn light on
      */
     $("#light-on").on("click", function () {
-        sockets.ctrl.ws.send(JSON.stringify({ light: true }));
+        sendCtrlMessage({ light: true });
         setLightActive(true);
         return false;
     });
@@ -777,7 +867,7 @@ $(function () {
      * On click of element with id "light-off", sends JSON data to wsctrl to turn light off
      */
     $("#light-off").on("click", function () {
-        sockets.ctrl.ws.send(JSON.stringify({ light: false }));
+        sendCtrlMessage({ light: false });
         setLightActive(false);
         return false;
     });
@@ -788,9 +878,7 @@ $(function () {
     $(".video-profile-btn").on("click", function () {
         const profile = $(this).data("video-profile");
         setVideoProfileActive(profile);
-        if (sockets.ctrl.ws) {
-            sockets.ctrl.ws.send(JSON.stringify({ video_profile: profile }));
-        }
+        sendCtrlMessage({ video_profile: profile });
         return false;
     });
 

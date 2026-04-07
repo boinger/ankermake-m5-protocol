@@ -213,7 +213,7 @@ class TestVideoServiceStallRecovery:
 
     @patch('web.service.video.VideoQueue')
     def test_video_stall_detection_triggers_soft_restart(self, mock_vq):
-        """No frames for 60s triggers soft restart"""
+        """No frames past the configured timeout triggers soft restart"""
         from web.service.video import VideoQueue, _STALL_TIMEOUT
 
         vq = VideoQueue()

@@ -68,11 +68,15 @@ class Service(Thread):
         return type(self).__name__
 
     def start(self):
+        if self.wanted or self.state in (RunState.Starting, RunState.Running):
+            return
         log.info(f"{self.name}: Requesting start")
         self.wanted = True
         self._event.set()
 
     def stop(self):
+        if (not self.wanted) or self.state in (RunState.Stopping, RunState.Stopped):
+            return
         log.info(f"{self.name}: Requesting stop")
         self.wanted = False
         self._event.set()
@@ -240,6 +244,7 @@ class ServiceManager:
     def __init__(self):
         self.svcs = {}
         self.refs = {}
+        self.shutting_down = False
         atexit.register(self.atexit)
 
     def __iter__(self):
@@ -249,21 +254,41 @@ class ServiceManager:
         return name in self.svcs
 
     def atexit(self):
+        self.shutting_down = True
         log.debug("ServiceManager: Shutting down threads..")
         self.dump()
-        for svc in self.svcs.values():
+
+        stop_order = [
+            "videoqueue",
+            "filetransfer",
+            *(name for name in self.svcs if name.startswith("mqttqueue")),
+            "pppp",
+        ]
+        seen = set()
+        ordered_names = []
+        for name in stop_order:
+            if name in self.svcs and name not in seen:
+                ordered_names.append(name)
+                seen.add(name)
+        for name in self.svcs:
+            if name not in seen:
+                ordered_names.append(name)
+                seen.add(name)
+
+        for name in ordered_names:
+            svc = self.svcs[name]
             if svc.state != RunState.Stopped:
                 svc.stop()
 
         log.debug("ServiceManager: Waiting for threads to stop..")
         self.dump()
-        for svc in self.svcs.values():
-            svc.await_stopped()
+        for name in ordered_names:
+            self.svcs[name].await_stopped()
 
         log.debug("ServiceManager: Cleaning up threads..")
         self.dump()
-        for svc in self.svcs.values():
-            svc.shutdown()
+        for name in ordered_names:
+            self.svcs[name].shutdown()
 
         log.info("ServiceManager: Shutdown complete")
 
@@ -290,6 +315,34 @@ class ServiceManager:
 
         del self.svcs[name]
         del self.refs[name]
+
+
+    def replace_service(self, name: str, svc: Service):
+        if name not in self:
+            raise KeyError(f"Trying to replace unknown service {name!r}")
+
+        old = self.svcs[name]
+        try:
+            old.wanted = False
+        except Exception:
+            pass
+        try:
+            if hasattr(old, "_event"):
+                old._event.set()
+        except Exception:
+            pass
+        try:
+            if hasattr(old, "_force_close_api"):
+                old._force_close_api()
+        except Exception:
+            pass
+        try:
+            old.running = False
+        except Exception:
+            pass
+
+        self.svcs[name] = svc
+        self.refs[name] = 0
 
     def restart_all(self, await_ready=True):
         wanted = {}
@@ -324,17 +377,32 @@ class ServiceManager:
         svc = self.svcs[name]
         self.refs[name] += 1
 
-        if self.refs[name] == 1:
-            svc.start()
+        try:
+            # Never request a fresh start while the old worker is still stopping.
+            # Let it finish that transition first, then start cleanly.
+            if svc.state == RunState.Stopping:
+                svc.await_stopped()
 
-        if ready:
-            try:
+            should_start = False
+
+            if self.refs[name] == 1:
+                should_start = True
+            elif not svc.wanted and svc.state == RunState.Stopped:
+                should_start = True
+            elif svc.state == RunState.Stopped:
+                should_start = True
+
+            if should_start:
+                svc.start()
+
+            if ready:
                 svc.await_ready()
-            except ServiceError:
-                self.put(name)
-                raise
 
-        return svc
+            return svc
+
+        except ServiceError:
+            self.put(name)
+            raise
 
     def put(self, name: str):
         if name not in self:

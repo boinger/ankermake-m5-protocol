@@ -77,6 +77,7 @@ class FakeFD:
 def test_video_queue_worker_start_stop_and_handler(monkeypatch):
     queue = object.__new__(VideoQueue)
     queue.video_enabled = True
+    queue.wanted = True
     queue.handlers = []
     queue.state = RunState.Stopped
     queue.saved_light_state = True
@@ -90,6 +91,13 @@ def test_video_queue_worker_start_stop_and_handler(monkeypatch):
     queue._live_active = False
     queue.api_id = None
     queue._enable_generation = 0
+    queue._pppp_ref_held = False
+    queue._recycle_pppp_on_restart = False
+    queue._awaiting_pppp_recycle = False
+    queue._pending_disable = False
+    queue._in_place_recovery = False
+    queue._pppp_recycle_requested_at = None
+    queue._live_auth_data = lambda: {"encryptkey": "secret", "accountId": "user-123456"}
     notifications = []
     queue.notify = lambda msg: notifications.append(msg)
 
@@ -106,7 +114,7 @@ def test_video_queue_worker_start_stop_and_handler(monkeypatch):
     puts = []
     old_svc = app.svc
     app.svc = SimpleNamespace(
-        get=lambda name: fake_pppp,
+        get=lambda name, ready=True: fake_pppp,
         put=lambda name: puts.append(name),
     )
 
@@ -121,6 +129,7 @@ def test_video_queue_worker_start_stop_and_handler(monkeypatch):
         queue.worker_start()
         queue._handler((1, FakeXzyh(1)))
         queue._handler((1, FakeXzyh(P2PCmdType.APP_CMD_VIDEO_FRAME)))
+        queue.wanted = False
         queue.worker_stop()
     finally:
         app.svc = old_svc
@@ -130,25 +139,29 @@ def test_video_queue_worker_start_stop_and_handler(monkeypatch):
     assert puts == ["pppp"]
     assert len(commands) == 4
     assert queue.last_frame_at == 123.0
-    assert len(notifications) == 2
+    assert len(notifications) == 1
+    assert notifications[0].cmd == P2PCmdType.APP_CMD_VIDEO_FRAME
 
 
 def test_video_queue_worker_run_detects_disconnect_api_swap_and_stall(monkeypatch):
     queue = object.__new__(VideoQueue)
     queue.video_enabled = True
+    queue.wanted = True
     queue.handlers = [lambda _: None]
     queue.idle = lambda timeout=None: None
+    queue._in_place_recovery = False
     queue._live_started_at = 100.0
     queue.last_frame_at = None
     queue._last_live_refresh_at = 0.0
     queue._last_no_frame_log_at = 0.0
     queue._last_start_live_at = 0.0
     queue._live_active = False
+    queue._stall_retry_count = 0
     queue.api_id = 1
     queue.pppp = SimpleNamespace(connected=False, _api=object())
 
-    with pytest.raises(ServiceRestartSignal, match="No pppp connection"):
-        queue.worker_run(timeout=0.1)
+    monkeypatch.setattr("web.service.video.time.sleep", lambda seconds: None)
+    queue.worker_run(timeout=0.1)
 
     queue.pppp = SimpleNamespace(connected=True, _api=object())
     with pytest.raises(ServiceRestartSignal, match="New pppp connection"):
@@ -159,13 +172,59 @@ def test_video_queue_worker_run_detects_disconnect_api_swap_and_stall(monkeypatc
     queue.api_id = id(api)
     commands = []
     queue.pppp.api_command = lambda command, data=None: commands.append((command, data))
+    queue._live_auth_data = lambda: {"encryptkey": "secret", "accountId": "user-123456"}
     times = iter([100.0 + _STALL_TIMEOUT + 1, 100.0 + _STALL_TIMEOUT + 1, 100.0 + _STALL_TIMEOUT + 1])
     monkeypatch.setattr("web.service.video.time.monotonic", lambda: next(times))
-    monkeypatch.setattr("web.service.video.time.sleep", lambda seconds: None)
     queue.worker_run(timeout=0.1)
 
     assert commands[0][0] == P2PSubCmdType.CLOSE_LIVE
     assert commands[1][0] == P2PSubCmdType.START_LIVE
+
+
+def test_video_queue_disable_cancels_recovery_with_connected_viewer():
+    queue = object.__new__(VideoQueue)
+    queue.video_enabled = True
+    queue.wanted = True
+    queue.persistent = True
+    queue.state = RunState.Running
+    queue._viewer_count = 1
+    queue._pending_disable = False
+    queue._live_active = True
+    queue._live_started_at = 100.0
+    queue.last_frame_at = 100.0
+    queue._last_start_live_at = 100.0
+    queue._last_no_frame_log_at = 100.0
+    queue._last_live_refresh_at = 100.0
+    queue._stall_retry_count = 2
+    queue._awaiting_pppp_recycle = True
+    queue._pppp_recycle_requested_at = 100.0
+    stop_calls = []
+
+    def stop():
+        stop_calls.append(True)
+        queue.wanted = False
+
+    queue.stop = stop
+
+    assert queue.set_video_enabled(False) is True
+
+    assert stop_calls == [True]
+    assert queue.video_enabled is False
+    assert queue.wanted is False
+    assert queue._pending_disable is False
+    assert queue._awaiting_pppp_recycle is False
+    assert queue._pppp_recycle_requested_at is None
+    assert queue._stall_retry_count == 0
+
+    queue.video_enabled = True
+    queue.wanted = True
+    queue.state = RunState.Stopping
+    stop_calls.clear()
+
+    assert queue.set_video_enabled(False) is True
+
+    assert stop_calls == []
+    assert queue.wanted is False
 
 
 def test_video_queue_api_profile_and_mode_validation():
@@ -272,6 +331,17 @@ def test_pppp_service_worker_run_handles_reset_aabb_and_xzyh(monkeypatch):
     svc.worker_run(timeout=0.1)
 
     assert drained == [1, 0]
+
+    channel = FakeFD(
+        peeks=[b"abcd" + b"\x00" * 12, b"abcd"],
+        reads=[],
+    )
+    svc._drain_xzyh = PPPPService._drain_xzyh.__get__(svc, PPPPService)
+    svc._api = SimpleNamespace(
+        poll=lambda timeout=0: SimpleNamespace(type=208, chan=1),
+        chans=[FakeFD(peeks=[], reads=[]), channel],
+    )
+    svc.worker_run(timeout=0.1)
 
 
 def test_filetransfer_notify_upload_swallow_and_error_paths(monkeypatch):

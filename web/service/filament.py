@@ -5,6 +5,7 @@ import re
 import sqlite3
 import threading
 import logging
+from contextlib import contextmanager
 
 log = logging.getLogger(__name__)
 
@@ -267,6 +268,15 @@ class FilamentStore:
         conn.row_factory = sqlite3.Row
         return conn
 
+    @contextmanager
+    def _connection(self):
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            if os.fspath(self.db_path) != ":memory:":
+                conn.close()
+
     def _recreate_db_after_corruption(self, exc):
         db_path = os.fspath(self.db_path)
         if db_path == ":memory:":
@@ -280,7 +290,7 @@ class FilamentStore:
     def _init_db(self):
         with self._lock:
             try:
-                with self._connect() as conn:
+                with self._connection() as conn:
                     conn.executescript(_SCHEMA)
                     self._migrate(conn)
                     count = conn.execute("SELECT COUNT(*) FROM filaments").fetchone()[0]
@@ -289,7 +299,7 @@ class FilamentStore:
                     conn.commit()
             except sqlite3.DatabaseError as exc:
                 self._recreate_db_after_corruption(exc)
-                with self._connect() as conn:
+                with self._connection() as conn:
                     conn.executescript(_SCHEMA)
                     self._migrate(conn)
                     count = conn.execute("SELECT COUNT(*) FROM filaments").fetchone()[0]
@@ -355,7 +365,7 @@ class FilamentStore:
     def list_all(self):
         """Return all filament profiles as list of dicts, ordered by id."""
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 rows = conn.execute(
                     "SELECT * FROM filaments ORDER BY id ASC"
                 ).fetchall()
@@ -364,7 +374,7 @@ class FilamentStore:
     def get(self, profile_id):
         """Return a single profile dict or None."""
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 row = conn.execute(
                     "SELECT * FROM filaments WHERE id = ?", (profile_id,)
                 ).fetchone()
@@ -382,7 +392,7 @@ class FilamentStore:
         cols = ", ".join(safe.keys())
         placeholders = ", ".join("?" for _ in safe)
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 cur = conn.execute(
                     f"INSERT INTO filaments ({cols}) VALUES ({placeholders})",
                     list(safe.values()),
@@ -404,7 +414,7 @@ class FilamentStore:
             return self.get(profile_id)
         assignments = ", ".join(f"{k} = ?" for k in safe)
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 conn.execute(
                     f"UPDATE filaments SET {assignments} WHERE id = ?",
                     list(safe.values()) + [profile_id],
@@ -418,7 +428,7 @@ class FilamentStore:
     def delete(self, profile_id):
         """Delete a profile. Returns True if deleted, False if not found."""
         with self._lock:
-            with self._connect() as conn:
+            with self._connection() as conn:
                 cur = conn.execute(
                     "DELETE FROM filaments WHERE id = ?", (profile_id,)
                 )

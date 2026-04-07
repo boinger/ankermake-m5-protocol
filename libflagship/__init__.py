@@ -19,7 +19,7 @@ def resolve_root_dir(*, frozen=None, meipass=None, executable=None, file_path=No
         return Path(meipass).resolve()
     if frozen and executable:
         return Path(executable).resolve().parent
-    return Path(file_path).resolve().parent.parent
+    return Path(file_path).parent.parent
 
 
 ROOT_DIR = resolve_root_dir()
