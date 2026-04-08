@@ -427,12 +427,25 @@ class ServiceManager:
         finally:
             self.put(name)
 
-    def stream(self, name: str):
+    @staticmethod
+    def _enqueue_stream_item(q, data):
+        if q.maxsize and q.full():
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            q.put_nowait(data)
+        except queue.Full:
+            # If another producer won the race, drop the stale realtime item.
+            pass
+
+    def stream(self, name: str, maxsize=0):
         try:
             with self.borrow(name) as svc:
-                q = Queue()
+                q = Queue(maxsize=max(0, int(maxsize or 0)))
 
-                with svc.tap(lambda data: q.put(data)):
+                with svc.tap(lambda data: self._enqueue_stream_item(q, data)):
                     while svc.state == RunState.Running:
                         try:
                             data = q.get(timeout=1.0)

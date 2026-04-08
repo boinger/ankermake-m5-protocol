@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from queue import Queue
 from threading import Timer
 from types import SimpleNamespace
 
@@ -115,3 +116,14 @@ def test_service_manager_restart_all_stream_and_atexit():
     assert wanted.shutdown_calls == 1
     assert wanted_stops.shutdown_calls == 1
     assert idle.shutdown_calls == 1
+
+
+def test_service_stream_bounded_queue_drops_oldest_items():
+    q = Queue(maxsize=2)
+
+    ServiceManager._enqueue_stream_item(q, "one")
+    ServiceManager._enqueue_stream_item(q, "two")
+    ServiceManager._enqueue_stream_item(q, "three")
+
+    assert q.get_nowait() == "two"
+    assert q.get_nowait() == "three"

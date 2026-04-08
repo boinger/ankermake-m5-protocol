@@ -148,6 +148,7 @@ def _ffmpeg_available():
 SNAPSHOT_FRAME_WAIT_SEC = 3.0
 SNAPSHOT_FRAME_MAX_AGE_SEC = 2.0
 SNAPSHOT_FFMPEG_TIMEOUT_SEC = 30
+VIDEO_STREAM_QUEUE_MAX = 30
 
 
 def _video_has_recent_frame(vq, wait_sec=SNAPSHOT_FRAME_WAIT_SEC, max_age_sec=SNAPSHOT_FRAME_MAX_AGE_SEC):
@@ -802,7 +803,7 @@ def video(sock):
 
     vq.viewer_connected()
     try:
-        for msg in app.svc.stream("videoqueue"):
+        for msg in app.svc.stream("videoqueue", maxsize=VIDEO_STREAM_QUEUE_MAX):
             payload = getattr(msg, "data", None)
             if not payload:
                 continue
@@ -1107,7 +1108,7 @@ def video_download():
                     vq.await_ready()
                 except ServiceStoppedError:
                     return
-        for msg in app.svc.stream("videoqueue"):
+        for msg in app.svc.stream("videoqueue", maxsize=VIDEO_STREAM_QUEUE_MAX):
             yield msg.data
 
     return Response(generate(), mimetype="video/mp4")

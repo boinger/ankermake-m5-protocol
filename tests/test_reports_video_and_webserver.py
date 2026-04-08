@@ -66,7 +66,7 @@ class FakeVideoServices:
         self.refs = {"videoqueue": 0}
         self._payloads = payloads
 
-    def stream(self, name):
+    def stream(self, name, **kwargs):
         assert name == "videoqueue"
         for payload in self._payloads:
             yield SimpleNamespace(data=payload)

@@ -72,7 +72,7 @@ class FakeServices:
         self.svcs = svcs or {}
         self.refs = refs or {}
 
-    def stream(self, name):
+    def stream(self, name, **kwargs):
         yield from self._streams.get(name, [])
 
     @contextmanager
