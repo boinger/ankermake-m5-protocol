@@ -98,7 +98,11 @@ class TimelapseService:
             self._light_mode = "session"
         else:
             self._light_mode = None
-        log.info(f"Timelapse: config loaded — enabled={self._enabled}, interval={self._interval}s, light_mode={self._light_mode}")
+        config_message = f"Timelapse: config loaded — enabled={self._enabled}, interval={self._interval}s, light_mode={self._light_mode}"
+        if self._enabled:
+            log.info(config_message)
+        else:
+            log.debug(config_message)
 
     @property
     def enabled(self):
@@ -448,7 +452,7 @@ class TimelapseService:
         if vq:
             snap_original_light = getattr(vq, "saved_light_state", None)
             if snap_original_light is not True:
-                log.info("Timelapse: light on for snapshot, waiting 1.5s")
+                log.debug("Timelapse: light on for snapshot, waiting 1.5s")
                 vq.api_light_state(True)
                 time.sleep(1.5)
 
@@ -513,7 +517,7 @@ class TimelapseService:
             if vq and snap_original_light is not True:
                 time.sleep(1.0)
                 restore = snap_original_light if snap_original_light is not None else False
-                log.info(f"Timelapse: restoring light to {restore} after snapshot")
+                log.debug(f"Timelapse: restoring light to {restore} after snapshot")
                 vq.api_light_state(restore)
 
     def _in_progress_base(self):

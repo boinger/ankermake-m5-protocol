@@ -711,7 +711,7 @@ class MqttQueue(Service):
                     self._reset_print_state()
             elif value == 8:
                 self._state = PrintState.IDLE
-            log.info(
+            log.debug(
                 "Printer state trace: ct=1000 value=%r (%s) internal=%s->%s stop_requested=%s pending_start=%s preparing=%s",
                 value,
                 self._print_state_value_label(value),
@@ -994,14 +994,14 @@ class MqttQueue(Service):
         lines = cli.util.normalize_gcode_lines(gcode)
         for line in lines:
             if self._is_duplicate_g28(line):
-                log.info("Ignoring duplicate homing command: %s", line)
+                log.debug("Ignoring duplicate homing command: %s", line)
                 continue
             cmd = {
                 "commandType": MqttMsgType.ZZ_MQTT_CMD_GCODE_COMMAND.value,
                 "cmdData": line,
                 "cmdLen": len(line),
             }
-            log.info("Sending GCode command: %s", line)
+            log.debug("Sending GCode command: %s", line)
             self.client.command(cmd)
             time.sleep(0.1)
 
@@ -1026,7 +1026,7 @@ class MqttQueue(Service):
             raise ValueError(f"Unsupported home axis: {axis}")
 
         gcode = HOME_GCODE_BY_AXIS[axis]
-        log.info("Sending home GCode axis=%s gcode=%s", axis, gcode)
+        log.debug("Sending home GCode axis=%s gcode=%s", axis, gcode)
         self.send_gcode(gcode)
 
     def send_print_control(self, value):
@@ -1034,7 +1034,7 @@ class MqttQueue(Service):
 
         pre_start_window = self.is_preparing_print or self.has_pending_print_start
 
-        log.info(
+        log.debug(
             "send_print_control(value=%s, state=%s, preparing=%s, pending_start=%s)",
             value,
             self._state.value,
@@ -1062,7 +1062,7 @@ class MqttQueue(Service):
                     "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
                     "value": candidate,
                 }
-                log.info("Pre-start cancel attempt value=%s (nested + flat)", candidate)
+                log.debug("Pre-start cancel attempt value=%s (nested + flat)", candidate)
                 self.client.command(nested_cmd)
                 time.sleep(0.12)
                 self.client.command(flat_cmd)
@@ -1079,7 +1079,7 @@ class MqttQueue(Service):
                 "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
                 "value": value,
             }
-            log.info("Print control attempt value=%s (nested + flat)", value)
+            log.debug("Print control attempt value=%s (nested + flat)", value)
             self.client.command(nested_cmd)
             time.sleep(0.12)
             self.client.command(flat_cmd)

@@ -1357,7 +1357,6 @@ $(function () {
      */
     function sendPrinterGCode(gcode) {
         if (!gcode) return;
-        console.log("Sending GCode:", gcode);
         fetch("/api/printer/gcode", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1367,7 +1366,6 @@ $(function () {
 
     function sendPrinterHome(axis) {
         const targetAxis = axis || "all";
-        console.log("Sending Home:", targetAxis);
         fetch("/api/printer/home", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1376,7 +1374,6 @@ $(function () {
     }
 
     function sendPrintControl(value) {
-        console.log("Sending Print Control:", value);
         fetch("/api/printer/control", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
