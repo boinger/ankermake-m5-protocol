@@ -183,7 +183,7 @@ class Channel:
         self._rx_gap_report_packets += gap
         now = time.monotonic()
         if now - self._rx_gap_report_at >= 10.0:
-            log.info(
+            log.debug(
                 f"Channel {self.index}: realtime receive-gap recovery "
                 f"({self._rx_gap_report_packets} packet(s) skipped across "
                 f"{self._rx_gap_report_skips} gap(s))"

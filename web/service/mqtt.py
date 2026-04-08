@@ -1022,12 +1022,9 @@ class MqttQueue(Service):
     def send_home(self, axis="all"):
         axis = str(axis or "all").lower()
         if axis == "all":
-            # The official app has been observed sending value=0 for XY and value=2 for Z.
-            # Avoid guessing an undocumented "all" value; send the known native commands.
-            for known_axis in ("xy", "z"):
-                self.send_home(known_axis)
-                time.sleep(0.1)
-            return
+            # On the M5, the native Z home sequence also homes the XY axes.
+            # Route "Home All" through that same proven firmware path.
+            axis = "z"
         if axis not in HOME_MOVE_ZERO_VALUE_BY_AXIS:
             raise ValueError(f"Unsupported home axis: {axis}")
 

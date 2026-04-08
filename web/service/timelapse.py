@@ -99,10 +99,7 @@ class TimelapseService:
         else:
             self._light_mode = None
         config_message = f"Timelapse: config loaded — enabled={self._enabled}, interval={self._interval}s, light_mode={self._light_mode}"
-        if self._enabled:
-            log.info(config_message)
-        else:
-            log.debug(config_message)
+        log.debug(config_message)
 
     @property
     def enabled(self):
@@ -256,7 +253,8 @@ class TimelapseService:
         timer.daemon = True
         timer.start()
         self._finalize_timer = timer
-        log.info(
+        pause_log = log.info if frame_count >= 2 else log.debug
+        pause_log(
             f"Timelapse: capture paused for '{filename}' ({frame_count} frames), "
             f"resumable for {_RESUME_WINDOW_SEC // 60} min"
         )
@@ -584,7 +582,8 @@ class TimelapseService:
 
         # Handle the youngest candidate
         if youngest_age <= _MAX_ORPHAN_AGE_SEC:
-            log.info(
+            resume_log = log.info if youngest_frames >= 2 else log.debug
+            resume_log(
                 f"Timelapse: found persisted capture '{youngest_filename}' "
                 f"({youngest_frames} frames, {youngest_age / 3600:.1f}h ago) — "
                 f"resumable for {_RESUME_WINDOW_SEC // 60} min"

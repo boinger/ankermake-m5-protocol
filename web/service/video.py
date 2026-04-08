@@ -335,15 +335,15 @@ class VideoQueue(Service):
 
         self.pppp = self._ensure_pppp_ready()
         if not self.pppp:
-            log.info("VideoQueue: PPPP not available yet in worker_start")
+            log.debug("VideoQueue: PPPP not available yet in worker_start")
             self.api_id = None
             return
         if not getattr(self.pppp, "connected", False):
-            log.info("VideoQueue: PPPP exists but is not connected yet in worker_start")
+            log.debug("VideoQueue: PPPP exists but is not connected yet in worker_start")
             self.api_id = None
             return
         if not hasattr(self.pppp, "_api"):
-            log.info("VideoQueue: PPPP connected but API not ready yet in worker_start")
+            log.debug("VideoQueue: PPPP connected but API not ready yet in worker_start")
             self.api_id = None
             return
 
@@ -378,7 +378,7 @@ class VideoQueue(Service):
         if not self.pppp:
             self.pppp = self._ensure_pppp_ready()
             if not self.pppp:
-                log.info("VideoQueue: PPPP not available yet")
+                log.debug("VideoQueue: PPPP not available yet")
                 time.sleep(0.5)
                 return
 
@@ -389,13 +389,13 @@ class VideoQueue(Service):
             raise ServiceRestartSignal("PPPP reference lost during video session")
 
         if not getattr(pppp, "connected", False):
-            log.info("VideoQueue: PPPP exists but is not connected yet")
+            log.debug("VideoQueue: PPPP exists but is not connected yet")
             time.sleep(0.5)
             return
 
         if getattr(self, "api_id", None) is None:
             if not hasattr(pppp, "_api"):
-                log.info("VideoQueue: PPPP connected but API not ready yet")
+                log.debug("VideoQueue: PPPP connected but API not ready yet")
                 time.sleep(0.5)
                 return
 
