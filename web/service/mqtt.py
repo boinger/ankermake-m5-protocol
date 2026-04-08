@@ -54,10 +54,9 @@ MQTT_PRINT_STATE_LABELS = {
 }
 
 G28_DEDUPE_WINDOW_SEC = 10.0
-HOME_GCODE_BY_AXIS = {
-    "all": "G28",
-    "xy": "G28 X0 Y0",
-    "z": "G28 Z0",
+HOME_MOVE_ZERO_VALUE_BY_AXIS = {
+    "xy": 0,
+    "z": 2,
 }
 
 
@@ -1022,12 +1021,22 @@ class MqttQueue(Service):
 
     def send_home(self, axis="all"):
         axis = str(axis or "all").lower()
-        if axis not in HOME_GCODE_BY_AXIS:
+        if axis == "all":
+            # The official app has been observed sending value=0 for XY and value=2 for Z.
+            # Avoid guessing an undocumented "all" value; send the known native commands.
+            for known_axis in ("xy", "z"):
+                self.send_home(known_axis)
+                time.sleep(0.1)
+            return
+        if axis not in HOME_MOVE_ZERO_VALUE_BY_AXIS:
             raise ValueError(f"Unsupported home axis: {axis}")
 
-        gcode = HOME_GCODE_BY_AXIS[axis]
-        log.debug("Sending home GCode axis=%s gcode=%s", axis, gcode)
-        self.send_gcode(gcode)
+        value = HOME_MOVE_ZERO_VALUE_BY_AXIS[axis]
+        log.debug("Sending native home command axis=%s value=%s", axis, value)
+        self.client.command({
+            "commandType": MqttMsgType.ZZ_MQTT_CMD_MOVE_ZERO.value,
+            "value": value,
+        })
 
     def send_print_control(self, value):
         value = int(value)

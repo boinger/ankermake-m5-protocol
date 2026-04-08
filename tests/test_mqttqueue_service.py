@@ -239,21 +239,23 @@ def test_send_gcode_dedupes_identical_g28_commands(monkeypatch):
     assert [cmd["cmdData"] for cmd in sent] == ["G28", "G28 Z", "G28"]
 
 
-def test_send_home_uses_axis_specific_gcode_command():
+def test_send_home_uses_native_move_zero_payloads(monkeypatch):
     global ha_updates, history_calls, timelapse_calls, events
     ha_updates, history_calls, timelapse_calls, events = [], [], [], []
     queue = _queue()
     sent = []
     queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
+    monkeypatch.setattr("web.service.mqtt.time.sleep", lambda seconds: None)
 
     queue.send_home("xy")
     queue.send_home("z")
     queue.send_home("all")
 
     assert sent == [
-        {"commandType": 1043, "cmdData": "G28 X0 Y0", "cmdLen": 9},
-        {"commandType": 1043, "cmdData": "G28 Z0", "cmdLen": 6},
-        {"commandType": 1043, "cmdData": "G28", "cmdLen": 3},
+        {"commandType": 1026, "value": 0},
+        {"commandType": 1026, "value": 2},
+        {"commandType": 1026, "value": 0},
+        {"commandType": 1026, "value": 2},
     ]
 
 

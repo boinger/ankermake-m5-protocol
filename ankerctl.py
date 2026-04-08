@@ -36,6 +36,14 @@ from libflagship.pppp import PktLanSearch, PktPunchPkt, P2PCmdType, P2PSubCmdTyp
 from libflagship.ppppapi import FileUploadInfo, PPPPError
 
 
+def mqtt_topic_direction(topic):
+    if "/device/maker/" in topic:
+        return "app->printer"
+    if "/phone/maker/" in topic:
+        return "printer->app"
+    return "unknown"
+
+
 class Environment:
     def __init__(self):
         pass
@@ -114,29 +122,47 @@ def mqtt(env):
 
 
 @mqtt.command("monitor")
+@click.option(
+    "--command-topics",
+    is_flag=True,
+    help="Also subscribe to app-to-printer command/query topics when broker ACLs permit it.",
+)
+@click.option(
+    "--sniff-topics",
+    is_flag=True,
+    help="Also subscribe to broad app-to-printer topic wildcards when broker ACLs permit it.",
+)
 @pass_env
-def mqtt_monitor(env):
+def mqtt_monitor(env, command_topics, sniff_topics):
     """
     Connect to mqtt broker, and show low-level events in realtime.
     """
 
     client = cli.mqtt.mqtt_open(env.config, env.printer_index, env.insecure)
+    if command_topics or sniff_topics:
+        extra_topics = client.subscribe_device_topics(wildcard=sniff_topics)
+        for topic in extra_topics:
+            log.info(f"Extra MQTT subscription requested: {topic}")
 
     for msg, body in client.fetchloop():
-        log.info(f"TOPIC [{msg.topic}]")
+        direction = mqtt_topic_direction(msg.topic)
+        log.info(f"TOPIC [{msg.topic}] ({direction})")
         log.debug(enhex(msg.payload[:]))
 
         for obj in body:
+            if not isinstance(obj, dict) or "commandType" not in obj:
+                print(f"  {obj}")
+                continue
+
+            payload = dict(obj)
+            cmdtype = payload.pop("commandType")
             try:
-                cmdtype = obj["commandType"]
                 name = MqttMsgType(cmdtype).name
                 if name.startswith("ZZ_MQTT_CMD_"):
                     name = name[len("ZZ_MQTT_CMD_"):].lower()
-
-                del obj["commandType"]
-                print(f"  [{cmdtype:4}] {name:20} {obj}")
             except Exception:
-                print(f"  {obj}")
+                name = "unknown"
+            print(f"  [{cmdtype:4}] {name:20} {payload}")
 
 
 @mqtt.command("send")
