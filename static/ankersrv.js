@@ -445,8 +445,8 @@ $(function () {
                 return;
             }
             if (data.commandType == 1000) {
-                // Printer state machine: value=0 idle, value=1 printing, value=2 paused
-                _updatePrintControlButtons(data.value);
+                // Printer state machine: normalize firmware resume acknowledgements for UI controls.
+                _updatePrintControlButtons(_normalizePrintStateValue(data.value));
                 if (typeof _onMqttStateChange === "function") {
                     _onMqttStateChange(data.value);
                 }
@@ -555,32 +555,93 @@ $(function () {
         reconnect: 2000,
 
         open: function () {
+            this.videoQueue = [];
+            this.videoBufferMinPackets = 4;
+            this.videoBufferDelayMs = 300;
+            this.videoBufferMaxPackets = 300;
+            this.videoPumpMaxPacketsPerTick = 12;
+            this.videoBuffering = true;
             this.jmuxer = new JMuxer({
                 node: "player",
                 mode: "video",
                 flushingTime: 0,
                 fps: 15,
                 // debug: true,
-                onReady: function (data) {
-                    console.log(data);
-                },
                 onError: function (data) {
-                    console.log(data);
+                    console.warn("JMuxer video error", data);
                 },
             });
+            this.videoPump = window.setInterval(() => {
+                if (!this.jmuxer)
+                    return;
+
+                const now = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
+                if (this.videoBuffering) {
+                    const firstPacket = this.videoQueue[0];
+                    const firstPacketAge = firstPacket ? now - firstPacket.receivedAt : 0;
+                    if (this.videoQueue.length < this.videoBufferMinPackets && firstPacketAge < this.videoBufferDelayMs) {
+                        return;
+                    }
+                    this.videoBuffering = false;
+                }
+
+                let fedPackets = 0;
+                while (this.videoQueue.length && fedPackets < this.videoPumpMaxPacketsPerTick) {
+                    const packet = this.videoQueue[0];
+                    const packetAge = now - packet.receivedAt;
+                    if (packetAge < this.videoBufferDelayMs && this.videoQueue.length <= this.videoBufferMinPackets) {
+                        break;
+                    }
+                    this.videoQueue.shift();
+                    try {
+                        this.jmuxer.feed({
+                            video: new Uint8Array(packet.data),
+                        });
+                    } catch (err) {
+                        console.log({ type: "video", name: err?.name || "feed", error: err?.message || String(err) });
+                        this.videoBuffering = true;
+                        return;
+                    }
+                    fedPackets++;
+                }
+
+                if (!fedPackets && !this.videoQueue.length) {
+                    this.videoBuffering = true;
+                }
+            }, 16);
         },
 
         message: function (event) {
-            this.jmuxer.feed({
-                video: new Uint8Array(event.data),
+            if (!(event.data instanceof ArrayBuffer) || event.data.byteLength === 0) {
+                return;
+            }
+            if (!this.videoQueue) {
+                this.videoQueue = [];
+            }
+            const now = (window.performance && window.performance.now) ? window.performance.now() : Date.now();
+            this.videoQueue.push({
+                data: event.data.slice(0),
+                receivedAt: now,
             });
+            if (this.videoQueue.length > this.videoBufferMaxPackets) {
+                this.videoQueue.splice(0, this.videoQueue.length - this.videoBufferMaxPackets);
+                this.videoBuffering = true;
+            }
         },
 
         close: function () {
+            if (this.videoPump) {
+                window.clearInterval(this.videoPump);
+                this.videoPump = null;
+            }
+            this.videoQueue = [];
+            this.videoBuffering = true;
+
             if (!this.jmuxer)
                 return;
 
             this.jmuxer.destroy();
+            this.jmuxer = null;
 
             /* Clear video source (to show loading animation) */
             $("#player").attr("src", "");
@@ -607,10 +668,42 @@ $(function () {
         videoPlayer.addEventListener("resize", updateVideoResolution);
     }
 
+    const ctrlPendingMessages = [];
+    function sendCtrlMessage(payload) {
+        const message = JSON.stringify(payload);
+        if (sockets.ctrl.ws && sockets.ctrl.ws.readyState === WebSocket.OPEN) {
+            try {
+                sockets.ctrl.ws.send(message);
+                return true;
+            } catch (err) {
+                console.warn("ctrl socket: send failed, queueing message", err);
+            }
+        }
+        ctrlPendingMessages.push(message);
+        return false;
+    }
+
+    function flushCtrlMessages() {
+        if (!sockets.ctrl.ws || sockets.ctrl.ws.readyState !== WebSocket.OPEN) {
+            return;
+        }
+        while (ctrlPendingMessages.length) {
+            const message = ctrlPendingMessages.shift();
+            try {
+                sockets.ctrl.ws.send(message);
+            } catch (err) {
+                ctrlPendingMessages.unshift(message);
+                console.warn("ctrl socket: failed to flush queued message", err);
+                return;
+            }
+        }
+    }
+
     sockets.ctrl = new AutoWebSocket({
         name: "Control socket",
         url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/ctrl`,
         badge: "#badge-ctrl",
+        opened: flushCtrlMessages,
         message: function (event) {
             let data = null;
             try {
@@ -618,6 +711,7 @@ $(function () {
             } catch (err) {
                 return;
             }
+            flushCtrlMessages();
             if (data.video_profile) {
                 setVideoProfileActive(data.video_profile);
             }
@@ -731,9 +825,7 @@ $(function () {
         if (videoEnabled) {
             $("#vplayer").show();
             $(this).html('<i class="bi bi-camera-video-off"></i> Disable Video');
-            if (sockets.ctrl.ws) {
-                sockets.ctrl.ws.send(JSON.stringify({ video_enabled: true }));
-            }
+            sendCtrlMessage({ video_enabled: true });
             sockets.video.autoReconnect = true;
             if (!sockets.video.ws) {
                 sockets.video.connect();
@@ -741,9 +833,7 @@ $(function () {
         } else {
             $("#vplayer").hide();
             $(this).html('<i class="bi bi-camera-video"></i> Enable Video');
-            if (sockets.ctrl.ws) {
-                sockets.ctrl.ws.send(JSON.stringify({ video_enabled: false }));
-            }
+            sendCtrlMessage({ video_enabled: false });
             sockets.video.autoReconnect = false;
             if (sockets.video.ws) {
                 try {
@@ -768,7 +858,7 @@ $(function () {
      * On click of element with id "light-on", sends JSON data to wsctrl to turn light on
      */
     $("#light-on").on("click", function () {
-        sockets.ctrl.ws.send(JSON.stringify({ light: true }));
+        sendCtrlMessage({ light: true });
         setLightActive(true);
         return false;
     });
@@ -777,7 +867,7 @@ $(function () {
      * On click of element with id "light-off", sends JSON data to wsctrl to turn light off
      */
     $("#light-off").on("click", function () {
-        sockets.ctrl.ws.send(JSON.stringify({ light: false }));
+        sendCtrlMessage({ light: false });
         setLightActive(false);
         return false;
     });
@@ -788,9 +878,7 @@ $(function () {
     $(".video-profile-btn").on("click", function () {
         const profile = $(this).data("video-profile");
         setVideoProfileActive(profile);
-        if (sockets.ctrl.ws) {
-            sockets.ctrl.ws.send(JSON.stringify({ video_profile: profile }));
-        }
+        sendCtrlMessage({ video_profile: profile });
         return false;
     });
 
@@ -1269,7 +1357,6 @@ $(function () {
      */
     function sendPrinterGCode(gcode) {
         if (!gcode) return;
-        console.log("Sending GCode:", gcode);
         fetch("/api/printer/gcode", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1277,8 +1364,16 @@ $(function () {
         }).catch(err => console.error("Failed to send GCode:", err));
     }
 
+    function sendPrinterHome(axis) {
+        const targetAxis = axis || "all";
+        fetch("/api/printer/home", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ axis: targetAxis })
+        }).catch(err => console.error("Failed to send home command:", err));
+    }
+
     function sendPrintControl(value) {
-        console.log("Sending Print Control:", value);
         fetch("/api/printer/control", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1287,7 +1382,6 @@ $(function () {
     }
 
     const PRINT_CONTROL = {
-        PREPARE_CANCEL: 0,
         PAUSE: 2,
         RESUME: 3,
         STOP: 4,
@@ -1297,14 +1391,24 @@ $(function () {
     const PRINT_STATE = { IDLE: 0, PRINTING: 1, PAUSED: 2, CALIBRATING: 8, STOPPING: 9, PENDING_START: 10 };
 
     let _currentPrintState = PRINT_STATE.IDLE;
+    let _lastStopCommandAt = 0;
+
+    function _normalizePrintStateValue(value) {
+        // Some firmware reports resume as ct=1000 value=3, while others report printing (1).
+        if (value === 3) {
+            return PRINT_STATE.PRINTING;
+        }
+        return value;
+    }
 
     function _updatePrintControlButtons(state) {
-        _currentPrintState = state;
-        const printing = state === PRINT_STATE.PRINTING;
-        const paused = state === PRINT_STATE.PAUSED;
-        const stopping = state === PRINT_STATE.STOPPING;
-        const preparing = state === PRINT_STATE.CALIBRATING;
-        const pendingStart = state === PRINT_STATE.PENDING_START;
+        const normalizedState = _normalizePrintStateValue(state);
+        _currentPrintState = normalizedState;
+        const printing = normalizedState === PRINT_STATE.PRINTING;
+        const paused = normalizedState === PRINT_STATE.PAUSED;
+        const stopping = normalizedState === PRINT_STATE.STOPPING;
+        const preparing = normalizedState === PRINT_STATE.CALIBRATING;
+        const pendingStart = normalizedState === PRINT_STATE.PENDING_START;
         const active = printing || paused || preparing || stopping || pendingStart;
         $("#print-pause").toggleClass("d-none", !printing || stopping);
         $("#print-resume").toggleClass("d-none", !paused || stopping);
@@ -1315,6 +1419,18 @@ $(function () {
     }
 
     const getStepDist = () => $('input[name="step-dist"]:checked').val() || "1";
+    let _lastHomeCommandAt = 0;
+    let _lastHomeCommand = null;
+
+    function sendHomeCommand(axis) {
+        const now = Date.now();
+        if (_lastHomeCommand === axis && now - _lastHomeCommandAt < 1000) {
+            return;
+        }
+        _lastHomeCommandAt = now;
+        _lastHomeCommand = axis;
+        sendPrinterHome(axis);
+    }
 
     $("#move-x-plus").on("click", function () { sendPrinterGCode(`G91\nG0 X${getStepDist()} F3000\nG90`); return false; });
     $("#move-x-minus").on("click", function () { sendPrinterGCode(`G91\nG0 X-${getStepDist()} F3000\nG90`); return false; });
@@ -1323,9 +1439,9 @@ $(function () {
     $("#move-z-plus").on("click", function () { sendPrinterGCode(`G91\nG0 Z${getStepDist()} F600\nG90`); return false; });
     $("#move-z-minus").on("click", function () { sendPrinterGCode(`G91\nG0 Z-${getStepDist()} F600\nG90`); return false; });
 
-    $("#control-home-xy").on("click", function () { sendPrinterGCode("G28 X Y"); return false; });
-    $("#control-home-z").on("click", function () { sendPrinterGCode("G28 Z"); return false; });
-    $("#control-home-all").on("click", function () { sendPrinterGCode("G28"); return false; });
+    $("#control-home-xy").on("click", function () { sendHomeCommand("xy"); return false; });
+    $("#control-home-z").on("click", function () { sendHomeCommand("z"); return false; });
+    $("#control-home-all").on("click", function () { sendHomeCommand("all"); return false; });
 
     // ------------------------------------------------------------------
     // Bed Level Map — shared rendering utilities
@@ -1920,24 +2036,33 @@ $(function () {
     /**
      * Snapshot Button
      */
-    $("#snapshot-btn").on("click", function () {
+    $("#snapshot-btn").on("click", async function () {
         const btn = $(this);
         btn.prop("disabled", true);
-        fetch("/api/snapshot")
-            .then(resp => {
-                if (!resp.ok) throw new Error("Snapshot failed");
-                return resp.blob();
-            })
-            .then(blob => {
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement("a");
-                a.href = url;
-                a.download = `ankerctl_snapshot_${Date.now()}.jpg`;
-                a.click();
-                URL.revokeObjectURL(url);
-            })
-            .catch(err => alert("Snapshot failed: " + err.message))
-            .finally(() => btn.prop("disabled", false));
+        try {
+            const resp = await fetch("/api/snapshot");
+            if (!resp.ok) {
+                const data = await resp.json().catch(() => ({}));
+                const msg = data.error || `HTTP ${resp.status}`;
+                const banner = /^snapshot\b/i.test(msg) ? msg : `Snapshot failed: ${msg}`;
+                flash_message(banner, "warning");
+                return;
+            }
+
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = `ankerctl_snapshot_${Date.now()}.jpg`;
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch (err) {
+            const msg = err.message || String(err);
+            const banner = /^snapshot\b/i.test(msg) ? msg : `Snapshot failed: ${msg}`;
+            flash_message(banner, "warning");
+        } finally {
+            btn.prop("disabled", false);
+        }
     });
 
     /**
@@ -2113,7 +2238,8 @@ $(function () {
         return false;
     });
     $("#print-stop").on("click", function () {
-        if (_currentPrintState === PRINT_STATE.STOPPING) {
+        const now = Date.now();
+        if (now - _lastStopCommandAt < 1000) {
             return false;
         }
         const preparing = _currentPrintState === PRINT_STATE.CALIBRATING;
@@ -2122,13 +2248,10 @@ $(function () {
             ? "Cancel the printer prepare phase before the print starts?"
             : pendingStart
                 ? "Cancel the pending print before it starts?"
-                : "Are you sure you want to stop the print? This will also turn off heaters.";
+                : "Are you sure you want to stop the print?";
         if (confirm(confirmText)) {
-            sendPrintControl((preparing || pendingStart) ? PRINT_CONTROL.PREPARE_CANCEL : PRINT_CONTROL.STOP);
-            if (!preparing && !pendingStart) {
-                sendPrinterGCode("M104 S0\nM140 S0\nM106 S0");
-            }
-            _updatePrintControlButtons(PRINT_STATE.STOPPING);
+            _lastStopCommandAt = now;
+            sendPrintControl(PRINT_CONTROL.STOP);
         }
         return false;
     });

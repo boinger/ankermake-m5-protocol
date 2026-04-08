@@ -136,6 +136,26 @@ def test_handle_notification_start_finish_and_failure_paths(monkeypatch):
     ]
 
 
+def test_deferred_filename_starts_timelapse_after_print_state(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    monkeypatch.setattr("web.service.mqtt.time.monotonic", lambda: 100.0)
+
+    queue._handle_notification({"commandType": 1000, "value": 1})
+
+    assert queue._state == PrintState.PRINTING
+    assert queue._pending_history_start is True
+    assert history_calls == []
+    assert timelapse_calls == []
+
+    queue._handle_notification({"commandType": 1044, "filePath": "/tmp/deferred.gcode"})
+
+    assert queue._pending_history_start is False
+    assert history_calls == [("start", ("deferred.gcode",), {"task_id": None})]
+    assert timelapse_calls == [("start", "deferred.gcode")]
+
+
 def test_handle_notification_aborts_active_print_on_value_8(monkeypatch):
     global ha_updates, history_calls, timelapse_calls, events
     ha_updates, history_calls, timelapse_calls, events = [], [], [], []
@@ -177,6 +197,81 @@ def test_send_print_control_shotgun_during_prepare_state():
         {"commandType": 1008, "value": 4},
     ]
     assert queue._stop_requested is True
+
+
+def test_send_pause_resume_print_control_uses_nested_and_flat_payloads():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    sent = []
+    queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
+    queue._state = PrintState.PRINTING
+
+    queue.send_print_control(2)
+    queue._state = PrintState.PAUSED
+    queue.send_print_control(3)
+
+    assert sent == [
+        {"commandType": 1008, "data": {"value": 2, "userName": "tester@example.com"}},
+        {"commandType": 1008, "value": 2},
+        {"commandType": 1008, "data": {"value": 3, "userName": "tester@example.com"}},
+        {"commandType": 1008, "value": 3},
+    ]
+    assert queue._stop_requested is False
+
+
+def test_send_stop_print_control_uses_nested_and_flat_payloads_for_active_print():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    sent = []
+    queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
+    queue._state = PrintState.PRINTING
+
+    queue.send_print_control(4)
+
+    assert sent == [
+        {"commandType": 1008, "data": {"value": 4, "userName": "tester@example.com"}},
+        {"commandType": 1008, "value": 4},
+    ]
+    assert queue._stop_requested is True
+
+
+def test_send_gcode_dedupes_identical_g28_commands(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    sent = []
+    queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
+    now = [100.0]
+    monkeypatch.setattr("web.service.mqtt.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("web.service.mqtt.time.sleep", lambda seconds: None)
+
+    queue.send_gcode("G28")
+    queue.send_gcode("G28")
+    queue.send_gcode("G28 Z")
+    now[0] += 10.1
+    queue.send_gcode("G28")
+
+    assert [cmd["cmdData"] for cmd in sent] == ["G28", "G28 Z", "G28"]
+
+
+def test_send_home_uses_native_move_zero_payloads():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    sent = []
+    queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
+
+    queue.send_home("xy")
+    queue.send_home("z")
+    queue.send_home("all")
+
+    assert sent == [
+        {"commandType": 1026, "value": 0},
+        {"commandType": 1026, "value": 2},
+        {"commandType": 1026, "value": 2},
+    ]
 
 
 def test_1044_captures_filename_without_marking_prepare_state():
@@ -568,6 +663,30 @@ def test_pause_and_resume():
     assert any(u.get("print_status") == "printing" for u in ha_updates), "HA should report printing after resume"
 
 
+def test_pause_and_resume_when_resume_ack_is_printing_value():
+    """Some firmware confirms resume with ct=1000 value=1 instead of value=3."""
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._handle_notification({"commandType": 1044, "filePath": "/tmp/cube.gcode"})
+    queue._handle_notification({"commandType": 1000, "value": 1})
+    queue._handle_notification({"commandType": 1000, "value": 2})
+    assert queue._state == PrintState.PAUSED
+
+    history_calls.clear()
+    timelapse_calls.clear()
+    events.clear()
+    ha_updates.clear()
+    queue._handle_notification({"commandType": 1000, "value": 1})
+
+    assert queue._state == PrintState.PRINTING
+    assert any(u.get("print_status") == "printing" for u in ha_updates), "HA should report printing after resume"
+    assert history_calls == []
+    assert timelapse_calls == []
+    assert events == []
+
+
 def test_pause_only_from_printing():
     """value=2 is ignored if not currently PRINTING."""
     global ha_updates, history_calls, timelapse_calls, events
@@ -780,3 +899,4 @@ def test_get_state_during_pause():
     assert state["active"] is True
     assert state["in_pre_print_window"] is False
     assert state["preparing"] is False, "is_preparing_print should be False during PAUSED"
+    assert state["state_label"] == "preparing_or_aborted"

@@ -59,6 +59,74 @@ def test_mqtt_send_blocks_dangerous_commands_without_force(monkeypatch):
     assert opened == []
 
 
+def test_mqtt_monitor_can_subscribe_to_command_topics(monkeypatch):
+    runner = CliRunner()
+    fake_config = FakeConfigManager()
+    fake_client = SimpleNamespace(subscribed=False, wildcard=None)
+
+    def subscribe_device_topics(wildcard=False):
+        fake_client.subscribed = True
+        fake_client.wildcard = wildcard
+        return ["/device/maker/SN123/command", "/device/maker/SN123/query"]
+
+    def fetchloop():
+        yield (
+            SimpleNamespace(topic="/device/maker/SN123/command", payload=b"payload"),
+            [{"commandType": 1026, "axis": "xy"}],
+        )
+
+    fake_client.subscribe_device_topics = subscribe_device_topics
+    fake_client.fetchloop = fetchloop
+
+    monkeypatch.setattr("ankerctl.cli.config.configmgr", lambda: fake_config)
+    monkeypatch.setattr("ankerctl.cli.logfmt.setup_logging", lambda level, log_dir=None: None)
+    monkeypatch.setattr("ankerctl.Environment.upgrade_config_if_needed", lambda self: None)
+    monkeypatch.setattr("ankerctl.Environment.load_config", lambda self, required=True: None)
+    monkeypatch.setattr("ankerctl.cli.mqtt.mqtt_open", lambda *args, **kwargs: fake_client)
+
+    result = runner.invoke(ankerctl.main, ["mqtt", "monitor", "--command-topics"])
+
+    assert result.exit_code == 0
+    assert fake_client.subscribed is True
+    assert fake_client.wildcard is False
+    assert "[1026] move_zero" in result.output
+    assert "{'axis': 'xy'}" in result.output
+
+
+def test_mqtt_monitor_can_sniff_wildcard_command_topics(monkeypatch):
+    runner = CliRunner()
+    fake_config = FakeConfigManager()
+    fake_client = SimpleNamespace(subscribed=False, wildcard=None)
+
+    def subscribe_device_topics(wildcard=False):
+        fake_client.subscribed = True
+        fake_client.wildcard = wildcard
+        return ["/device/maker/SN123/command", "/device/maker/SN123/query", "/device/maker/SN123/#"]
+
+    def fetchloop():
+        yield (
+            SimpleNamespace(topic="/device/maker/SN123/command", payload=b"payload"),
+            [{"commandType": 1025, "value": 3}],
+        )
+
+    fake_client.subscribe_device_topics = subscribe_device_topics
+    fake_client.fetchloop = fetchloop
+
+    monkeypatch.setattr("ankerctl.cli.config.configmgr", lambda: fake_config)
+    monkeypatch.setattr("ankerctl.cli.logfmt.setup_logging", lambda level, log_dir=None: None)
+    monkeypatch.setattr("ankerctl.Environment.upgrade_config_if_needed", lambda self: None)
+    monkeypatch.setattr("ankerctl.Environment.load_config", lambda self, required=True: None)
+    monkeypatch.setattr("ankerctl.cli.mqtt.mqtt_open", lambda *args, **kwargs: fake_client)
+
+    result = runner.invoke(ankerctl.main, ["mqtt", "monitor", "--sniff-topics"])
+
+    assert result.exit_code == 0
+    assert fake_client.subscribed is True
+    assert fake_client.wildcard is True
+    assert ankerctl.mqtt_topic_direction("/device/maker/SN123/command") == "app->printer"
+    assert "[1025] move_direction" in result.output
+
+
 def test_http_calc_sec_code_and_webserver_run_dispatch(monkeypatch):
     runner = CliRunner()
     fake_config = FakeConfigManager()

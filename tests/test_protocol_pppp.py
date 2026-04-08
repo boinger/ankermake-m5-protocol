@@ -162,3 +162,15 @@ def test_channel_write_poll_and_acknowledge():
 
     assert chan.tx_ack == CyclicU16(2)
     assert chan.txqueue == []
+
+
+def test_channel_can_skip_stale_receive_gap_for_realtime_streams():
+    chan = Channel(index=1)
+
+    chan.rx_drw(CyclicU16(1), b"middle")
+    chan.rx_drw(CyclicU16(2), b"end")
+
+    assert chan.peek(1, timeout=0.0) is None
+    assert chan.skip_rx_gap(max_queued=2) is True
+    assert chan.read(9, timeout=0.0) == b"middleend"
+    assert chan.rx_ctr == CyclicU16(3)

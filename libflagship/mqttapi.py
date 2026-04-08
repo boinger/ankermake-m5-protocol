@@ -130,6 +130,19 @@ class AnkerMQTTBaseClient:
     def command(self, msg):
         return self.send(f"/device/maker/{self.sn}/command", msg)
 
+    def subscribe_device_topics(self, wildcard=False):
+        """Also listen to app-to-printer topics when broker ACLs permit it."""
+        topics = [
+            f"/device/maker/{self.sn}/command",
+            f"/device/maker/{self.sn}/query",
+        ]
+        if wildcard:
+            topics.append(f"/device/maker/{self.sn}/#")
+
+        for topic in topics:
+            self._mqtt.subscribe(topic)
+        return topics
+
     def loop(self):
         self._mqtt.loop_forever()
 

@@ -53,14 +53,24 @@ class PrintHistory:
 
     def _init_db(self):
         try:
-            with self._connect() as conn:
+            conn = self._connect()
+            try:
                 conn.executescript(_SCHEMA)
                 self._migrate_schema(conn)
+                conn.commit()
+            finally:
+                if os.fspath(self._db_path) != ":memory:":
+                    conn.close()
         except sqlite3.DatabaseError as exc:
             self._recreate_db_after_corruption(exc)
-            with self._connect() as conn:
+            conn = self._connect()
+            try:
                 conn.executescript(_SCHEMA)
                 self._migrate_schema(conn)
+                conn.commit()
+            finally:
+                if os.fspath(self._db_path) != ":memory:":
+                    conn.close()
 
     def _migrate_schema(self, conn):
         """Ensure schema is up to date."""

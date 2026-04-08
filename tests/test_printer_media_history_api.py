@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from datetime import datetime
+import subprocess
 from types import SimpleNamespace
 
 from cli.model import Account, Config, Printer
@@ -128,10 +129,12 @@ def test_printer_gcode_route_normalizes_safe_commands_and_blocks_motion_while_pr
 def test_printer_control_and_autolevel_routes_validate_and_dispatch():
     control_calls = []
     autolevel_calls = []
+    home_calls = []
     mqtt = SimpleNamespace(
         is_printing=False,
         send_print_control=lambda value: control_calls.append(value),
         send_auto_leveling=lambda: autolevel_calls.append(True),
+        send_home=lambda axis: home_calls.append(axis),
     )
     client = app.test_client()
     old_values, old_svc = _install_app_state(mqtt=mqtt)
@@ -151,9 +154,24 @@ def test_printer_control_and_autolevel_routes_validate_and_dispatch():
             "/api/printer/autolevel",
             headers={"X-Api-Key": API_KEY},
         )
+        home = client.post(
+            "/api/printer/home",
+            json={"axis": "xy"},
+            headers={"X-Api-Key": API_KEY},
+        )
+        bad_home = client.post(
+            "/api/printer/home",
+            json={"axis": "bad"},
+            headers={"X-Api-Key": API_KEY},
+        )
         mqtt.is_printing = True
         blocked = client.post(
             "/api/printer/autolevel",
+            headers={"X-Api-Key": API_KEY},
+        )
+        blocked_home = client.post(
+            "/api/printer/home",
+            json={"axis": "z"},
             headers={"X-Api-Key": API_KEY},
         )
     finally:
@@ -162,9 +180,13 @@ def test_printer_control_and_autolevel_routes_validate_and_dispatch():
     assert invalid.status_code == 400
     assert control.status_code == 200
     assert allowed.status_code == 200
+    assert home.status_code == 200
+    assert bad_home.status_code == 400
     assert blocked.status_code == 409
+    assert blocked_home.status_code == 409
     assert control_calls == [2]
     assert autolevel_calls == [True]
+    assert home_calls == ["xy"]
 
 
 def test_printer_z_offset_routes_refresh_set_and_nudge():
@@ -286,23 +308,65 @@ def test_snapshot_route_reports_expected_error_paths(monkeypatch):
     finally:
         _restore_app_state(old_values, old_svc)
 
-    monkeypatch.setattr("shutil.which", lambda name: None)
+    monkeypatch.setattr("web._ffmpeg_path", lambda: None)
     old_values, old_svc = _install_app_state(video_supported=True, videoqueue=object())
     try:
         no_ffmpeg = client.get("/api/snapshot", headers={"X-Api-Key": API_KEY})
     finally:
         _restore_app_state(old_values, old_svc)
 
-    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr("web._ffmpeg_path", lambda: "/usr/bin/ffmpeg")
     old_values, old_svc = _install_app_state(video_supported=True, videoqueue=None)
     try:
         no_service = client.get("/api/snapshot", headers={"X-Api-Key": API_KEY})
     finally:
         _restore_app_state(old_values, old_svc)
 
+    old_values, old_svc = _install_app_state(
+        video_supported=True,
+        videoqueue=SimpleNamespace(video_enabled=False),
+    )
+    try:
+        video_disabled = client.get("/api/snapshot", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    monkeypatch.setattr("web._video_has_recent_frame", lambda vq: False)
+    old_values, old_svc = _install_app_state(
+        video_supported=True,
+        videoqueue=SimpleNamespace(video_enabled=True, last_frame_at=None),
+    )
+    try:
+        no_frames = client.get("/api/snapshot", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    monkeypatch.setattr("web._video_has_recent_frame", lambda vq: True)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs.get("timeout"))
+        ),
+    )
+    old_values, old_svc = _install_app_state(
+        video_supported=True,
+        videoqueue=SimpleNamespace(video_enabled=True, last_frame_at=123.0),
+    )
+    try:
+        timeout = client.get("/api/snapshot", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
     assert not_supported.status_code == 400
     assert no_ffmpeg.status_code == 500
     assert no_service.status_code == 503
+    assert video_disabled.status_code == 409
+    assert "Enable video" in video_disabled.get_json()["error"]
+    assert no_frames.status_code == 409
+    assert "no live camera frames" in no_frames.get_json()["error"]
+    assert timeout.status_code == 504
+    assert "timed out" in timeout.get_json()["error"]
+    assert "Command" not in timeout.get_json()["error"]
 
 
 def test_unsupported_device_guard_blocks_printer_control_routes():

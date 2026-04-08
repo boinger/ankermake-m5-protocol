@@ -3,6 +3,7 @@ import socket
 import string
 import hashlib
 import logging as log
+import time
 
 from enum import Enum
 from multiprocessing import Pipe
@@ -127,6 +128,9 @@ class Channel:
         self.max_in_flight = max_in_flight
         self.max_age_warn = max_age_warn
         self.lock = Lock()
+        self._rx_gap_report_at = 0.0
+        self._rx_gap_report_skips = 0
+        self._rx_gap_report_packets = 0
 
     def rx_ack(self, acks):
         # remove all ACKed packets from transmission queue
@@ -158,6 +162,49 @@ class Channel:
             del self.rxqueue[self.rx_ctr]
             self.rx_ctr += 1
             self.rx.write(data)
+
+    def skip_rx_gap(self, max_queued=16):
+        """Drop a stale receive gap and resume at the oldest queued packet.
+
+        Video is a realtime stream carried over UDP. If one DRW packet never
+        arrives, waiting forever for perfect ordering freezes every later frame.
+        This intentionally sacrifices the damaged bytes so higher layers can
+        resync at the next XZYH frame boundary.
+        """
+        if self.rx_ctr in self.rxqueue or len(self.rxqueue) < max_queued:
+            return False
+
+        next_index = min(
+            self.rxqueue,
+            key=lambda idx: int(CyclicU16(idx) - self.rx_ctr),
+        )
+        gap = int(CyclicU16(next_index) - self.rx_ctr)
+        self._rx_gap_report_skips += 1
+        self._rx_gap_report_packets += gap
+        now = time.monotonic()
+        if now - self._rx_gap_report_at >= 10.0:
+            log.debug(
+                f"Channel {self.index}: realtime receive-gap recovery "
+                f"({self._rx_gap_report_packets} packet(s) skipped across "
+                f"{self._rx_gap_report_skips} gap(s))"
+            )
+            self._rx_gap_report_at = now
+            self._rx_gap_report_skips = 0
+            self._rx_gap_report_packets = 0
+        else:
+            log.debug(
+                f"Channel {self.index}: skipping stale receive gap of {gap} packet(s) "
+                f"after {len(self.rxqueue)} queued packet(s)"
+            )
+        self.rx_ctr = CyclicU16(next_index)
+        self.rx.buf.clear()
+
+        while self.rx_ctr in self.rxqueue:
+            data = self.rxqueue[self.rx_ctr]
+            del self.rxqueue[self.rx_ctr]
+            self.rx_ctr += 1
+            self.rx.write(data)
+        return True
 
     def poll(self):
         # signal event to make blocking reads check status again

@@ -72,7 +72,7 @@ class FakeServices:
         self.svcs = svcs or {}
         self.refs = refs or {}
 
-    def stream(self, name):
+    def stream(self, name, **kwargs):
         yield from self._streams.get(name, [])
 
     @contextmanager
@@ -155,12 +155,15 @@ def test_mqtt_and_upload_websockets_forward_stream_messages():
 
 def test_video_websocket_toggles_streaming_and_ctrl_dispatches_commands():
     set_enabled = []
+    viewer_events = []
     light_calls = []
     profile_calls = []
     quality_calls = []
     videoqueue = SimpleNamespace(
         saved_video_profile_id="balanced",
         set_video_enabled=lambda enabled: set_enabled.append(enabled),
+        viewer_connected=lambda: viewer_events.append("connect"),
+        viewer_disconnected=lambda: viewer_events.append("disconnect"),
         api_light_state=lambda enabled: light_calls.append(enabled),
         api_video_profile=lambda profile: profile_calls.append(profile),
         api_video_mode=lambda quality: quality_calls.append(quality),
@@ -189,7 +192,8 @@ def test_video_websocket_toggles_streaming_and_ctrl_dispatches_commands():
         _restore_app_state(web_module, old_values, old_svc)
 
     assert video_sock.sent == [b"frame-1", b"frame-2"]
-    assert set_enabled == [True, False, False]
+    assert viewer_events == ["connect", "disconnect"]
+    assert set_enabled == [False]
     assert json.loads(ctrl_sock.sent[0]) == {"ankerctl": 1}
     assert json.loads(ctrl_sock.sent[1]) == {"video_profile": "balanced"}
     assert light_calls == [True]

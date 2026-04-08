@@ -4,7 +4,7 @@ import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
-from web.service.timelapse import TimelapseService, _IN_PROGRESS_SUBDIR
+from web.service.timelapse import TimelapseService, _IN_PROGRESS_SUBDIR, _resolve_ffmpeg_path
 
 
 class FakeConfigManager:
@@ -62,6 +62,15 @@ def test_timelapse_prunes_old_videos(tmp_path):
 
     remaining = sorted(p.name for p in tmp_path.glob("*.mp4"))
     assert remaining == ["mid.mp4", "new.mp4"]
+
+
+def test_timelapse_resolves_ffmpeg_through_web_fallback(monkeypatch):
+    import web
+
+    monkeypatch.setattr("web.service.timelapse.shutil.which", lambda name: None)
+    monkeypatch.setattr(web, "_ffmpeg_path", lambda: r"C:\ffmpeg\ffmpeg.exe")
+
+    assert _resolve_ffmpeg_path() == r"C:\ffmpeg\ffmpeg.exe"
 
 
 def test_timelapse_scan_recovers_or_resumes_in_progress(monkeypatch, tmp_path):
@@ -166,7 +175,7 @@ def test_timelapse_start_capture_resumes_pending_session(monkeypatch, tmp_path):
         def start(self):
             calls.append("thread-start")
 
-    monkeypatch.setattr("web.service.timelapse.shutil.which", lambda name: "/usr/bin/ffmpeg")
+    monkeypatch.setattr("web.service.timelapse._resolve_ffmpeg_path", lambda: "/usr/bin/ffmpeg")
     monkeypatch.setattr(TimelapseService, "_stop_capture_thread", lambda self: calls.append("stop-thread"))
     monkeypatch.setattr(TimelapseService, "_cancel_finalize_timer", lambda self: calls.append("cancel-finalize"))
     monkeypatch.setattr(TimelapseService, "_cancel_pending_resume", lambda self: calls.append("cancel-pending"))
@@ -210,6 +219,7 @@ def test_timelapse_take_snapshot_retries_and_restores_light(monkeypatch, tmp_pat
         return SimpleNamespace(returncode=1)
 
     try:
+        monkeypatch.setattr("web.service.timelapse._resolve_ffmpeg_path", lambda: "resolved-ffmpeg")
         monkeypatch.setattr(TimelapseService, "_await_video_frame", lambda self: True)
         monkeypatch.setattr("web.service.timelapse.subprocess.run", fake_run)
         monkeypatch.setattr("web.service.timelapse.time.sleep", lambda seconds: None)
@@ -219,10 +229,36 @@ def test_timelapse_take_snapshot_retries_and_restores_light(monkeypatch, tmp_pat
         __import__("web").app.config["api_key"] = old_api_key
 
     assert len(runs) == 2
+    assert runs[0][0] == "resolved-ffmpeg"
+    assert runs[1][0] == "resolved-ffmpeg"
     assert any("apikey=secret-key" in part for part in runs[0] if isinstance(part, str))
     assert light_calls == [True, False]
     assert svc._frame_count == 1
     assert os.path.exists(os.path.join(svc._current_dir, "frame_00000.jpg"))
+
+
+def test_timelapse_assemble_uses_resolved_ffmpeg(monkeypatch, tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    (frames_dir / "frame_00000.jpg").write_bytes(b"jpg")
+    (frames_dir / "frame_00001.jpg").write_bytes(b"jpg")
+    runs = []
+
+    def fake_run(cmd, stdout=None, stderr=None, timeout=None):
+        runs.append(cmd)
+        with open(cmd[-1], "wb") as fh:
+            fh.write(b"mp4")
+        return SimpleNamespace(returncode=0, stderr=b"")
+
+    monkeypatch.setattr("web.service.timelapse._resolve_ffmpeg_path", lambda: "resolved-ffmpeg")
+    monkeypatch.setattr("web.service.timelapse.subprocess.run", fake_run)
+
+    svc._assemble_video_from(str(frames_dir), "cube.gcode", 2)
+
+    assert runs[0][0] == "resolved-ffmpeg"
+    assert list(tmp_path.glob("*.mp4"))
 
 
 def test_capture_thread_crash_clears_ref(tmp_path):

@@ -437,7 +437,7 @@ Manages the LAN (PPPP) connection. Registered as `"pppp"`. Reference-counted: st
 H.264 video from printer camera over PPPP channel 1. Registered as `"videoqueue"`.
 Key methods: `api_light_state(bool)`, `api_video_profile(id)`, `set_video_enabled(bool)`.
 Video profiles: `"sd"` (848×480), `"hd"` (1280×720, default), `"fhd"` (1920×1080, snapshot-only).
-Stall detection: no frames for 60 seconds → soft restart; after 3 consecutive failures → `ServiceRestartSignal`.
+Stall detection: no frames for 5 seconds → soft restart; after 3 consecutive failures → `ServiceRestartSignal`.
 
 ### FileTransferService (`web/service/filetransfer.py`)
 

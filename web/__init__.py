@@ -40,6 +40,18 @@ from contextlib import contextmanager
 log = logging.getLogger("web")
 
 
+class _StaticAssetAccessLogFilter(logging.Filter):
+    def filter(self, record):
+        message = record.getMessage()
+        return '"GET /static/' not in message and '"GET /favicon.ico' not in message
+
+
+def _configure_access_log_noise():
+    werkzeug_log = logging.getLogger("werkzeug")
+    if not any(isinstance(f, _StaticAssetAccessLogFilter) for f in werkzeug_log.filters):
+        werkzeug_log.addFilter(_StaticAssetAccessLogFilter())
+
+
 from secrets import token_urlsafe as token
 from flask import Flask, flash, request, render_template, Response, session, url_for, jsonify
 from flask_sock import Sock
@@ -107,8 +119,50 @@ def _env_int(name, default, min_value=1, env=None):
     return value
 
 
+def _ffmpeg_path():
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    cached = getattr(_ffmpeg_path, "_cached", None)
+    if cached and os.path.isfile(cached):
+        return cached
+
+    local_app_data = os.getenv("LOCALAPPDATA")
+    if local_app_data:
+        packages_dir = os.path.join(local_app_data, "Microsoft", "WinGet", "Packages")
+        if os.path.isdir(packages_dir):
+            for root, _, files in os.walk(packages_dir):
+                if "ffmpeg.exe" in files:
+                    candidate = os.path.join(root, "ffmpeg.exe")
+                    _ffmpeg_path._cached = candidate
+                    return candidate
+
+    return None
+
+
 def _ffmpeg_available():
-    return shutil.which("ffmpeg") is not None
+    return _ffmpeg_path() is not None
+
+
+SNAPSHOT_FRAME_WAIT_SEC = 3.0
+SNAPSHOT_FRAME_MAX_AGE_SEC = 2.0
+SNAPSHOT_FFMPEG_TIMEOUT_SEC = 30
+VIDEO_STREAM_QUEUE_MAX = 30
+
+
+def _video_has_recent_frame(vq, wait_sec=SNAPSHOT_FRAME_WAIT_SEC, max_age_sec=SNAPSHOT_FRAME_MAX_AGE_SEC):
+    if not hasattr(vq, "last_frame_at"):
+        return True
+
+    deadline = time.monotonic() + wait_sec
+    while True:
+        last_frame_at = getattr(vq, "last_frame_at", None)
+        if last_frame_at is not None and time.monotonic() - last_frame_at <= max_age_sec:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def _configure_request_limits(flask_app, env=None):
@@ -716,9 +770,17 @@ def mqtt(sock):
     if not _validate_ws_auth(sock):
         return
 
-    for data in stream_mqtt():
-        log.debug(f"MQTT message: {data}")
-        sock.send(json.dumps(data))
+    try:
+        for data in stream_mqtt():
+            log.debug(f"MQTT message: {data}")
+            sock.send(json.dumps(data))
+    except ConnectionClosed:
+        log.debug("/ws/mqtt closed by client")
+    except OSError as exc:
+        log.debug(f"/ws/mqtt closed during send: {exc}")
+    except Exception as exc:
+        log.warning(f"/ws/mqtt error: {exc}")
+        log.info("Stack trace:", exc_info=True)
 
 
 @sock.route("/ws/video")
@@ -739,15 +801,30 @@ def video(sock):
     if not vq:
         return
 
-    vq.set_video_enabled(True)
+    vq.viewer_connected()
     try:
-        for msg in app.svc.stream("videoqueue"):
-            sock.send(msg.data)
+        for msg in app.svc.stream("videoqueue", maxsize=VIDEO_STREAM_QUEUE_MAX):
+            payload = getattr(msg, "data", None)
+            if not payload:
+                continue
+            sock.send(payload)
+    except ConnectionClosed:
+        log.debug("/ws/video closed by client")
+    except OSError as exc:
+        log.debug(f"/ws/video closed during send: {exc}")
+    except Exception as exc:
+        log.warning(f"/ws/video error: {exc}")
+        log.info("Stack trace:", exc_info=True)
     finally:
-        # Only disable video if no other clients are consuming the stream.
-        # refs > 0 means other /ws/video handlers are still inside stream() → borrow().
-        if app.svc.refs.get("videoqueue", 0) == 0:
-            vq.set_video_enabled(False)
+        # /ws/video is only a consumer of the shared video service.
+        # The explicit owner of video enable/disable is /ws/ctrl via
+        # {"video_enabled": true/false}.  Do not tear the service down here,
+        # because transient websocket disconnects or reconnects would otherwise
+        # stop live video for the whole app.
+        try:
+            vq.viewer_disconnected()
+        except Exception as exc:
+            log.debug(f"/ws/video cleanup failed: {exc}")
 
 
 def _maybe_start_pppp_probe(reason="scheduled"):
@@ -900,7 +977,7 @@ def pppp_state(sock):
 
             time.sleep(1.0)
     except ConnectionClosed:
-        log.info("WebSocket connection closed by client")
+        log.debug("WebSocket connection closed by client")
     except Exception as e:
         log.warning(f"Error in PPPP state websocket handler: {e}")
         log.info("Stack trace:", exc_info=True)
@@ -910,7 +987,7 @@ def pppp_state(sock):
                 app.pppp_probe["client_count"] -= 1
         except Exception as exc:
             log.debug(f"PPPP state cleanup failed: {exc}")
-        log.info("PPPP state websocket handler ending")
+        log.debug("PPPP state websocket handler ending")
 
 
 @sock.route("/ws/upload")
@@ -923,8 +1000,16 @@ def upload(sock):
     if not _validate_ws_auth(sock):
         return
 
-    for data in app.svc.stream("filetransfer"):
-        sock.send(json.dumps(data))
+    try:
+        for data in app.svc.stream("filetransfer"):
+            sock.send(json.dumps(data))
+    except ConnectionClosed:
+        log.debug("/ws/upload closed by client")
+    except OSError as exc:
+        log.debug(f"/ws/upload closed during send: {exc}")
+    except Exception as exc:
+        log.warning(f"/ws/upload error: {exc}")
+        log.info("Stack trace:", exc_info=True)
 
 
 @sock.route("/ws/ctrl")
@@ -1023,7 +1108,7 @@ def video_download():
                     vq.await_ready()
                 except ServiceStoppedError:
                     return
-        for msg in app.svc.stream("videoqueue"):
+        for msg in app.svc.stream("videoqueue", maxsize=VIDEO_STREAM_QUEUE_MAX):
             yield msg.data
 
     return Response(generate(), mimetype="video/mp4")
@@ -1638,6 +1723,21 @@ def app_api_printer_gcode():
     return {"status": "ok"}
 
 
+@app.post("/api/printer/home")
+def app_api_printer_home():
+    payload = request.get_json(silent=True) or {}
+    axis = str(payload.get("axis", "all")).lower()
+    if axis not in {"all", "xy", "z"}:
+        return {"error": "Invalid home axis"}, 400
+
+    with borrow_mqtt() as mqtt:
+        if mqtt.is_printing:
+            return {"error": "Motion commands blocked while printing"}, 409
+        mqtt.send_home(axis)
+
+    return {"status": "ok", "axis": axis}
+
+
 @app.post("/api/printer/control")
 def app_api_printer_control():
     payload = request.get_json(silent=True)
@@ -2091,19 +2191,23 @@ def app_api_printer_bed_leveling_last():
 @app.get("/api/snapshot")
 def app_api_snapshot():
     """Capture a JPEG snapshot from the camera and return it as a file download."""
-    import shutil
     import subprocess
     import tempfile
 
     if not app.config.get("video_supported"):
         return {"error": "Video not supported on this platform"}, 400
 
-    if not shutil.which("ffmpeg"):
+    ffmpeg_path = _ffmpeg_path()
+    if not ffmpeg_path:
         return {"error": "ffmpeg not installed"}, 500
 
     vq = app.svc.svcs.get("videoqueue")
     if not vq:
         return {"error": "Video service not available"}, 503
+    if not getattr(vq, "video_enabled", False):
+        return {"error": "Enable video before taking a snapshot"}, 409
+    if not _video_has_recent_frame(vq):
+        return {"error": "Video is enabled, but no live camera frames are available yet. Wait for live video to appear and try again."}, 409
 
     host = os.getenv("FLASK_HOST") or "127.0.0.1"
     if host in {"0.0.0.0", "::"}:
@@ -2123,18 +2227,21 @@ def app_api_snapshot():
 
     try:
         result = subprocess.run(
-            ["ffmpeg", "-loglevel", "error", "-nostdin", "-y",
+            [ffmpeg_path, "-loglevel", "error", "-nostdin", "-y",
              "-f", "h264", "-i", url, "-frames:v", "1", temp_path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=SNAPSHOT_FFMPEG_TIMEOUT_SEC,
         )
         if result.returncode != 0:
             # Retry without -f h264
             result = subprocess.run(
-                ["ffmpeg", "-loglevel", "error", "-nostdin", "-y",
+                [ffmpeg_path, "-loglevel", "error", "-nostdin", "-y",
                  "-i", url, "-frames:v", "1", temp_path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=SNAPSHOT_FFMPEG_TIMEOUT_SEC,
             )
         if result.returncode != 0 or not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
+            stderr = result.stderr.decode("utf-8", errors="replace").strip()
+            if stderr:
+                log.warning("Snapshot ffmpeg failed: %s", stderr)
             try:
                 os.remove(temp_path)
             except OSError:
@@ -2156,12 +2263,18 @@ def app_api_snapshot():
         return send_file(temp_path, mimetype="image/jpeg",
                          as_attachment=True,
                          download_name=f"ankerctl_snapshot_{timestamp}.jpg")
-    except (subprocess.TimeoutExpired, OSError) as err:
+    except subprocess.TimeoutExpired:
         try:
             os.remove(temp_path)
         except OSError:
             pass
-        return {"error": f"Snapshot failed: {err}"}, 500
+        return {"error": "Snapshot timed out waiting for a camera frame. Wait for live video to update and try again."}, 504
+    except OSError as err:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        return {"error": f"Snapshot could not run ffmpeg: {err}"}, 500
 
 @app.get("/api/history")
 def app_api_history():
@@ -2708,6 +2821,7 @@ def webserver(config, printer_index, host, port, insecure=False, **kwargs):
     def inject_debug():
         return {"debug_mode": os.getenv("ANKERCTL_DEV_MODE", "false").lower() == "true"}
 
+    _configure_access_log_noise()
     app.run(host=host, port=port)
 
 

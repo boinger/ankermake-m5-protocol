@@ -41,6 +41,42 @@ class PPPPService(Service):
         self._handler_lock = threading.Lock()
         super().__init__()
 
+    def _force_close_api(self):
+        if not hasattr(self, "_api"):
+            return
+        api = self._api
+        # Do not try to send a graceful close packet here. After a video freeze,
+        # that send path can block and leave PPPP half-stopped forever. Force the
+        # transport down locally so the service thread can complete its stop and
+        # be restarted cleanly.
+        try:
+            api.state = PPPPState.Disconnected
+        except Exception:
+            pass
+        try:
+            if getattr(api, "sock", None):
+                try:
+                    api.sock.shutdown(2)
+                except Exception:
+                    pass
+                api.sock.close()
+        except Exception:
+            pass
+        try:
+            del self._api
+        except Exception:
+            try:
+                self._api = None
+            except Exception:
+                pass
+
+    def stop(self):
+        was_wanted = self.wanted
+        super().stop()
+        if was_wanted:
+            log.info("PPPPService: forcing socket close to expedite stop")
+            self._force_close_api()
+
     def api_command(self, commandType, **kwargs):
         if not hasattr(self, "_api"):
             raise ConnectionError("No pppp connection")
@@ -112,6 +148,8 @@ class PPPPService(Service):
                 if not hdr:
                     return
                 if hdr[:4] != b"XZYH":
+                    if self._resync_xzyh(fd, chan):
+                        continue
                     return
 
                 xzyh = Xzyh.parse(hdr)[0]
@@ -128,6 +166,25 @@ class PPPPService(Service):
                 except Exception as e:
                     log.warning(f"Handler error: {e}")
 
+    def _resync_xzyh(self, fd, chan):
+        rx = getattr(fd, "rx", None)
+        buf = getattr(rx, "buf", None)
+        if not buf:
+            return False
+
+        data = bytes(buf)
+        pos = data.find(b"XZYH", 1)
+        if pos < 0:
+            if len(buf) > 3:
+                discarded = len(buf) - 3
+                del buf[:-3]
+                log.debug(f"PPPPService: discarded {discarded} unsynced channel {chan} byte(s) while looking for XZYH")
+            return False
+
+        del buf[:pos]
+        log.debug(f"PPPPService: resynced channel {chan} stream at next XZYH boundary")
+        return True
+
     def _recv_aabb(self, fd):
         data = fd.read(12)
         aabb = Aabb.parse(data)[0]
@@ -136,10 +193,40 @@ class PPPPService(Service):
         return aabb, data
 
     def worker_run(self, timeout):
+        if not hasattr(self, "_api"):
+            if getattr(self, "wanted", True):
+                raise ServiceRestartSignal("PPPP API missing while service is wanted")
+            return
+
+        # A stale/disconnected API object after video recovery is not a usable
+        # running PPPP session. Force an internal restart instead of idling
+        # forever in a wanted-but-disconnected state.
+        if getattr(self._api, "state", PPPPState.Connected) != PPPPState.Connected:
+            if getattr(self, "wanted", True):
+                raise ServiceRestartSignal("PPPP API exists but is not connected while service is wanted")
+            return
+
         try:
             msg = self._api.poll(timeout=timeout)
-        except ConnectionResetError:
+        except (ConnectionResetError, OSError):
+            if not getattr(self, "wanted", True):
+                return
             raise ServiceRestartSignal()
+
+        if not hasattr(self, "_api"):
+            if getattr(self, "wanted", True):
+                raise ServiceRestartSignal("PPPP API disappeared during worker loop")
+            return
+
+        if getattr(self._api, "state", PPPPState.Connected) != PPPPState.Connected:
+            if getattr(self, "wanted", True):
+                raise ServiceRestartSignal("PPPP API disconnected during worker loop")
+            return
+
+        chans = getattr(self._api, "chans", [])
+        if len(chans) > 1 and hasattr(chans[1], "skip_rx_gap"):
+            if chans[1].skip_rx_gap(max_queued=12):
+                self._drain_xzyh(chan=1)
 
         self._drain_xzyh(chan=1)
 
@@ -172,15 +259,19 @@ class PPPPService(Service):
                 aabb.data = data
                 self.notify((msg.chan, aabb))
             else:
-                raise ValueError(f"Unexpected data in stream: {header!r}")
+                if msg.chan == 1:
+                    if self._resync_xzyh(ch, msg.chan):
+                        drain_xzyh = True
+                    else:
+                        return
+                else:
+                    raise ValueError(f"Unexpected data in stream: {header!r}")
 
         if drain_xzyh:
             self._drain_xzyh(chan=msg.chan)
 
     def worker_stop(self):
-        if hasattr(self, "_api"):
-            self._api.send(PktClose())
-            del self._api
+        self._force_close_api()
 
     @property
     def connected(self):
