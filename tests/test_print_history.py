@@ -1,3 +1,5 @@
+import os
+
 from web.service.history import PrintHistory
 
 
@@ -128,3 +130,31 @@ def test_history_preview_url_marks_entry_thumbnail_available(tmp_path):
 
     assert entry["thumbnail_available"] is True
     assert entry["preview_url"] == "https://example.test/preview.png"
+
+
+def test_delete_entries_removes_selected_rows_and_unreferenced_archives(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+
+    first_archive = history.archive_upload("one.gcode", b"G28\n")
+    first_id = history.record_start(
+        "one.gcode",
+        archive_relpath=first_archive["archive_relpath"],
+        archive_size=first_archive["archive_size"],
+    )
+    second_archive = history.archive_upload("two.gcode", b"G28\n")
+    second_id = history.record_start(
+        "two.gcode",
+        archive_relpath=second_archive["archive_relpath"],
+        archive_size=second_archive["archive_size"],
+    )
+
+    first_archive_path = os.path.join(tmp_path, "gcode_archive", first_archive["archive_relpath"])
+    second_archive_path = os.path.join(tmp_path, "gcode_archive", second_archive["archive_relpath"])
+
+    deleted = history.delete_entries([first_id])
+
+    assert deleted == 1
+    assert history.get_entry(first_id) is None
+    assert history.get_entry(second_id) is not None
+    assert first_archive_path is not None and not os.path.exists(first_archive_path)
+    assert second_archive_path is not None and os.path.exists(second_archive_path)

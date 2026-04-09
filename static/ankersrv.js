@@ -2821,6 +2821,7 @@ $(function () {
      */
     let historyOffset = 0;
     const HISTORY_LIMIT = 25;
+    const selectedHistoryIds = new Set();
 
     function formatDuration(sec) {
         if (!sec) return "-";
@@ -2839,23 +2840,55 @@ $(function () {
         return map[status] || `<span class="badge bg-secondary">${escapeHtml(status)}</span>`;
     }
 
+    function updateHistorySelectionUi() {
+        const deleteButton = $("#history-delete-selected");
+        const count = selectedHistoryIds.size;
+        deleteButton
+            .prop("disabled", count === 0)
+            .html(`<i class="bi bi-trash3"></i> Delete Selected${count > 0 ? ` (${count})` : ""}`);
+
+        const checkboxes = $(".history-select-checkbox").filter(function () {
+            return !$(this).prop("disabled");
+        });
+        const checked = checkboxes.filter(function () {
+            return $(this).prop("checked");
+        });
+        const selectAll = $("#history-select-all");
+        if (selectAll.length) {
+            const selectAllEl = selectAll.get(0);
+            selectAll.prop("checked", checkboxes.length > 0 && checked.length === checkboxes.length);
+            if (selectAllEl) {
+                selectAllEl.indeterminate = checked.length > 0 && checked.length < checkboxes.length;
+            }
+        }
+    }
+
     function loadHistory(append) {
         fetch(`/api/history?limit=${HISTORY_LIMIT}&offset=${historyOffset}`)
             .then(r => r.json())
             .then(data => {
                 const tbody = $("#history-tbody");
-                if (!append) tbody.empty();
+                if (!append) {
+                    tbody.empty();
+                    selectedHistoryIds.clear();
+                }
                 if (data.entries.length === 0 && !append) {
-                    tbody.html('<tr><td colspan="5" class="text-center text-muted py-4">No history yet</td></tr>');
+                    tbody.html('<tr><td colspan="6" class="text-center text-muted py-4">No history yet</td></tr>');
                 }
                 data.entries.forEach(e => {
                     const started = e.started_at ? new Date(e.started_at + "Z").toLocaleString() : "-";
                     const safeFilename = escapeHtml(e.filename);
                     const thumbnail = buildGCodeThumbnail(e.thumbnail_url, e.filename || "History thumbnail");
+                    const canDelete = e.status !== "started";
+                    const isChecked = selectedHistoryIds.has(e.id);
+                    const checkboxCell = canDelete
+                        ? `<input type="checkbox" class="form-check-input history-select-checkbox" data-history-id="${e.id}" ${isChecked ? "checked" : ""} aria-label="Select ${safeFilename}">`
+                        : '<input type="checkbox" class="form-check-input" disabled aria-label="Cannot delete in-progress history entry">';
                     const actionCell = e.can_reprint
                         ? `<button class="btn btn-sm btn-outline-primary history-reprint-btn" data-history-id="${e.id}" data-history-name="${safeFilename}">Reprint</button>`
                         : '<span class="text-muted small">-</span>';
                     const row = `<tr>
+                        <td class="text-center align-middle">${checkboxCell}</td>
                         <td class="history-file-cell" title="${safeFilename}">
                             <div class="d-flex align-items-center gap-2">
                                 ${thumbnail}
@@ -2875,6 +2908,7 @@ $(function () {
                 } else {
                     $("#history-load-more").hide();
                 }
+                updateHistorySelectionUi();
             })
             .catch(err => console.error("History load failed:", err));
     }
@@ -2895,12 +2929,78 @@ $(function () {
         loadHistory(true);
     });
 
+    $(document).on("change", ".history-select-checkbox", function () {
+        const id = parseInt($(this).attr("data-history-id"), 10);
+        if (!Number.isFinite(id)) {
+            return;
+        }
+        if ($(this).prop("checked")) {
+            selectedHistoryIds.add(id);
+        } else {
+            selectedHistoryIds.delete(id);
+        }
+        updateHistorySelectionUi();
+    });
+
+    $("#history-select-all").on("change", function () {
+        const checked = $(this).prop("checked");
+        $(".history-select-checkbox").each(function () {
+            const checkbox = $(this);
+            const id = parseInt(checkbox.attr("data-history-id"), 10);
+            if (!Number.isFinite(id)) {
+                return;
+            }
+            checkbox.prop("checked", checked);
+            if (checked) {
+                selectedHistoryIds.add(id);
+            } else {
+                selectedHistoryIds.delete(id);
+            }
+        });
+        updateHistorySelectionUi();
+    });
+
+    $("#history-delete-selected").on("click", async function () {
+        const ids = Array.from(selectedHistoryIds);
+        if (!ids.length) {
+            flash_message("Select one or more history entries first.", "warning");
+            return;
+        }
+        if (!confirm(`Delete ${ids.length} selected history entr${ids.length === 1 ? "y" : "ies"}?`)) {
+            return;
+        }
+        const btn = $(this);
+        btn.prop("disabled", true);
+        try {
+            const resp = await fetch("/api/history/delete", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ids }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            selectedHistoryIds.clear();
+            historyOffset = 0;
+            loadHistory(false);
+            flash_message(`Deleted ${data.deleted || 0} history entr${(data.deleted || 0) === 1 ? "y" : "ies"}.`, "success");
+        } catch (err) {
+            flash_message(`Delete failed: ${err.message || err}`, "danger");
+        } finally {
+            btn.prop("disabled", false);
+            updateHistorySelectionUi();
+        }
+    });
+
     $("#history-clear").on("click", function () {
         if (!confirm("Clear all print history?")) return;
         fetch("/api/history", { method: "DELETE" })
             .then(() => {
+                selectedHistoryIds.clear();
                 historyOffset = 0;
                 loadHistory(false);
+                updateHistorySelectionUi();
             });
     });
 

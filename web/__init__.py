@@ -2612,6 +2612,41 @@ def app_api_history_clear():
     return {"status": "ok"}
 
 
+@app.post("/api/history/delete")
+def app_api_history_delete_selected():
+    payload = request.get_json(silent=True) or {}
+    raw_ids = payload.get("ids")
+    if not isinstance(raw_ids, list):
+        return {"error": "ids must be a list of history entry ids"}, 400
+
+    entry_ids = []
+    for raw_id in raw_ids:
+        try:
+            entry_id = int(raw_id)
+        except (TypeError, ValueError):
+            return {"error": "ids must contain integers"}, 400
+        if entry_id > 0 and entry_id not in entry_ids:
+            entry_ids.append(entry_id)
+
+    if not entry_ids:
+        return {"error": "No history entries were selected"}, 400
+
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        entries = [mqtt.history.get_entry(entry_id) for entry_id in entry_ids]
+        active = [entry for entry in entries if entry and entry.get("status") == "started"]
+        if active:
+            return {"error": "Cannot delete an in-progress history entry"}, 409
+        deleted = mqtt.history.delete_entries(entry_ids)
+
+    return {
+        "status": "ok",
+        "deleted": deleted,
+        "requested": len(entry_ids),
+    }
+
+
 @app.get("/api/history/<int:entry_id>/thumbnail")
 def app_api_history_thumbnail(entry_id):
     from flask import send_file

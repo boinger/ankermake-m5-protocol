@@ -440,6 +440,51 @@ def test_history_routes_require_auth_and_clear_entries():
     assert calls == [("get", 500, 0), ("clear",)]
 
 
+def test_history_delete_selected_route_deletes_finished_entries(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+    first_id = history.record_start("one.gcode")
+    second_id = history.record_start("two.gcode")
+    history.record_finish(filename="two.gcode")
+    history.record_finish(filename="one.gcode")
+    mqtt = SimpleNamespace(history=history)
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+
+    try:
+        response = client.post(
+            "/api/history/delete",
+            json={"ids": [first_id]},
+            headers={"X-Api-Key": API_KEY},
+        )
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 200
+    assert response.get_json()["deleted"] == 1
+    assert history.get_entry(first_id) is None
+    assert history.get_entry(second_id) is not None
+
+
+def test_history_delete_selected_route_rejects_active_entries(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+    entry_id = history.record_start("active.gcode")
+    mqtt = SimpleNamespace(history=history)
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+
+    try:
+        response = client.post(
+            "/api/history/delete",
+            json={"ids": [entry_id]},
+            headers={"X-Api-Key": API_KEY},
+        )
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 409
+    assert "in-progress" in response.get_json()["error"]
+
+
 def test_history_thumbnail_route_serves_local_archive_thumbnail(tmp_path):
     history = PrintHistory(db_path=tmp_path / "history.db")
     archive_info = history.archive_upload(

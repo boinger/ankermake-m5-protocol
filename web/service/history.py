@@ -430,6 +430,33 @@ class PrintHistory:
             with self._connect() as conn:
                 return conn.execute("SELECT COUNT(*) FROM print_history").fetchone()[0]
 
+    def delete_entries(self, entry_ids):
+        ids = []
+        for entry_id in entry_ids or []:
+            try:
+                normalized = int(entry_id)
+            except (TypeError, ValueError):
+                continue
+            if normalized > 0 and normalized not in ids:
+                ids.append(normalized)
+
+        if not ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in ids)
+        with self._lock:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    f"DELETE FROM print_history WHERE id IN ({placeholders})",
+                    tuple(ids),
+                )
+                deleted = cursor.rowcount or 0
+                self._delete_unreferenced_archives(conn)
+                conn.commit()
+                if deleted:
+                    log.info("History: deleted %d selected entr%s", deleted, "y" if deleted == 1 else "ies")
+                return deleted
+
     def clear(self):
         """Delete all history entries."""
         with self._lock:
