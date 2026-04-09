@@ -1707,6 +1707,10 @@ $(function () {
         $("#print-pause").prop("disabled", stopping);
         $("#print-resume").prop("disabled", stopping);
         $("#print-stop").prop("disabled", stopping);
+        updateGCodeStorageControls();
+        if (!isGCodeStorageLocked()) {
+            maybeRefreshGCodeStorageAfterUnlock();
+        }
     }
 
     const getStepDist = () => $('input[name="step-dist"]:checked').val() || "1";
@@ -2398,6 +2402,22 @@ $(function () {
     }
 
     let _selectedGCodeStorageFile = null;
+    let _gcodeStorageLoading = false;
+    let _gcodeStorageRefreshDeferred = false;
+
+    function isGCodeStorageLocked() {
+        const normalizedState = _normalizePrintStateValue(_currentPrintState);
+        return normalizedState === PRINT_STATE.PRINTING
+            || normalizedState === PRINT_STATE.PAUSED
+            || normalizedState === PRINT_STATE.CALIBRATING
+            || normalizedState === PRINT_STATE.STOPPING
+            || normalizedState === PRINT_STATE.PENDING_START;
+    }
+
+    function isGCodeTabVisible() {
+        const pane = document.getElementById("gcode");
+        return !!(pane && pane.classList.contains("show"));
+    }
 
     function buildGCodeThumbnail(url, altText) {
         const safeAlt = escapeHtml(altText || "GCode thumbnail");
@@ -2422,13 +2442,37 @@ $(function () {
     }
 
     function setGCodeStoragePrintEnabled(enabled) {
-        $("#gcode-storage-print").prop("disabled", !enabled);
+        $("#gcode-storage-print").prop("disabled", !enabled || _gcodeStorageLoading || isGCodeStorageLocked());
     }
 
     function setGCodeStorageBusy(busy) {
-        $("#gcode-storage-refresh").prop("disabled", busy);
-        $("#gcode-storage-source").prop("disabled", busy);
-        $("#gcode-storage-print").prop("disabled", busy || !_selectedGCodeStorageFile);
+        _gcodeStorageLoading = busy;
+        updateGCodeStorageControls();
+    }
+
+    function updateGCodeStorageControls() {
+        const busy = _gcodeStorageLoading;
+        const locked = isGCodeStorageLocked();
+        $("#gcode-storage-refresh").prop("disabled", busy || locked);
+        $("#gcode-storage-source").prop("disabled", busy || locked);
+        $("#gcode-storage-print").prop("disabled", busy || locked || !_selectedGCodeStorageFile);
+        $("#gcode-storage-lock-note").toggleClass("d-none", !locked);
+    }
+
+    function deferGCodeStorageRefresh(message) {
+        _gcodeStorageRefreshDeferred = true;
+        updateGCodeStorageControls();
+        if (message) {
+            $("#gcode-storage-status").text(message);
+        }
+    }
+
+    function maybeRefreshGCodeStorageAfterUnlock() {
+        if (!_gcodeStorageRefreshDeferred || _gcodeStorageLoading || isGCodeStorageLocked() || !isGCodeTabVisible()) {
+            return;
+        }
+        _gcodeStorageRefreshDeferred = false;
+        loadGCodeStorageFiles();
     }
 
     function renderGCodeStorageSelection(file) {
@@ -2518,8 +2562,15 @@ $(function () {
     async function loadGCodeStorageFiles() {
         const source = $("#gcode-storage-source").val() || "onboard";
         const status = $("#gcode-storage-status");
+        const lockedMessage = `File list is paused while the printer is busy. It will refresh after the print stops.`;
+
+        if (isGCodeStorageLocked()) {
+            deferGCodeStorageRefresh(lockedMessage);
+            return;
+        }
 
         setGCodeStorageBusy(true);
+        _gcodeStorageRefreshDeferred = false;
         status.text(`Loading ${gcodeStorageSourceLabel(source)} files...`);
         try {
             const resp = await fetch(`/api/files/printer?source=${encodeURIComponent(source)}`);
@@ -2527,8 +2578,16 @@ $(function () {
             if (!resp.ok) {
                 throw new Error(data.error || `HTTP ${resp.status}`);
             }
+            if (isGCodeStorageLocked()) {
+                deferGCodeStorageRefresh(lockedMessage);
+                return;
+            }
             renderGCodeStorageFiles(source, data.files || []);
         } catch (err) {
+            if (isGCodeStorageLocked()) {
+                deferGCodeStorageRefresh(lockedMessage);
+                return;
+            }
             $("#gcode-storage-list").html(
                 `<div class="list-group-item text-danger small">Failed to load ${escapeHtml(gcodeStorageSourceLabel(source))}: ${escapeHtml(err.message)}</div>`
             );
@@ -2679,6 +2738,12 @@ $(function () {
             flash_message("Select a stored file before printing.", "warning");
             return;
         }
+        if (isGCodeStorageLocked()) {
+            gcodeLog("Stored file actions are paused while the printer is busy");
+            flash_message("The printer is busy right now. Wait for it to return to idle before browsing or starting another stored file.", "warning");
+            deferGCodeStorageRefresh("File list is paused while the printer is busy. It will refresh after the print stops.");
+            return;
+        }
 
         const source = _selectedGCodeStorageFile.source || $("#gcode-storage-source").val() || "onboard";
         const fileName = _selectedGCodeStorageFile.name || "stored file";
@@ -2729,6 +2794,8 @@ $(function () {
             loadGCodeStorageFiles();
         });
     }
+
+    updateGCodeStorageControls();
 
     $("#print-pause").on("click", function () {
         sendPrintControl(PRINT_CONTROL.PAUSE);

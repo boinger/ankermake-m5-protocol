@@ -81,6 +81,9 @@
                             Browse GCode files already stored on printer storage or an attached thumb drive.
                             The first file is selected automatically after a refresh, and you can click any other file before starting it.
                         </div>
+                        <div class="small text-warning mb-2 d-none" id="gcode-storage-lock-note">
+                            File browsing is paused while the printer is busy. The list will refresh after the print stops.
+                        </div>
                         <div class="small text-muted mb-2" id="gcode-storage-status">Choose a source and refresh to browse files.</div>
                         <div id="gcode-storage-selected" class="alert alert-secondary py-2 small mb-3" style="display:none;"></div>
                         <div class="d-grid mb-3">
