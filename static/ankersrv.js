@@ -165,6 +165,10 @@ $(function () {
     let _homeConsoleLastId = 0;
     let _homeConsoleLoading = false;
     let _homeConsoleInterval = null;
+    let _homeConsoleFilter = "all";
+    let _homeConsoleAutoScrollPaused = false;
+    let _homeConsoleClearedBeforeId = 0;
+    let _homeConsoleWasCleared = false;
 
     function setHomeConsoleStatus(message) {
         const status = $("#home-console-status");
@@ -173,7 +177,95 @@ $(function () {
         }
     }
 
-    function renderHomeConsoleEntries(entries, replace = false) {
+    function getHomeConsoleVisibleEntries() {
+        return _homeConsoleEntries.filter(entry => {
+            if (!entry || typeof entry.id !== "number" || entry.id <= _homeConsoleClearedBeforeId) {
+                return false;
+            }
+            return homeConsoleMatchesFilter(entry, _homeConsoleFilter);
+        });
+    }
+
+    function homeConsoleMatchesFilter(entry, filter) {
+        if (!entry) {
+            return false;
+        }
+
+        const text = String(entry.text || "").toLowerCase();
+        if (filter === "all") {
+            return true;
+        }
+        if (filter === "mqtt") {
+            return text.includes("mqtt") || text.includes("mqttqueue");
+        }
+        if (filter === "pppp") {
+            return text.includes("pppp");
+        }
+        if (filter === "video") {
+            return text.includes("video")
+                || text.includes("/ws/video")
+                || text.includes("snapshot")
+                || text.includes("jmuxer");
+        }
+        if (filter === "upload") {
+            return text.includes("upload")
+                || text.includes("filetransfer")
+                || text.includes("transfer")
+                || text.includes("gcode file");
+        }
+        if (filter === "error") {
+            return /^\[(e|w|!)\]/i.test(text)
+                || text.includes("error")
+                || text.includes("exception")
+                || text.includes("traceback");
+        }
+        return true;
+    }
+
+    function updateHomeConsoleStatus() {
+        const visibleEntries = getHomeConsoleVisibleEntries();
+        const totalEntries = _homeConsoleEntries.filter(entry => entry && entry.id > _homeConsoleClearedBeforeId).length;
+        const filterLabel = _homeConsoleFilter.toUpperCase();
+        const scrollLabel = _homeConsoleAutoScrollPaused ? "auto-scroll paused" : "auto-scroll live";
+        setHomeConsoleStatus(`Showing ${visibleEntries.length} of ${totalEntries} line(s) - ${filterLabel} - ${scrollLabel}`);
+    }
+
+    function updateHomeConsoleFilterButtons() {
+        $("[data-home-console-filter]").each(function () {
+            const button = $(this);
+            const isActive = button.data("home-console-filter") === _homeConsoleFilter;
+            button.toggleClass("active", isActive);
+            button.attr("aria-pressed", isActive ? "true" : "false");
+        });
+    }
+
+    function updateHomeConsoleAutoScrollButton() {
+        const button = $("#home-console-autoscroll-toggle");
+        if (!button.length) {
+            return;
+        }
+        const label = _homeConsoleAutoScrollPaused ? "Resume Auto-Scroll" : "Pause Auto-Scroll";
+        const icon = _homeConsoleAutoScrollPaused ? "play-circle" : "pause-circle";
+        button
+            .toggleClass("btn-outline-warning", _homeConsoleAutoScrollPaused)
+            .toggleClass("btn-outline-secondary", !_homeConsoleAutoScrollPaused)
+            .attr("aria-pressed", _homeConsoleAutoScrollPaused ? "true" : "false")
+            .html(`<i class="bi bi-${icon}"></i> ${label}`);
+    }
+
+    function mergeHomeConsoleEntries(entries, replace = false) {
+        if (replace) {
+            _homeConsoleEntries = Array.isArray(entries) ? entries.slice(-HOME_CONSOLE_MAX_LINES) : [];
+        } else if (Array.isArray(entries) && entries.length) {
+            _homeConsoleEntries = _homeConsoleEntries.concat(entries).slice(-HOME_CONSOLE_MAX_LINES);
+        }
+
+        if (_homeConsoleClearedBeforeId > 0) {
+            _homeConsoleEntries = _homeConsoleEntries.filter(entry => entry && entry.id > _homeConsoleClearedBeforeId);
+        }
+    }
+
+    function renderHomeConsoleEntries() {
         const pre = document.getElementById("home-console-pre");
         const content = document.getElementById("home-console-content");
         if (!content) {
@@ -183,23 +275,26 @@ $(function () {
         const wasNearBottom = !pre
             || (pre.scrollHeight - pre.scrollTop - pre.clientHeight) < 40;
 
-        if (replace) {
-            _homeConsoleEntries = Array.isArray(entries) ? entries.slice(-HOME_CONSOLE_MAX_LINES) : [];
-        } else if (Array.isArray(entries) && entries.length) {
-            _homeConsoleEntries = _homeConsoleEntries.concat(entries).slice(-HOME_CONSOLE_MAX_LINES);
-        }
+        const visibleEntries = getHomeConsoleVisibleEntries();
+        const totalEntries = _homeConsoleEntries.filter(entry => entry && entry.id > _homeConsoleClearedBeforeId).length;
 
-        if (!_homeConsoleEntries.length) {
-            content.innerHTML = "No console output captured yet.";
+        if (!visibleEntries.length) {
+            if (_homeConsoleWasCleared && totalEntries === 0) {
+                content.innerHTML = "Console cleared. New output will appear here.";
+            } else if (totalEntries > 0) {
+                content.innerHTML = "No console lines match the current filter.";
+            } else {
+                content.innerHTML = "No console output captured yet.";
+            }
         } else {
-            content.innerHTML = _homeConsoleEntries
+            content.innerHTML = visibleEntries
                 .map(entry => escapeHtml(entry && entry.text ? entry.text : ""))
                 .join("\n");
         }
 
-        setHomeConsoleStatus(`Showing ${_homeConsoleEntries.length} line(s) - live updates every 2s`);
+        updateHomeConsoleStatus();
 
-        if (pre && wasNearBottom) {
+        if (pre && !_homeConsoleAutoScrollPaused && wasNearBottom) {
             pre.scrollTop = pre.scrollHeight;
         }
     }
@@ -224,8 +319,9 @@ $(function () {
         _homeConsoleLoading = true;
         try {
             const data = await fetchHomeConsoleLogs(null, HOME_CONSOLE_INITIAL_LIMIT);
-            renderHomeConsoleEntries(data.entries || [], true);
+            mergeHomeConsoleEntries(data.entries || [], true);
             _homeConsoleLastId = data.last_id || 0;
+            renderHomeConsoleEntries();
         } catch (err) {
             setHomeConsoleStatus(`Console viewer error: ${err.message}`);
         } finally {
@@ -241,9 +337,12 @@ $(function () {
         try {
             const data = await fetchHomeConsoleLogs(_homeConsoleLastId, HOME_CONSOLE_INITIAL_LIMIT);
             if (data.truncated) {
-                renderHomeConsoleEntries(data.entries || [], true);
+                mergeHomeConsoleEntries(data.entries || [], true);
+                renderHomeConsoleEntries();
             } else if (Array.isArray(data.entries) && data.entries.length) {
-                renderHomeConsoleEntries(data.entries, false);
+                mergeHomeConsoleEntries(data.entries, false);
+                _homeConsoleWasCleared = false;
+                renderHomeConsoleEntries();
             }
             _homeConsoleLastId = data.last_id || _homeConsoleLastId;
         } catch (err) {
@@ -257,6 +356,8 @@ $(function () {
         if (!document.getElementById("home-console-content")) {
             return;
         }
+        updateHomeConsoleFilterButtons();
+        updateHomeConsoleAutoScrollButton();
         loadHomeConsoleHistory();
         if (_homeConsoleInterval) {
             return;
@@ -270,6 +371,25 @@ $(function () {
             _homeConsoleInterval = null;
         }
     }
+
+    $(document).on("click", "#home-console-clear", function () {
+        _homeConsoleClearedBeforeId = _homeConsoleLastId;
+        _homeConsoleWasCleared = true;
+        _homeConsoleEntries = _homeConsoleEntries.filter(entry => entry && entry.id > _homeConsoleClearedBeforeId);
+        renderHomeConsoleEntries();
+    });
+
+    $(document).on("click", "#home-console-autoscroll-toggle", function () {
+        _homeConsoleAutoScrollPaused = !_homeConsoleAutoScrollPaused;
+        updateHomeConsoleAutoScrollButton();
+        renderHomeConsoleEntries();
+    });
+
+    $(document).on("click", "[data-home-console-filter]", function () {
+        _homeConsoleFilter = String($(this).data("home-console-filter") || "all");
+        updateHomeConsoleFilterButtons();
+        renderHomeConsoleEntries();
+    });
 
     /**
      * Calculates the AnkerMake M5 Speed ratio ("X-factor")

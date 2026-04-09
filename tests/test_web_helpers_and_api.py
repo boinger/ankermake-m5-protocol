@@ -1,3 +1,4 @@
+import logging
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -5,7 +6,7 @@ from types import SimpleNamespace
 
 from cli.model import Account, Config, Printer
 from libflagship import resolve_root_dir
-from web import _ConsoleLogBuffer
+from web import _AccessLogNoiseFilter, _ConsoleLogBuffer
 from web import (
     _build_command_group,
     _build_filament_move_gcode,
@@ -219,6 +220,30 @@ def test_console_log_buffer_supports_recent_tail_and_incremental_updates():
     assert [entry["text"] for entry in incremental["entries"]] == ["line 4", "line 5"]
     assert incremental["truncated"] is False
     assert truncated["truncated"] is True
+
+
+def test_access_log_noise_filter_suppresses_console_polling_and_static_assets():
+    filt = _AccessLogNoiseFilter()
+
+    console_record = logging.LogRecord(
+        name="werkzeug", level=logging.INFO, pathname=__file__, lineno=0,
+        msg='127.0.0.1 - - [08/Apr/2026 17:57:47] "GET /api/console/logs?limit=200&after=108 HTTP/1.1" 200 -',
+        args=(), exc_info=None,
+    )
+    static_record = logging.LogRecord(
+        name="werkzeug", level=logging.INFO, pathname=__file__, lineno=0,
+        msg='127.0.0.1 - - [08/Apr/2026 17:57:47] "GET /static/ankersrv.js HTTP/1.1" 304 -',
+        args=(), exc_info=None,
+    )
+    api_record = logging.LogRecord(
+        name="werkzeug", level=logging.INFO, pathname=__file__, lineno=0,
+        msg='127.0.0.1 - - [08/Apr/2026 17:57:47] "GET /api/health HTTP/1.1" 200 -',
+        args=(), exc_info=None,
+    )
+
+    assert filt.filter(console_record) is False
+    assert filt.filter(static_record) is False
+    assert filt.filter(api_record) is True
 
 
 def test_api_console_logs_returns_recent_entries(monkeypatch):

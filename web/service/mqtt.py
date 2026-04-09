@@ -56,6 +56,8 @@ MQTT_PRINT_STATE_LABELS = {
 G28_DEDUPE_WINDOW_SEC = 10.0
 STORED_FILE_SELECTION_TIMEOUT_SEC = 2.0
 STORED_FILE_START_CONFIRM_TIMEOUT_SEC = 12.0
+STORED_FILE_ONBOARD_START_CONFIRM_TIMEOUT_SEC = 20.0
+STORED_FILE_LIST_PAGE_SIZE = 47
 STORED_FILE_SOURCE_ROOTS = (
     "/tmp/udisk/",
     "/usr/data/local/model/",
@@ -157,6 +159,8 @@ class MqttQueue(Service):
         self._pending_stored_file_path = None
         self._last_selected_storage_file_path = None
         self._last_selected_storage_file_name = None
+        self._last_print_schedule_filename = None
+        self._last_print_schedule_seen_at = 0.0
         # Preserve debug setting across resets if possible, but init here if missing
         if not hasattr(self, "_debug_log_payloads"):
              self._debug_log_payloads = False
@@ -331,16 +335,8 @@ class MqttQueue(Service):
         if not file_path:
             return False
 
-        target_name = os.path.basename(file_path)
-
         def selection_ready():
-            return (
-                self._last_selected_storage_file_path == file_path
-                or (
-                    self._pending_stored_file_path == file_path
-                    and self._last_selected_storage_file_name == target_name
-                )
-            )
+            return self._last_selected_storage_file_path == file_path
 
         with self._stored_file_selection_cond:
             if selection_ready():
@@ -382,6 +378,20 @@ class MqttQueue(Service):
             payload["userId"] = self._control_user_id
         return payload
 
+    def _build_stored_file_list_request_payload(self, file_path):
+        source = cli.mqtt.infer_storage_source_from_path(file_path)
+        value = cli.mqtt.mqtt_file_list_source_value(source=source or "onboard")
+        payload = {
+            "commandType": MqttMsgType.ZZ_MQTT_CMD_FILE_LIST_REQUEST.value,
+            "value": value,
+            "isFirst": 1,
+            "index": 1,
+            "num": STORED_FILE_LIST_PAGE_SIZE,
+        }
+        if self._control_user_id:
+            payload["userId"] = self._control_user_id
+        return payload
+
     def _send_stored_file_start_print_control(self, file_path):
         payload = {
             "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
@@ -396,14 +406,23 @@ class MqttQueue(Service):
             payload["userId"] = self._control_user_id
         self.client.command(payload)
 
+    @staticmethod
+    def _stored_file_start_timeout_sec(file_path):
+        file_path = str(file_path or "")
+        if file_path.startswith("/usr/data/local/model/"):
+            return STORED_FILE_ONBOARD_START_CONFIRM_TIMEOUT_SEC
+        return STORED_FILE_START_CONFIRM_TIMEOUT_SEC
+
     def _stored_file_start_confirmed(self, file_path=None):
         target_name = os.path.basename(str(file_path or "")) or None
         with self._state_lock:
             preview_path = getattr(self, "_preview_file_path", None)
             preview_name = os.path.basename(preview_path) if preview_path else None
+            schedule_name = getattr(self, "_last_print_schedule_filename", None)
             return (
                 self._state in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED)
                 or self.is_preparing_print
+                or (target_name is not None and schedule_name == target_name)
                 or (
                     preview_path
                     and self._is_preprint_preview_path(preview_path)
@@ -912,6 +931,9 @@ class MqttQueue(Service):
 
         filename = self._extract_filename(payload)
         if filename:
+            if command_type == MqttMsgType.ZZ_MQTT_CMD_PRINT_SCHEDULE:
+                self._last_print_schedule_filename = filename
+                self._last_print_schedule_seen_at = time.monotonic()
             if self._last_filename and filename != self._last_filename and self._state == PrintState.PRINTING:
                 if progress <= 1:
                     self._reset_print_state()
@@ -921,6 +943,18 @@ class MqttQueue(Service):
             else:
                 self._last_filename = filename
             self._complete_deferred_print_start()
+
+        pending_name = os.path.basename(self._pending_stored_file_path) if self._pending_stored_file_path else None
+        if (
+            command_type == MqttMsgType.ZZ_MQTT_CMD_PRINT_SCHEDULE
+            and self._state == PrintState.PREPARING
+            and pending_name
+            and filename == pending_name
+            and progress == 0
+        ):
+            self._state = PrintState.PRE_PRINT
+            self._stop_requested = False
+            log.info("Stored file start entered pre-print state via print schedule for %r", filename)
 
         if self._last_progress is not None and progress < self._last_progress and progress <= 1:
             same_task = task_id and prev_task_id and task_id == prev_task_id
@@ -1206,6 +1240,9 @@ class MqttQueue(Service):
             self._pending_stored_file_path = file_path
             self._last_selected_storage_file_path = None
             self._last_selected_storage_file_name = None
+        log.debug("Refreshing stored file list context for: %s", file_path)
+        self.client.command(self._build_stored_file_list_request_payload(file_path))
+        time.sleep(0.12)
         log.debug("Selecting stored GCode file: %s", file_path)
         self.client.command(self._build_stored_file_request_payload(file_path))
 
@@ -1218,14 +1255,15 @@ class MqttQueue(Service):
         self.mark_pending_print_start(filename)
         log.debug("Starting selected stored GCode file: %s", filename)
         self._send_stored_file_start_print_control(file_path)
-        start_confirmed = self._await_stored_file_start_confirmation(file_path)
+        timeout_sec = self._stored_file_start_timeout_sec(file_path)
+        start_confirmed = self._await_stored_file_start_confirmation(file_path, timeout_sec=timeout_sec)
         if start_confirmed:
             log.info("Stored file start confirmed for %s", file_path)
         else:
             log.warning(
                 "Printer did not confirm stored file start for %s within %.1fs",
                 file_path,
-                STORED_FILE_START_CONFIRM_TIMEOUT_SEC,
+                timeout_sec,
             )
             with self._state_lock:
                 if self._state == PrintState.PREPARING and not self.is_preparing_print:

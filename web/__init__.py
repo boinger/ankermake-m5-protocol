@@ -41,16 +41,22 @@ from contextlib import contextmanager
 log = logging.getLogger("web")
 
 
-class _StaticAssetAccessLogFilter(logging.Filter):
+class _AccessLogNoiseFilter(logging.Filter):
+    _IGNORED_SUBSTRINGS = (
+        '"GET /static/',
+        '"GET /favicon.ico',
+        '"GET /api/console/logs',
+    )
+
     def filter(self, record):
         message = record.getMessage()
-        return '"GET /static/' not in message and '"GET /favicon.ico' not in message
+        return not any(fragment in message for fragment in self._IGNORED_SUBSTRINGS)
 
 
 def _configure_access_log_noise():
     werkzeug_log = logging.getLogger("werkzeug")
-    if not any(isinstance(f, _StaticAssetAccessLogFilter) for f in werkzeug_log.filters):
-        werkzeug_log.addFilter(_StaticAssetAccessLogFilter())
+    if not any(isinstance(f, _AccessLogNoiseFilter) for f in werkzeug_log.filters):
+        werkzeug_log.addFilter(_AccessLogNoiseFilter())
 
 
 class _ConsoleLogBuffer:

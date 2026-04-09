@@ -282,11 +282,25 @@ def test_start_stored_file_selects_filepath_then_starts_print(monkeypatch):
     sent = []
     queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
     monkeypatch.setattr(queue, "_await_stored_file_selection", lambda file_path, timeout_sec=2.0: True)
-    monkeypatch.setattr(queue, "_await_stored_file_start_confirmation", lambda file_path, timeout_sec=12.0: True)
+    timeouts = []
+
+    def confirm(file_path, timeout_sec=12.0):
+        timeouts.append(timeout_sec)
+        return True
+
+    monkeypatch.setattr(queue, "_await_stored_file_start_confirmation", confirm)
 
     started = queue.start_stored_file("/tmp/udisk/udisk1/Top parts 5h_PETG_M5 grey.gcode")
 
     assert sent == [
+        {
+            "commandType": 1009,
+            "value": 0,
+            "isFirst": 1,
+            "index": 1,
+            "num": 47,
+            "userId": "user-123",
+        },
         {
             "commandType": 1010,
             "filePath": "/tmp/udisk/udisk1/Top parts 5h_PETG_M5 grey.gcode",
@@ -303,8 +317,54 @@ def test_start_stored_file_selects_filepath_then_starts_print(monkeypatch):
         },
     ]
     assert started is True
+    assert timeouts == [12.0]
     assert queue.get_state()["print"]["pending_start"] is True
     assert queue.get_state()["print"]["last_filename"] == "Top parts 5h_PETG_M5 grey.gcode"
+
+
+def test_start_stored_file_uses_longer_confirmation_timeout_for_onboard_storage(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    sent = []
+    queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
+    monkeypatch.setattr(queue, "_await_stored_file_selection", lambda file_path, timeout_sec=2.0: True)
+    timeouts = []
+
+    def confirm(file_path, timeout_sec=12.0):
+        timeouts.append(timeout_sec)
+        return True
+
+    monkeypatch.setattr(queue, "_await_stored_file_start_confirmation", confirm)
+
+    started = queue.start_stored_file(
+        "/usr/data/local/model/AnkerMake Model/Autodesk_Kickstarter_Geometry.gcode"
+    )
+
+    assert started is True
+    assert timeouts == [20.0]
+    assert sent[0] == {
+        "commandType": 1009,
+        "value": 1,
+        "isFirst": 1,
+        "index": 1,
+        "num": 47,
+        "userId": "user-123",
+    }
+
+
+def test_stored_file_selection_waits_for_exact_filepath_preview():
+    queue = _queue()
+    queue._ensure_stored_file_selection_state()
+    target_path = "/usr/data/local/model/AnkerMake Model/Autodesk_Kickstarter_Geometry.gcode"
+    queue._pending_stored_file_path = target_path
+    queue._note_stored_file_selection(file_name="Autodesk_Kickstarter_Geometry.gcode")
+
+    assert queue._await_stored_file_selection(target_path, timeout_sec=0.0) is False
+
+    queue._note_stored_file_selection(file_path=target_path, file_name="Autodesk_Kickstarter_Geometry.gcode")
+
+    assert queue._await_stored_file_selection(target_path, timeout_sec=0.0) is True
 
 
 def test_derive_control_display_name_uses_email_local_part():
@@ -376,6 +436,26 @@ def test_tmpmodel_preview_activates_pre_print_window_after_prepare_value_8():
     assert state["pending_start"] is False
     assert state["in_pre_print_window"] is True
     assert state["active"] is True
+
+
+def test_print_schedule_can_confirm_onboard_stored_file_pre_print_window():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue.mark_pending_print_start("Autodesk_Kickstarter_Geometry.gcode")
+    queue._pending_stored_file_path = "/usr/data/local/model/Autodesk_Kickstarter_Geometry.gcode"
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 0,
+        "name": "Autodesk_Kickstarter_Geometry.gcode",
+        "time": 120,
+    })
+
+    state = queue.get_state()["print"]
+    assert state["pending_start"] is False
+    assert state["in_pre_print_window"] is True
+    assert state["last_filename"] == "Autodesk_Kickstarter_Geometry.gcode"
 
 
 def test_value_8_marks_prepare_state_before_print_start():
