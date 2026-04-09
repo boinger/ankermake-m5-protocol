@@ -2230,7 +2230,6 @@ $(function () {
         $("#gcode-text-send").prop("disabled", busy);
         $("#gcode-file").prop("disabled", busy);
         $("#gcode-input").prop("disabled", busy);
-        $("#gcode-upload-target").prop("disabled", busy);
     }
 
     async function sendGCodeWithLog(gcode) {
@@ -2260,12 +2259,6 @@ $(function () {
     async function uploadGCodeFileWithLog(file, startPrint = true) {
         if (!file) {
             gcodeLog("✗ No file selected");
-            return false;
-        }
-
-        const uploadTarget = $("#gcode-upload-target").val() || "onboard";
-        if (uploadTarget !== "onboard") {
-            gcodeLog("âœ— Thumb-drive upload is not supported yet");
             return false;
         }
 
