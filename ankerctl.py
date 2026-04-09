@@ -199,6 +199,72 @@ def mqtt_send(env, command_type, args, force):
     cli.mqtt.mqtt_command(client, cmd)
 
 
+@mqtt.command("file-list-probe")
+@click.option(
+    "--source",
+    type=click.Choice(["onboard", "usb"]),
+    default="onboard",
+    show_default=True,
+    help="Storage source to probe when --value is not provided.",
+)
+@click.option(
+    "--value",
+    "source_value",
+    type=int,
+    default=None,
+    help="Raw value for ZZ_MQTT_CMD_FILE_LIST_REQUEST. value=1 probes printer storage; any non-1 value probes alternate storage such as USB/thumb drive.",
+)
+@click.option(
+    "--timeout",
+    "-t",
+    type=float,
+    default=10.0,
+    show_default=True,
+    help="Seconds to wait for the first response.",
+)
+@click.option(
+    "--window",
+    "-w",
+    type=float,
+    default=3.0,
+    show_default=True,
+    help="Seconds to keep collecting after the first response.",
+)
+@pass_env
+def mqtt_file_list_probe(env, source, source_value, timeout, window):
+    """
+    Probe the printer's storage file-list command (0x03f1).
+
+    This is a discovery tool for learning which reply payload the printer uses
+    for on-board storage (value=1) versus alternate storage such as USB/thumb
+    drives (value!=1).
+    """
+
+    source_value = cli.mqtt.mqtt_file_list_source_value(source=source, value=source_value)
+
+    storage_label = "printer/onboard" if source_value == 1 else "usb/thumb drive candidate"
+
+    click.echo(
+        f"Probing file list with value={source_value} ({storage_label}); "
+        f"collecting replies for up to {timeout:.1f}s + {window:.1f}s window."
+    )
+
+    client = cli.mqtt.mqtt_open(env.config, env.printer_index, env.insecure)
+    result = cli.mqtt.mqtt_file_list_probe(
+        client,
+        source=source,
+        source_value=source_value,
+        timeout=timeout,
+        collect_window=window,
+    )
+
+    if not result["replies"]:
+        log.error("No response from printer")
+        raise SystemExit(1)
+
+    click.echo(cli.util.pretty_json(result))
+
+
 @mqtt.command("rename-printer")
 @click.argument("newname", type=str, required=True, metavar="<newname>")
 @pass_env

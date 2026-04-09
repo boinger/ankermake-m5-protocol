@@ -157,6 +157,240 @@ $(function () {
         return div.innerHTML;
     }
 
+    const HOME_CONSOLE_INITIAL_LIMIT = 200;
+    const HOME_CONSOLE_MAX_LINES = 400;
+    const HOME_CONSOLE_POLL_MS = 2000;
+
+    let _homeConsoleEntries = [];
+    let _homeConsoleLastId = 0;
+    let _homeConsoleLoading = false;
+    let _homeConsoleInterval = null;
+    let _homeConsoleFilter = "all";
+    let _homeConsoleAutoScrollPaused = false;
+    let _homeConsoleClearedBeforeId = 0;
+    let _homeConsoleWasCleared = false;
+
+    function setHomeConsoleStatus(message) {
+        const status = $("#home-console-status");
+        if (status.length) {
+            status.text(message);
+        }
+    }
+
+    function getHomeConsoleVisibleEntries() {
+        return _homeConsoleEntries.filter(entry => {
+            if (!entry || typeof entry.id !== "number" || entry.id <= _homeConsoleClearedBeforeId) {
+                return false;
+            }
+            return homeConsoleMatchesFilter(entry, _homeConsoleFilter);
+        });
+    }
+
+    function homeConsoleMatchesFilter(entry, filter) {
+        if (!entry) {
+            return false;
+        }
+
+        const text = String(entry.text || "").toLowerCase();
+        if (filter === "all") {
+            return true;
+        }
+        if (filter === "mqtt") {
+            return text.includes("mqtt") || text.includes("mqttqueue");
+        }
+        if (filter === "pppp") {
+            return text.includes("pppp");
+        }
+        if (filter === "video") {
+            return text.includes("video")
+                || text.includes("/ws/video")
+                || text.includes("snapshot")
+                || text.includes("jmuxer");
+        }
+        if (filter === "upload") {
+            return text.includes("upload")
+                || text.includes("filetransfer")
+                || text.includes("transfer")
+                || text.includes("gcode file");
+        }
+        if (filter === "error") {
+            return /^\[(e|w|!)\]/i.test(text)
+                || text.includes("error")
+                || text.includes("exception")
+                || text.includes("traceback");
+        }
+        return true;
+    }
+
+    function updateHomeConsoleStatus() {
+        const visibleEntries = getHomeConsoleVisibleEntries();
+        const totalEntries = _homeConsoleEntries.filter(entry => entry && entry.id > _homeConsoleClearedBeforeId).length;
+        const filterLabel = _homeConsoleFilter.toUpperCase();
+        const scrollLabel = _homeConsoleAutoScrollPaused ? "auto-scroll paused" : "auto-scroll live";
+        setHomeConsoleStatus(`Showing ${visibleEntries.length} of ${totalEntries} line(s) - ${filterLabel} - ${scrollLabel}`);
+    }
+
+    function updateHomeConsoleFilterButtons() {
+        $("[data-home-console-filter]").each(function () {
+            const button = $(this);
+            const isActive = button.data("home-console-filter") === _homeConsoleFilter;
+            button.toggleClass("active", isActive);
+            button.attr("aria-pressed", isActive ? "true" : "false");
+        });
+    }
+
+    function updateHomeConsoleAutoScrollButton() {
+        const button = $("#home-console-autoscroll-toggle");
+        if (!button.length) {
+            return;
+        }
+        const label = _homeConsoleAutoScrollPaused ? "Resume Auto-Scroll" : "Pause Auto-Scroll";
+        const icon = _homeConsoleAutoScrollPaused ? "play-circle" : "pause-circle";
+        button
+            .toggleClass("btn-outline-warning", _homeConsoleAutoScrollPaused)
+            .toggleClass("btn-outline-secondary", !_homeConsoleAutoScrollPaused)
+            .attr("aria-pressed", _homeConsoleAutoScrollPaused ? "true" : "false")
+            .html(`<i class="bi bi-${icon}"></i> ${label}`);
+    }
+
+    function mergeHomeConsoleEntries(entries, replace = false) {
+        if (replace) {
+            _homeConsoleEntries = Array.isArray(entries) ? entries.slice(-HOME_CONSOLE_MAX_LINES) : [];
+        } else if (Array.isArray(entries) && entries.length) {
+            _homeConsoleEntries = _homeConsoleEntries.concat(entries).slice(-HOME_CONSOLE_MAX_LINES);
+        }
+
+        if (_homeConsoleClearedBeforeId > 0) {
+            _homeConsoleEntries = _homeConsoleEntries.filter(entry => entry && entry.id > _homeConsoleClearedBeforeId);
+        }
+    }
+
+    function renderHomeConsoleEntries() {
+        const pre = document.getElementById("home-console-pre");
+        const content = document.getElementById("home-console-content");
+        if (!content) {
+            return;
+        }
+
+        const wasNearBottom = !pre
+            || (pre.scrollHeight - pre.scrollTop - pre.clientHeight) < 40;
+
+        const visibleEntries = getHomeConsoleVisibleEntries();
+        const totalEntries = _homeConsoleEntries.filter(entry => entry && entry.id > _homeConsoleClearedBeforeId).length;
+
+        if (!visibleEntries.length) {
+            if (_homeConsoleWasCleared && totalEntries === 0) {
+                content.innerHTML = "Console cleared. New output will appear here.";
+            } else if (totalEntries > 0) {
+                content.innerHTML = "No console lines match the current filter.";
+            } else {
+                content.innerHTML = "No console output captured yet.";
+            }
+        } else {
+            content.innerHTML = visibleEntries
+                .map(entry => escapeHtml(entry && entry.text ? entry.text : ""))
+                .join("\n");
+        }
+
+        updateHomeConsoleStatus();
+
+        if (pre && !_homeConsoleAutoScrollPaused && wasNearBottom) {
+            pre.scrollTop = pre.scrollHeight;
+        }
+    }
+
+    async function fetchHomeConsoleLogs(afterId = null, limit = HOME_CONSOLE_INITIAL_LIMIT) {
+        const params = new URLSearchParams({ limit: String(limit) });
+        if (afterId !== null && afterId !== undefined) {
+            params.set("after", String(afterId));
+        }
+        const resp = await fetch(`/api/console/logs?${params.toString()}`);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+        return data;
+    }
+
+    async function loadHomeConsoleHistory() {
+        if (_homeConsoleLoading) {
+            return;
+        }
+        _homeConsoleLoading = true;
+        try {
+            const data = await fetchHomeConsoleLogs(null, HOME_CONSOLE_INITIAL_LIMIT);
+            mergeHomeConsoleEntries(data.entries || [], true);
+            _homeConsoleLastId = data.last_id || 0;
+            renderHomeConsoleEntries();
+        } catch (err) {
+            setHomeConsoleStatus(`Console viewer error: ${err.message}`);
+        } finally {
+            _homeConsoleLoading = false;
+        }
+    }
+
+    async function pollHomeConsoleUpdates() {
+        if (_homeConsoleLoading) {
+            return;
+        }
+        _homeConsoleLoading = true;
+        try {
+            const data = await fetchHomeConsoleLogs(_homeConsoleLastId, HOME_CONSOLE_INITIAL_LIMIT);
+            if (data.truncated) {
+                mergeHomeConsoleEntries(data.entries || [], true);
+                renderHomeConsoleEntries();
+            } else if (Array.isArray(data.entries) && data.entries.length) {
+                mergeHomeConsoleEntries(data.entries, false);
+                _homeConsoleWasCleared = false;
+                renderHomeConsoleEntries();
+            }
+            _homeConsoleLastId = data.last_id || _homeConsoleLastId;
+        } catch (err) {
+            setHomeConsoleStatus(`Console viewer error: ${err.message}`);
+        } finally {
+            _homeConsoleLoading = false;
+        }
+    }
+
+    function startHomeConsoleViewer() {
+        if (!document.getElementById("home-console-content")) {
+            return;
+        }
+        updateHomeConsoleFilterButtons();
+        updateHomeConsoleAutoScrollButton();
+        loadHomeConsoleHistory();
+        if (_homeConsoleInterval) {
+            return;
+        }
+        _homeConsoleInterval = setInterval(pollHomeConsoleUpdates, HOME_CONSOLE_POLL_MS);
+    }
+
+    function stopHomeConsoleViewer() {
+        if (_homeConsoleInterval) {
+            clearInterval(_homeConsoleInterval);
+            _homeConsoleInterval = null;
+        }
+    }
+
+    $(document).on("click", "#home-console-clear", function () {
+        _homeConsoleClearedBeforeId = _homeConsoleLastId;
+        _homeConsoleWasCleared = true;
+        _homeConsoleEntries = _homeConsoleEntries.filter(entry => entry && entry.id > _homeConsoleClearedBeforeId);
+        renderHomeConsoleEntries();
+    });
+
+    $(document).on("click", "#home-console-autoscroll-toggle", function () {
+        _homeConsoleAutoScrollPaused = !_homeConsoleAutoScrollPaused;
+        updateHomeConsoleAutoScrollButton();
+        renderHomeConsoleEntries();
+    });
+
+    $(document).on("click", "[data-home-console-filter]", function () {
+        _homeConsoleFilter = String($(this).data("home-console-filter") || "all");
+        updateHomeConsoleFilterButtons();
+        renderHomeConsoleEntries();
+    });
+
     /**
      * Calculates the AnkerMake M5 Speed ratio ("X-factor")
      * @param {number} speed - The speed value in mm/s
@@ -164,6 +398,58 @@ $(function () {
      */
     function getSpeedFactor(speed) {
         return `X${speed / 50}`;
+    }
+
+    function getFilamentStateLabel(value, progress, stepLen) {
+        const parsedValue = Number(value);
+        const parsedProgress = Number(progress);
+        const parsedStepLen = Number(stepLen);
+        const hasValue = Number.isFinite(parsedValue);
+        const hasProgress = Number.isFinite(parsedProgress);
+        const hasStepLen = Number.isFinite(parsedStepLen);
+
+        if ((hasProgress && parsedProgress > 0) || (hasStepLen && parsedStepLen > 0)) {
+            return "Changing";
+        }
+        if (hasValue && parsedValue === 0) {
+            return "Loaded";
+        }
+        if (!hasValue) {
+            return "Unknown";
+        }
+        return "Changing";
+    }
+
+    function isFilamentRunoutEvent(data) {
+        if (!data || typeof data !== "object") {
+            return false;
+        }
+        if (data.commandType === 1085 && String(data.errorCode || "") === "0xFF01030001") {
+            return true;
+        }
+        return data.commandType === 1000
+            && Number(data.subType) === 2
+            && Number(data.value) === 6;
+    }
+
+    function setFilamentState(label) {
+        const el = $("#filament-state");
+        if (!el.length) {
+            return;
+        }
+
+        const value = String(label || "Unknown");
+        el.text(value);
+        el.removeClass("text-success text-warning text-danger text-muted");
+        if (value === "Loaded") {
+            el.addClass("text-success");
+        } else if (value === "Not Loaded") {
+            el.addClass("text-danger");
+        } else if (value === "Changing") {
+            el.addClass("text-warning");
+        } else {
+            el.addClass("text-muted");
+        }
     }
 
     /**
@@ -509,6 +795,10 @@ $(function () {
                 }
             } else if (data.commandType == 1021) {
                 applyZOffsetState(data, { populateTarget: false });
+            } else if (isFilamentRunoutEvent(data)) {
+                setFilamentState("Not Loaded");
+            } else if (data.commandType == 1023) {
+                setFilamentState(getFilamentStateLabel(data.value, data.progress, data.stepLen));
             } else if (data.commandType == 1044) {
                 // Print start notification — extract basename from filePath
                 const filePath = data.filePath || "";
@@ -536,6 +826,7 @@ $(function () {
             $("#set-bed-temp").val(0);
             $("#print-speed").text("0mm/s");
             $("#print-layer").text("0 / 0");
+            setFilamentState("Unknown");
             document.title = "ankerctl";
             _updatePrintControlButtons(PRINT_STATE.IDLE);
             _zOffsetCurrentMm = null;
@@ -2102,6 +2393,153 @@ $(function () {
             || /(^|\n)\s*; generated by /i.test(gcode);
     }
 
+    function gcodeStorageSourceLabel(source) {
+        return source === "usb" ? "thumb drive" : "printer storage";
+    }
+
+    let _selectedGCodeStorageFile = null;
+
+    function buildGCodeThumbnail(url, altText) {
+        const safeAlt = escapeHtml(altText || "GCode thumbnail");
+        const safeUrl = url ? escapeHtml(url) : "";
+        const img = safeUrl
+            ? `<img src="${safeUrl}" alt="${safeAlt}" class="gcode-thumbnail-image" loading="lazy" onerror="this.remove()">`
+            : "";
+        return (
+            '<div class="gcode-thumbnail-shell">' +
+            '<div class="gcode-thumbnail-fallback"><i class="bi bi-card-image"></i></div>' +
+            img +
+            "</div>"
+        );
+    }
+
+    function formatStorageTimestamp(timestamp) {
+        const value = Number(timestamp);
+        if (!Number.isFinite(value) || value <= 0) {
+            return "-";
+        }
+        return new Date(value * 1000).toLocaleString();
+    }
+
+    function setGCodeStoragePrintEnabled(enabled) {
+        $("#gcode-storage-print").prop("disabled", !enabled);
+    }
+
+    function setGCodeStorageBusy(busy) {
+        $("#gcode-storage-refresh").prop("disabled", busy);
+        $("#gcode-storage-source").prop("disabled", busy);
+        $("#gcode-storage-print").prop("disabled", busy || !_selectedGCodeStorageFile);
+    }
+
+    function renderGCodeStorageSelection(file) {
+        const selected = $("#gcode-storage-selected");
+        _selectedGCodeStorageFile = file || null;
+        if (!selected.length) {
+            return;
+        }
+        if (!file) {
+            setGCodeStoragePrintEnabled(false);
+            selected.hide().empty();
+            return;
+        }
+
+        const source = gcodeStorageSourceLabel(file.source || $("#gcode-storage-source").val() || "onboard");
+        selected
+            .html(
+                '<div class="d-flex align-items-start gap-3">' +
+                buildGCodeThumbnail(file.thumbnail_url, file.name || "Stored file thumbnail") +
+                '<div class="flex-grow-1 min-w-0">' +
+                `<div class="fw-semibold">${escapeHtml(file.name || "Unnamed file")}</div>` +
+                `<div class="text-break"><code>${escapeHtml(file.path || "-")}</code></div>` +
+                `<div class="text-muted">Modified: ${escapeHtml(formatStorageTimestamp(file.timestamp))} · Source: ${escapeHtml(source)}</div>` +
+                "</div>" +
+                "</div>"
+            )
+            .show();
+        setGCodeStoragePrintEnabled(true);
+    }
+
+    function renderGCodeStorageFiles(source, files) {
+        const list = $("#gcode-storage-list");
+        const status = $("#gcode-storage-status");
+        if (!list.length) {
+            return;
+        }
+
+        list.empty();
+        renderGCodeStorageSelection(null);
+
+        if (!Array.isArray(files) || files.length === 0) {
+            list.append(
+                `<div class="list-group-item text-muted small">No files found on ${escapeHtml(gcodeStorageSourceLabel(source))}.</div>`
+            );
+            status.text(`No files found on ${gcodeStorageSourceLabel(source)}.`);
+            return;
+        }
+
+        let firstItem = null;
+        let firstFile = null;
+        files.forEach((file) => {
+            const normalizedFile = Object.assign({}, file || {}, { source: source });
+            const name = normalizedFile && normalizedFile.name ? String(normalizedFile.name) : "Unnamed file";
+            const path = normalizedFile && normalizedFile.path ? String(normalizedFile.path) : "-";
+            const item = $(`
+                <button type="button" class="list-group-item list-group-item-action text-start">
+                    <div class="d-flex align-items-start gap-3">
+                        ${buildGCodeThumbnail(normalizedFile.thumbnail_url, name)}
+                        <div class="flex-grow-1 min-w-0">
+                            <div class="fw-semibold text-truncate">${escapeHtml(name)}</div>
+                            <div class="small text-muted text-truncate"><code>${escapeHtml(path)}</code></div>
+                            <div class="small text-muted">Modified: ${escapeHtml(formatStorageTimestamp(file.timestamp))}</div>
+                        </div>
+                    </div>
+                </button>
+            `);
+            item.on("click", function () {
+                $("#gcode-storage-list .list-group-item").removeClass("active");
+                item.addClass("active");
+                renderGCodeStorageSelection(normalizedFile);
+            });
+            list.append(item);
+            if (!firstItem) {
+                firstItem = item;
+                firstFile = normalizedFile;
+            }
+        });
+
+        if (firstItem && firstFile) {
+            firstItem.addClass("active");
+            renderGCodeStorageSelection(firstFile);
+        }
+
+        status.text(`Loaded ${files.length} file(s) from ${gcodeStorageSourceLabel(source)}.`);
+    }
+
+    async function loadGCodeStorageFiles() {
+        const source = $("#gcode-storage-source").val() || "onboard";
+        const status = $("#gcode-storage-status");
+
+        setGCodeStorageBusy(true);
+        status.text(`Loading ${gcodeStorageSourceLabel(source)} files...`);
+        try {
+            const resp = await fetch(`/api/files/printer?source=${encodeURIComponent(source)}`);
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            renderGCodeStorageFiles(source, data.files || []);
+        } catch (err) {
+            $("#gcode-storage-list").html(
+                `<div class="list-group-item text-danger small">Failed to load ${escapeHtml(gcodeStorageSourceLabel(source))}: ${escapeHtml(err.message)}</div>`
+            );
+            renderGCodeStorageSelection(null);
+            status.text(`Failed to load ${gcodeStorageSourceLabel(source)}.`);
+            gcodeLog(`Error loading ${gcodeStorageSourceLabel(source)} files: ${err.message}`);
+        } finally {
+            setGCodeStorageBusy(false);
+        }
+    }
+
     function setGCodeConsoleBusy(busy) {
         $("#gcode-file-send").prop("disabled", busy);
         $("#gcode-text-send").prop("disabled", busy);
@@ -2226,6 +2664,71 @@ $(function () {
             $("#gcode-text-send").click();
         }
     });
+
+    $(document).on("click", "#gcode-storage-refresh", function () {
+        loadGCodeStorageFiles();
+    });
+
+    $(document).on("change", "#gcode-storage-source", function () {
+        loadGCodeStorageFiles();
+    });
+
+    $(document).on("click", "#gcode-storage-print", async function () {
+        if (!_selectedGCodeStorageFile || !_selectedGCodeStorageFile.path) {
+            gcodeLog("No stored file selected");
+            flash_message("Select a stored file before printing.", "warning");
+            return;
+        }
+
+        const source = _selectedGCodeStorageFile.source || $("#gcode-storage-source").val() || "onboard";
+        const fileName = _selectedGCodeStorageFile.name || "stored file";
+
+        setGCodeStorageBusy(true);
+        try {
+            gcodeLog(`Starting ${fileName} from ${gcodeStorageSourceLabel(source)}`);
+            const resp = await fetch("/api/files/printer/print", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    source: source,
+                    path: _selectedGCodeStorageFile.path,
+                }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            gcodeLog(`Printer confirmed stored file start for ${data.name || fileName}`);
+            flash_message(`Printer confirmed ${data.name || fileName} from ${gcodeStorageSourceLabel(source)}.`, "success", 4000);
+        } catch (err) {
+            gcodeLog(`Failed to start stored file: ${err.message}`);
+            flash_message(`Failed to start stored file: ${err.message}`, "danger");
+        } finally {
+            setGCodeStorageBusy(false);
+        }
+    });
+
+    const homeTabBtn = document.querySelector('button[data-bs-target="#home"]');
+    if (homeTabBtn) {
+        homeTabBtn.addEventListener("shown.bs.tab", function () {
+            startHomeConsoleViewer();
+        });
+        homeTabBtn.addEventListener("hidden.bs.tab", function () {
+            stopHomeConsoleViewer();
+        });
+    }
+
+    const homeTabPane = document.getElementById("home");
+    if (homeTabPane && homeTabPane.classList.contains("show")) {
+        startHomeConsoleViewer();
+    }
+
+    const gcodeTabBtn = document.querySelector('button[data-bs-target="#gcode"]');
+    if (gcodeTabBtn) {
+        gcodeTabBtn.addEventListener("shown.bs.tab", function () {
+            loadGCodeStorageFiles();
+        });
+    }
 
     $("#print-pause").on("click", function () {
         sendPrintControl(PRINT_CONTROL.PAUSE);
@@ -2375,6 +2878,7 @@ $(function () {
      */
     let historyOffset = 0;
     const HISTORY_LIMIT = 25;
+    const selectedHistoryIds = new Set();
 
     function formatDuration(sec) {
         if (!sec) return "-";
@@ -2393,23 +2897,65 @@ $(function () {
         return map[status] || `<span class="badge bg-secondary">${escapeHtml(status)}</span>`;
     }
 
+    function updateHistorySelectionUi() {
+        const deleteButton = $("#history-delete-selected");
+        const count = selectedHistoryIds.size;
+        deleteButton
+            .prop("disabled", count === 0)
+            .html(`<i class="bi bi-trash3"></i> Delete Selected${count > 0 ? ` (${count})` : ""}`);
+
+        const checkboxes = $(".history-select-checkbox").filter(function () {
+            return !$(this).prop("disabled");
+        });
+        const checked = checkboxes.filter(function () {
+            return $(this).prop("checked");
+        });
+        const selectAll = $("#history-select-all");
+        if (selectAll.length) {
+            const selectAllEl = selectAll.get(0);
+            selectAll.prop("checked", checkboxes.length > 0 && checked.length === checkboxes.length);
+            if (selectAllEl) {
+                selectAllEl.indeterminate = checked.length > 0 && checked.length < checkboxes.length;
+            }
+        }
+    }
+
     function loadHistory(append) {
         fetch(`/api/history?limit=${HISTORY_LIMIT}&offset=${historyOffset}`)
             .then(r => r.json())
             .then(data => {
                 const tbody = $("#history-tbody");
-                if (!append) tbody.empty();
+                if (!append) {
+                    tbody.empty();
+                    selectedHistoryIds.clear();
+                }
                 if (data.entries.length === 0 && !append) {
-                    tbody.html('<tr><td colspan="4" class="text-center text-muted py-4">No history yet</td></tr>');
+                    tbody.html('<tr><td colspan="6" class="text-center text-muted py-4">No history yet</td></tr>');
                 }
                 data.entries.forEach(e => {
                     const started = e.started_at ? new Date(e.started_at + "Z").toLocaleString() : "-";
                     const safeFilename = escapeHtml(e.filename);
+                    const thumbnail = buildGCodeThumbnail(e.thumbnail_url, e.filename || "History thumbnail");
+                    const canDelete = e.status !== "started";
+                    const isChecked = selectedHistoryIds.has(e.id);
+                    const checkboxCell = canDelete
+                        ? `<input type="checkbox" class="form-check-input history-select-checkbox" data-history-id="${e.id}" ${isChecked ? "checked" : ""} aria-label="Select ${safeFilename}">`
+                        : '<input type="checkbox" class="form-check-input" disabled aria-label="Cannot delete in-progress history entry">';
+                    const actionCell = e.can_reprint
+                        ? `<button class="btn btn-sm btn-outline-primary history-reprint-btn" data-history-id="${e.id}" data-history-name="${safeFilename}">Reprint</button>`
+                        : '<span class="text-muted small">-</span>';
                     const row = `<tr>
-                        <td class="text-truncate" style="max-width:200px;" title="${safeFilename}">${safeFilename}</td>
+                        <td class="text-center align-middle">${checkboxCell}</td>
+                        <td class="history-file-cell" title="${safeFilename}">
+                            <div class="d-flex align-items-center gap-2">
+                                ${thumbnail}
+                                <div class="text-truncate" style="max-width:200px;">${safeFilename}</div>
+                            </div>
+                        </td>
                         <td>${statusBadge(e.status)}</td>
                         <td class="small">${started}</td>
                         <td>${formatDuration(e.duration_sec)}</td>
+                        <td class="text-end">${actionCell}</td>
                     </tr>`;
                     tbody.append(row);
                 });
@@ -2419,6 +2965,7 @@ $(function () {
                 } else {
                     $("#history-load-more").hide();
                 }
+                updateHistorySelectionUi();
             })
             .catch(err => console.error("History load failed:", err));
     }
@@ -2439,13 +2986,106 @@ $(function () {
         loadHistory(true);
     });
 
+    $(document).on("change", ".history-select-checkbox", function () {
+        const id = parseInt($(this).attr("data-history-id"), 10);
+        if (!Number.isFinite(id)) {
+            return;
+        }
+        if ($(this).prop("checked")) {
+            selectedHistoryIds.add(id);
+        } else {
+            selectedHistoryIds.delete(id);
+        }
+        updateHistorySelectionUi();
+    });
+
+    $("#history-select-all").on("change", function () {
+        const checked = $(this).prop("checked");
+        $(".history-select-checkbox").each(function () {
+            const checkbox = $(this);
+            const id = parseInt(checkbox.attr("data-history-id"), 10);
+            if (!Number.isFinite(id)) {
+                return;
+            }
+            checkbox.prop("checked", checked);
+            if (checked) {
+                selectedHistoryIds.add(id);
+            } else {
+                selectedHistoryIds.delete(id);
+            }
+        });
+        updateHistorySelectionUi();
+    });
+
+    $("#history-delete-selected").on("click", async function () {
+        const ids = Array.from(selectedHistoryIds);
+        if (!ids.length) {
+            flash_message("Select one or more history entries first.", "warning");
+            return;
+        }
+        if (!confirm(`Delete ${ids.length} selected history entr${ids.length === 1 ? "y" : "ies"}?`)) {
+            return;
+        }
+        const btn = $(this);
+        btn.prop("disabled", true);
+        try {
+            const resp = await fetch("/api/history/delete", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ids }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            selectedHistoryIds.clear();
+            historyOffset = 0;
+            loadHistory(false);
+            flash_message(`Deleted ${data.deleted || 0} history entr${(data.deleted || 0) === 1 ? "y" : "ies"}.`, "success");
+        } catch (err) {
+            flash_message(`Delete failed: ${err.message || err}`, "danger");
+        } finally {
+            btn.prop("disabled", false);
+            updateHistorySelectionUi();
+        }
+    });
+
     $("#history-clear").on("click", function () {
         if (!confirm("Clear all print history?")) return;
         fetch("/api/history", { method: "DELETE" })
             .then(() => {
+                selectedHistoryIds.clear();
                 historyOffset = 0;
                 loadHistory(false);
+                updateHistorySelectionUi();
             });
+    });
+
+    $(document).on("click", ".history-reprint-btn", async function () {
+        const btn = $(this);
+        const entryId = btn.attr("data-history-id");
+        const entryName = btn.attr("data-history-name") || "selected file";
+        if (!entryId) {
+            return;
+        }
+        if (!confirm(`Reprint ${entryName}?`)) {
+            return;
+        }
+        btn.prop("disabled", true);
+        try {
+            const resp = await fetch(`/api/history/${encodeURIComponent(entryId)}/reprint`, {
+                method: "POST",
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            flash_message(`Reprint upload started for ${entryName}`, "success");
+        } catch (err) {
+            flash_message(`Reprint failed: ${err.message || err}`, "danger");
+        } finally {
+            btn.prop("disabled", false);
+        }
     });
 
     /**

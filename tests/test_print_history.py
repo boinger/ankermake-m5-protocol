@@ -1,3 +1,5 @@
+import os
+
 from web.service.history import PrintHistory
 
 
@@ -70,3 +72,89 @@ def test_history_clear_and_fallback_finish_latest_active(tmp_path):
 
     history.clear()
     assert history.get_count() == 0
+
+
+def test_archive_upload_and_reprint_flags(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+
+    archive_info = history.archive_upload(
+        "cube.gcode",
+        (
+            b"; thumbnail begin 32x32 10\n"
+            b"; iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5ZQAAAAASUVORK5CYII=\n"
+            b"; thumbnail end\n"
+            b"G28\nM104 S200\n"
+        ),
+    )
+    row_id = history.record_start(
+        "cube.gcode",
+        task_id="task-archive",
+        archive_relpath=archive_info["archive_relpath"],
+        archive_size=archive_info["archive_size"],
+    )
+
+    entry = history.get_entry(row_id)
+
+    assert entry["archive_available"] is True
+    assert entry["can_reprint"] is True
+    assert entry["thumbnail_available"] is True
+    assert history.get_archive_path(row_id) is not None
+    assert history.get_thumbnail_path(row_id) is not None
+
+
+def test_history_clear_removes_archived_gcode_files(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+
+    archive_info = history.archive_upload("cube.gcode", b"G28\n")
+    row_id = history.record_start(
+        "cube.gcode",
+        archive_relpath=archive_info["archive_relpath"],
+        archive_size=archive_info["archive_size"],
+    )
+    assert history.get_archive_path(row_id) is not None
+
+    history.clear()
+
+    assert history.get_archive_path(row_id) is None
+
+
+def test_history_preview_url_marks_entry_thumbnail_available(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+
+    row_id = history.record_start(
+        "usb-file.gcode",
+        preview_url="https://example.test/preview.png",
+    )
+
+    entry = history.get_entry(row_id)
+
+    assert entry["thumbnail_available"] is True
+    assert entry["preview_url"] == "https://example.test/preview.png"
+
+
+def test_delete_entries_removes_selected_rows_and_unreferenced_archives(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+
+    first_archive = history.archive_upload("one.gcode", b"G28\n")
+    first_id = history.record_start(
+        "one.gcode",
+        archive_relpath=first_archive["archive_relpath"],
+        archive_size=first_archive["archive_size"],
+    )
+    second_archive = history.archive_upload("two.gcode", b"G28\n")
+    second_id = history.record_start(
+        "two.gcode",
+        archive_relpath=second_archive["archive_relpath"],
+        archive_size=second_archive["archive_size"],
+    )
+
+    first_archive_path = os.path.join(tmp_path, "gcode_archive", first_archive["archive_relpath"])
+    second_archive_path = os.path.join(tmp_path, "gcode_archive", second_archive["archive_relpath"])
+
+    deleted = history.delete_entries([first_id])
+
+    assert deleted == 1
+    assert history.get_entry(first_id) is None
+    assert history.get_entry(second_id) is not None
+    assert first_archive_path is not None and not os.path.exists(first_archive_path)
+    assert second_archive_path is not None and os.path.exists(second_archive_path)

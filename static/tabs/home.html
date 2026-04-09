@@ -388,12 +388,65 @@
                                     </span>
                                 </div>
                             </div>
+                            <div class="col-12">
+                                <div class="input-group">
+                                    <div class="input-group-text print-info-label" id="filamentState">
+                                        {{ macro.bi_icon("droplet-fill") }}
+                                    </div>
+                                    <span id="filament-state" class="form-control text-center small" title="Filament State"
+                                        aria-describedby="filamentState">
+                                        Unknown
+                                    </span>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
             </div>
 
 
+        </div>
+        <div class="row g-3 mt-1">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <div class="d-flex flex-column flex-lg-row align-items-lg-center justify-content-between gap-2">
+                            <div class="d-flex flex-column">
+                                <span class="fs-6">Live Console</span>
+                                <span class="small text-muted" id="home-console-status">Loading recent output...</span>
+                            </div>
+                            <div class="d-flex flex-wrap gap-2">
+                                <button type="button" class="btn btn-sm btn-outline-secondary" id="home-console-clear">
+                                    {{ macro.bi_icon("eraser") }} Clear
+                                </button>
+                                <button type="button" class="btn btn-sm btn-outline-secondary" id="home-console-autoscroll-toggle"
+                                    aria-pressed="false">
+                                    {{ macro.bi_icon("pause-circle") }} Pause Auto-Scroll
+                                </button>
+                            </div>
+                        </div>
+                        <div class="d-flex flex-wrap align-items-center gap-1 mt-2">
+                            <span class="small text-muted me-1">Filter:</span>
+                            <button type="button" class="btn btn-sm btn-outline-secondary active" data-home-console-filter="all"
+                                aria-pressed="true">All</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" data-home-console-filter="mqtt"
+                                aria-pressed="false">MQTT</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" data-home-console-filter="pppp"
+                                aria-pressed="false">PPPP</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" data-home-console-filter="video"
+                                aria-pressed="false">Video</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" data-home-console-filter="upload"
+                                aria-pressed="false">Upload</button>
+                            <button type="button" class="btn btn-sm btn-outline-secondary" data-home-console-filter="error"
+                                aria-pressed="false">Error</button>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <pre id="home-console-pre" class="bg-dark text-light p-3 m-0 border-0 small font-monospace"
+                            style="height: 260px; overflow-y: auto; white-space: pre-wrap;"><code id="home-console-content">Loading console output...</code></pre>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 </div>

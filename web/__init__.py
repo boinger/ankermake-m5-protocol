@@ -35,21 +35,118 @@ import secrets
 import shutil
 import threading
 import time
+from collections import deque
 from contextlib import contextmanager
 
 log = logging.getLogger("web")
 
 
-class _StaticAssetAccessLogFilter(logging.Filter):
+class _AccessLogNoiseFilter(logging.Filter):
+    _IGNORED_SUBSTRINGS = (
+        '"GET /static/',
+        '"GET /favicon.ico',
+        '"GET /api/console/logs',
+    )
+
     def filter(self, record):
         message = record.getMessage()
-        return '"GET /static/' not in message and '"GET /favicon.ico' not in message
+        return not any(fragment in message for fragment in self._IGNORED_SUBSTRINGS)
 
 
 def _configure_access_log_noise():
     werkzeug_log = logging.getLogger("werkzeug")
-    if not any(isinstance(f, _StaticAssetAccessLogFilter) for f in werkzeug_log.filters):
-        werkzeug_log.addFilter(_StaticAssetAccessLogFilter())
+    if not any(isinstance(f, _AccessLogNoiseFilter) for f in werkzeug_log.filters):
+        werkzeug_log.addFilter(_AccessLogNoiseFilter())
+
+
+class _ConsoleLogBuffer:
+    def __init__(self, max_lines=2000):
+        self._entries = deque(maxlen=max_lines)
+        self._next_id = 1
+        self._lock = threading.Lock()
+
+    @property
+    def max_lines(self):
+        return self._entries.maxlen or 0
+
+    def append(self, text):
+        text = str(text or "").rstrip("\r\n")
+        if not text:
+            return None
+        with self._lock:
+            entry = {"id": self._next_id, "text": text}
+            self._entries.append(entry)
+            self._next_id += 1
+            return entry["id"]
+
+    def snapshot(self, *, limit=200, after_id=None):
+        limit = max(1, min(int(limit), self.max_lines or 1))
+        with self._lock:
+            entries = list(self._entries)
+
+        first_id = entries[0]["id"] if entries else 0
+        last_id = entries[-1]["id"] if entries else 0
+        truncated = False
+
+        if after_id is None:
+            selected = entries[-limit:]
+        else:
+            try:
+                after_id = int(after_id)
+            except (TypeError, ValueError):
+                after_id = 0
+
+            if entries and after_id < first_id - 1:
+                truncated = True
+
+            selected = [entry for entry in entries if entry["id"] > after_id]
+            if len(selected) > limit:
+                truncated = True
+                selected = selected[-limit:]
+
+        return {
+            "entries": [dict(entry) for entry in selected],
+            "first_id": first_id,
+            "last_id": last_id,
+            "next_after": last_id,
+            "truncated": truncated,
+            "max_lines": self.max_lines,
+        }
+
+
+class _ConsoleLogFormatter(logging.Formatter):
+    _MARKS = {
+        logging.CRITICAL: "!",
+        logging.ERROR: "E",
+        logging.WARNING: "W",
+        logging.INFO: "*",
+        logging.DEBUG: "D",
+    }
+
+    def format(self, record):
+        message = record.getMessage()
+        if record.exc_info:
+            message = f"{message}\n{self.formatException(record.exc_info)}"
+        if record.stack_info:
+            message = f"{message}\n{self.formatStack(record.stack_info)}"
+        mark = self._MARKS.get(record.levelno, "*")
+        lines = str(message or "").splitlines() or [""]
+        return "\n".join(([f"[{mark}] {lines[0]}"] + lines[1:]))
+
+
+class _ConsoleLogBufferHandler(logging.Handler):
+    def __init__(self, buffer):
+        super().__init__(level=logging.DEBUG)
+        self.buffer = buffer
+        self._ankerctl_console_buffer_handler = True
+
+    def emit(self, record):
+        try:
+            formatted = self.format(record)
+            for line in str(formatted).splitlines():
+                self.buffer.append(line)
+        except Exception:
+            self.handleError(record)
 
 
 from secrets import token_urlsafe as token
@@ -72,6 +169,7 @@ import web.util
 import cli.util
 import cli.config
 import cli.countrycodes
+import cli.mqtt
 from cli.model import (
     UPLOAD_RATE_MBPS_CHOICES,
     default_apprise_config,
@@ -178,6 +276,30 @@ def _configure_request_limits(flask_app, env=None):
 
 
 _configure_request_limits(app)
+
+
+def _get_console_log_buffer():
+    buffer = getattr(app, "console_log_buffer", None)
+    if buffer is None:
+        max_lines = _env_int("ANKERCTL_CONSOLE_BUFFER_LINES", 2000, min_value=100)
+        buffer = _ConsoleLogBuffer(max_lines=max_lines)
+        app.console_log_buffer = buffer
+
+    root = logging.getLogger()
+    for handler in root.handlers:
+        if getattr(handler, "_ankerctl_console_buffer_handler", False):
+            if getattr(handler, "buffer", None) is not buffer:
+                buffer = handler.buffer
+                app.console_log_buffer = buffer
+            return buffer
+
+    if not root.handlers:
+        return buffer
+
+    handler = _ConsoleLogBufferHandler(buffer)
+    handler.setFormatter(_ConsoleLogFormatter())
+    root.addHandler(handler)
+    return buffer
 
 # Session cookie security
 app.config['SESSION_COOKIE_SAMESITE'] = 'Strict'
@@ -1463,6 +1585,99 @@ def app_api_files_local():
     }
 
 
+@app.get("/api/files/printer")
+def app_api_files_printer():
+    source = str(request.args.get("source", "onboard") or "onboard").strip().lower()
+    if source not in {"onboard", "usb"}:
+        return {"error": "Invalid storage source"}, 400
+    raw_value = request.args.get("value")
+    source_value = None
+    if raw_value not in (None, ""):
+        try:
+            source_value = int(raw_value)
+        except ValueError:
+            return {"error": "value must be an integer"}, 400
+
+    result, error = _probe_printer_storage_files(source=source, source_value=source_value)
+    if error:
+        payload, status = error
+        return payload, status
+
+    resolved_source = "onboard" if result["source_value"] == 1 else source
+    files = []
+    for entry in result["files"]:
+        item = dict(entry)
+        item["thumbnail_url"] = url_for(
+            "app_api_files_printer_thumbnail",
+            path=item.get("path", ""),
+            source=resolved_source,
+        )
+        files.append(item)
+
+    return {
+        "status": "ok",
+        "source": resolved_source,
+        "source_value": result["source_value"],
+        "reply_count": result["reply_count"],
+        "files": files,
+    }
+
+
+@app.get("/api/files/printer/thumbnail")
+def app_api_files_printer_thumbnail():
+    source = str(request.args.get("source", "") or "").strip().lower() or None
+    try:
+        file_path, _ = _validate_printer_storage_path(request.args.get("path"), source=source)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        preview_url = mqtt.get_cached_stored_file_preview_url(file_path)
+        if not preview_url:
+            allow_probe = not (mqtt.is_printing or mqtt.has_pending_print_start or mqtt.is_preparing_print)
+            preview_url = mqtt.get_stored_file_preview_url(file_path, allow_probe=allow_probe)
+
+    if not preview_url:
+        return {"error": "Thumbnail not available for this stored file"}, 404
+
+    return _proxy_preview_image_response(preview_url)
+
+
+@app.post("/api/files/printer/print")
+def app_api_files_printer_print():
+    payload = request.get_json(silent=True) or {}
+    source = str(payload.get("source", "") or "").strip().lower() or None
+    if source is not None and source not in {"onboard", "usb"}:
+        return {"error": "Invalid storage source"}, 400
+
+    try:
+        file_path, inferred_source = _validate_printer_storage_path(payload.get("path"), source=source)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+
+    with borrow_mqtt() as mqtt:
+        if mqtt.is_printing or mqtt.has_pending_print_start or mqtt.is_preparing_print:
+            return {"error": "Printer is already busy with another print job"}, 409
+        started = mqtt.start_stored_file(file_path)
+
+    if not started:
+        return {
+            "error": (
+                "Selected file preview loaded, but the printer did not confirm the job start. "
+                "Stored-file launching is still incomplete for this firmware."
+            )
+        }, 504
+
+    return {
+        "status": "ok",
+        "source": inferred_source,
+        "path": file_path,
+        "name": os.path.basename(file_path),
+    }
+
+
 @app.post("/api/ankerctl/config/upload-rate")
 def app_api_ankerctl_config_upload_rate():
     config = app.config["config"]
@@ -1967,6 +2182,94 @@ def _disconnect_mqtt_client(client):
         log.debug(f"MQTT client disconnect failed: {exc}")
 
 
+def _probe_printer_storage_files(source="onboard", source_value=None, timeout=5.0, collect_window=1.0):
+    config = app.config.get("config")
+    if not config:
+        return None, ({"error": "No configuration loaded"}, 503)
+
+    with config.open() as cfg:
+        if not cfg:
+            return None, ({"error": "No printers configured"}, 503)
+
+    try:
+        source_value = cli.mqtt.mqtt_file_list_source_value(source=source, value=source_value)
+    except (TypeError, ValueError):
+        return None, ({"error": "Invalid storage source"}, 400)
+
+    printer_index = app.config.get("printer_index", 0)
+    insecure = app.config.get("insecure", False)
+
+    client = None
+    try:
+        client = cli.mqtt.mqtt_open(config, printer_index, insecure)
+        result = cli.mqtt.mqtt_file_list_probe(
+            client,
+            source=source,
+            source_value=source_value,
+            timeout=timeout,
+            collect_window=collect_window,
+        )
+    except Exception as exc:
+        log.warning(f"storage-file-list: MQTT probe failed: {exc}")
+        return None, ({"error": f"MQTT storage probe failed: {exc}"}, 503)
+    finally:
+        if client is not None:
+            _disconnect_mqtt_client(client)
+
+    if not result.get("replies"):
+        return None, ({"error": f"No response from printer for storage source '{source}'"}, 504)
+
+    return result, None
+
+
+def _validate_printer_storage_path(file_path, source=None):
+    if not isinstance(file_path, str) or not file_path.strip():
+        raise ValueError("Stored file path is required")
+
+    normalized_path = file_path.strip()
+    inferred_source = cli.mqtt.infer_storage_source_from_path(normalized_path)
+    if inferred_source not in {"onboard", "usb"}:
+        raise ValueError("Unsupported stored file path")
+
+    if source is not None and inferred_source != source:
+        raise ValueError(f"Stored file path does not match source '{source}'")
+
+    return normalized_path, inferred_source
+
+
+def _fetch_remote_image(preview_url, timeout=10.0):
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    preview_url = str(preview_url or "").strip()
+    if not preview_url.startswith(("http://", "https://")):
+        raise ValueError("Invalid preview URL")
+
+    request_obj = Request(preview_url, headers={"User-Agent": "ankerctl"})
+    try:
+        with urlopen(request_obj, timeout=timeout) as remote:
+            data = remote.read()
+            content_type = remote.headers.get_content_type() if remote.headers else None
+            return data, (content_type or "image/jpeg")
+    except HTTPError as exc:
+        raise RuntimeError(f"Preview image request failed with HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Preview image request failed: {exc.reason}") from exc
+
+
+def _proxy_preview_image_response(preview_url):
+    try:
+        data, content_type = _fetch_remote_image(preview_url)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+    except RuntimeError as exc:
+        return {"error": str(exc)}, 502
+
+    response = Response(data, mimetype=content_type)
+    response.headers["Cache-Control"] = "private, max-age=600"
+    return response
+
+
 def _clean_printer_report_output(raw_output):
     import re
 
@@ -2289,7 +2592,16 @@ def app_api_history():
             return {"entries": [], "total": 0}
         entries = mqtt.history.get_history(limit=limit, offset=offset)
         total = mqtt.history.get_count()
-    return {"entries": entries, "total": total}
+    serialized_entries = []
+    for entry in entries:
+        item = dict(entry)
+        item["thumbnail_url"] = (
+            url_for("app_api_history_thumbnail", entry_id=item["id"])
+            if item.get("thumbnail_available")
+            else None
+        )
+        serialized_entries.append(item)
+    return {"entries": serialized_entries, "total": total}
 
 
 @app.delete("/api/history")
@@ -2298,6 +2610,121 @@ def app_api_history_clear():
     with borrow_mqtt() as mqtt:
         mqtt.history.clear()
     return {"status": "ok"}
+
+
+@app.post("/api/history/delete")
+def app_api_history_delete_selected():
+    payload = request.get_json(silent=True) or {}
+    raw_ids = payload.get("ids")
+    if not isinstance(raw_ids, list):
+        return {"error": "ids must be a list of history entry ids"}, 400
+
+    entry_ids = []
+    for raw_id in raw_ids:
+        try:
+            entry_id = int(raw_id)
+        except (TypeError, ValueError):
+            return {"error": "ids must contain integers"}, 400
+        if entry_id > 0 and entry_id not in entry_ids:
+            entry_ids.append(entry_id)
+
+    if not entry_ids:
+        return {"error": "No history entries were selected"}, 400
+
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        entries = [mqtt.history.get_entry(entry_id) for entry_id in entry_ids]
+        active = [entry for entry in entries if entry and entry.get("status") == "started"]
+        if active:
+            return {"error": "Cannot delete an in-progress history entry"}, 409
+        deleted = mqtt.history.delete_entries(entry_ids)
+
+    return {
+        "status": "ok",
+        "deleted": deleted,
+        "requested": len(entry_ids),
+    }
+
+
+@app.get("/api/history/<int:entry_id>/thumbnail")
+def app_api_history_thumbnail(entry_id):
+    from flask import send_file
+
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        entry = mqtt.history.get_entry(entry_id)
+        if not entry:
+            return {"error": "History entry not found"}, 404
+        thumbnail_path = mqtt.history.get_thumbnail_path(entry_id)
+        preview_url = entry.get("preview_url")
+
+    if thumbnail_path:
+        response = send_file(
+            thumbnail_path,
+            mimetype="image/png",
+            as_attachment=False,
+            download_name=os.path.basename(thumbnail_path),
+        )
+        response.headers["Cache-Control"] = "private, max-age=600"
+        return response
+
+    if preview_url:
+        return _proxy_preview_image_response(preview_url)
+
+    return {"error": "Thumbnail not available for this history entry"}, 404
+
+
+@app.post("/api/history/<int:entry_id>/reprint")
+def app_api_history_reprint(entry_id):
+    user_name = request.headers.get("User-Agent", "ankerctl").split(url_for('app_root'))[0]
+    printer_index = app.config.get("printer_index", 0)
+
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        if mqtt.is_printing or mqtt.has_pending_print_start or mqtt.is_preparing_print:
+            return {"error": "Printer is already busy with another print job"}, 409
+        entry = mqtt.history.get_entry(entry_id)
+        if not entry:
+            return {"error": "History entry not found"}, 404
+        archive_path = mqtt.history.get_archive_path(entry_id)
+        if not archive_path:
+            return {"error": "No archived GCode is available for this history entry"}, 404
+
+    with app.config["config"].open() as cfg:
+        rate_limit_mbps, rate_limit_source = cli.util.resolve_upload_rate_mbps_with_source(cfg)
+
+    with open(archive_path, "rb") as fh:
+        archive_bytes = fh.read()
+
+    with app.svc.borrow("filetransfer") as ft:
+        if not ft:
+            return {"error": "File transfer service unavailable"}, 503
+        try:
+            ft.send_bytes(
+                archive_bytes,
+                entry["filename"],
+                user_name,
+                rate_limit_mbps=rate_limit_mbps,
+                start_print=True,
+                printer_index=printer_index,
+                archive_info={
+                    "archive_relpath": entry.get("archive_relpath"),
+                    "archive_size": entry.get("archive_size"),
+                },
+            )
+        except ConnectionError as exc:
+            log.error(f"History reprint connection error: {exc}")
+            return {"error": str(exc)}, 503
+
+    return {
+        "status": "ok",
+        "name": entry["filename"],
+        "upload_rate_mbps": rate_limit_mbps,
+        "upload_rate_source": rate_limit_source,
+    }
 
 
 @app.get("/api/filaments")
@@ -2740,6 +3167,14 @@ def register_services(app):
         svc.start()
 
 
+@app.get("/api/console/logs")
+def app_api_console_logs():
+    buffer = _get_console_log_buffer()
+    limit = max(1, min(request.args.get("limit", 200, type=int), 1000))
+    after_id = request.args.get("after", default=None, type=int)
+    return buffer.snapshot(limit=limit, after_id=after_id)
+
+
 def webserver(config, printer_index, host, port, insecure=False, **kwargs):
     """
     Starts the Flask webserver
@@ -2753,6 +3188,8 @@ def webserver(config, printer_index, host, port, insecure=False, **kwargs):
     Returns:
         - None
     """
+    _get_console_log_buffer()
+
     # Filament profile store — initialized once at startup
     config_root = config.config_root
     app.filaments = FilamentStore(db_path=str(config_root / "filament.db"))
@@ -2970,6 +3407,7 @@ def add_security_headers(response):
 # and therefore require auth even though they are GET requests.
 _PROTECTED_GET_PATHS = {
     "/api/ankerctl/server/reload",
+    "/api/console/logs",
     "/api/debug/state",
     "/api/debug/logs",
     "/api/debug/services",

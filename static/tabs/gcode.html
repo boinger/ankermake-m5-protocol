@@ -20,7 +20,8 @@
                                     </button>
                                 </div>
                                 <div class="form-text">Upload a <code>.gcode</code> file as a print job via the same file-transfer
-                                    path used by slicers.</div>
+                                    path used by slicers. Uploads go to printer storage. Use the section below to browse
+                                    and print files that are already on a thumb drive.</div>
                             </div>
                         </div>
                         <!-- Custom GCode (secondary, collapsible) -->
@@ -50,6 +51,45 @@
                                 <pre id="gcode-log" class="bg-dark text-light p-2 rounded font-monospace small"
                                     style="max-height: 400px; overflow-y: auto; min-height: 200px;"></pre>
                             </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-8 offset-lg-2">
+                <div class="card">
+                    <div class="card-header fs-6">
+                        Stored Printer Files
+                    </div>
+                    <div class="card-body">
+                        <div class="row g-3 align-items-end mb-3">
+                            <div class="col-md-6">
+                                <label for="gcode-storage-source" class="form-label fw-semibold">
+                                    {{ macro.bi_icon("folder2-open") }} Print Source
+                                </label>
+                                <select class="form-select" id="gcode-storage-source">
+                                    <option value="onboard">Printer Storage</option>
+                                    <option value="usb" selected>Thumb Drive</option>
+                                </select>
+                            </div>
+                            <div class="col-md-6">
+                                <button class="btn btn-outline-secondary w-100" id="gcode-storage-refresh" type="button">
+                                    {{ macro.bi_icon("arrow-clockwise") }} Refresh File List
+                                </button>
+                            </div>
+                        </div>
+                        <div class="form-text mb-3">
+                            Browse GCode files already stored on printer storage or an attached thumb drive.
+                            The first file is selected automatically after a refresh, and you can click any other file before starting it.
+                        </div>
+                        <div class="small text-muted mb-2" id="gcode-storage-status">Choose a source and refresh to browse files.</div>
+                        <div id="gcode-storage-selected" class="alert alert-secondary py-2 small mb-3" style="display:none;"></div>
+                        <div class="d-grid mb-3">
+                            <button class="btn btn-primary" id="gcode-storage-print" type="button" disabled>
+                                {{ macro.bi_icon("play-fill") }} Print Selected File
+                            </button>
+                        </div>
+                        <div class="list-group" id="gcode-storage-list">
+                            <div class="list-group-item text-muted small">No storage files loaded yet.</div>
                         </div>
                     </div>
                 </div>

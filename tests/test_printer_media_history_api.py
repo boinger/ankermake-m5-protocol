@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from cli.model import Account, Config, Printer
 from web import app
+from web.service.history import PrintHistory
 
 
 API_KEY = "secret-key-123456"
@@ -63,7 +64,7 @@ def _base_config():
     )
 
 
-def _install_app_state(*, mqtt=None, videoqueue=None, config=None, login=True, video_supported=True, unsupported=False):
+def _install_app_state(*, mqtt=None, videoqueue=None, filetransfer=None, config=None, login=True, video_supported=True, unsupported=False):
     old_values = {
         "config": app.config.get("config"),
         "api_key": app.config.get("api_key"),
@@ -80,7 +81,7 @@ def _install_app_state(*, mqtt=None, videoqueue=None, config=None, login=True, v
     app.config["printer_index"] = 0
     app.config["video_supported"] = video_supported
     app.config["unsupported_device"] = unsupported
-    app.svc = FakeServices(mqttqueue=mqtt, videoqueue=videoqueue)
+    app.svc = FakeServices(mqttqueue=mqtt, videoqueue=videoqueue, filetransfer=filetransfer)
 
     return old_values, old_svc
 
@@ -189,6 +190,178 @@ def test_printer_control_and_autolevel_routes_validate_and_dispatch():
     assert home_calls == ["xy"]
 
 
+def test_printer_storage_file_list_route_returns_files_and_validates_input(monkeypatch):
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=SimpleNamespace())
+    calls = []
+
+    def fake_probe(source="onboard", source_value=None, timeout=5.0, collect_window=1.0):
+        calls.append((source, source_value, timeout, collect_window))
+        files = [{
+            "name": "cube.gcode" if source == "onboard" else "usb-part.gcode",
+            "path": "/usr/data/local/model/cube.gcode" if source == "onboard" else "/tmp/udisk/udisk1/usb-part.gcode",
+            "timestamp": 123,
+            "source": source,
+        }]
+        return ({
+            "source_value": 1 if source == "onboard" else 0,
+            "reply_count": 1,
+            "files": files,
+            "replies": [{"commandType": 1009, "reply": 0}],
+        }, None)
+
+    monkeypatch.setattr("web._probe_printer_storage_files", fake_probe)
+
+    try:
+        onboard = client.get("/api/files/printer?source=onboard", headers={"X-Api-Key": API_KEY})
+        usb = client.get("/api/files/printer?source=usb", headers={"X-Api-Key": API_KEY})
+        bad_value = client.get("/api/files/printer?value=abc", headers={"X-Api-Key": API_KEY})
+        bad_source = client.get("/api/files/printer?source=cloud", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert onboard.status_code == 200
+    assert onboard.get_json()["source"] == "onboard"
+    assert onboard.get_json()["files"][0]["path"] == "/usr/data/local/model/cube.gcode"
+    assert "/api/files/printer/thumbnail" in onboard.get_json()["files"][0]["thumbnail_url"]
+    assert usb.status_code == 200
+    assert usb.get_json()["source"] == "usb"
+    assert usb.get_json()["files"][0]["path"] == "/tmp/udisk/udisk1/usb-part.gcode"
+    assert bad_value.status_code == 400
+    assert bad_source.status_code == 400
+    assert calls == [
+        ("onboard", None, 5.0, 1.0),
+        ("usb", None, 5.0, 1.0),
+    ]
+
+
+def test_printer_storage_thumbnail_route_fetches_preview_url(monkeypatch):
+    mqtt = SimpleNamespace(
+        is_printing=False,
+        has_pending_print_start=False,
+        is_preparing_print=False,
+        get_cached_stored_file_preview_url=lambda path: None,
+        get_stored_file_preview_url=lambda path, allow_probe=True: "https://example.test/storage-thumb.png",
+    )
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+    captured = []
+    monkeypatch.setattr(
+        "web._fetch_remote_image",
+        lambda url, timeout=10.0: (captured.append(url) or (b"png-bytes", "image/png")),
+    )
+
+    try:
+        response = client.get(
+            "/api/files/printer/thumbnail?source=usb&path=/tmp/udisk/udisk1/file.gcode",
+            headers={"X-Api-Key": API_KEY},
+        )
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 200
+    assert response.data == b"png-bytes"
+    assert response.mimetype == "image/png"
+    assert captured == ["https://example.test/storage-thumb.png"]
+
+
+def test_printer_storage_file_list_route_surfaces_probe_errors(monkeypatch):
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=SimpleNamespace())
+    monkeypatch.setattr(
+        "web._probe_printer_storage_files",
+        lambda source="onboard", source_value=None, timeout=5.0, collect_window=1.0: (
+            None,
+            ({"error": "No response from printer for storage source 'usb'"}, 504),
+        ),
+    )
+
+    try:
+        response = client.get("/api/files/printer?source=usb", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 504
+    assert "No response from printer" in response.get_json()["error"]
+
+
+def test_printer_storage_print_route_validates_dispatches_and_blocks_when_busy():
+    start_calls = []
+    mqtt = SimpleNamespace(
+        is_printing=False,
+        has_pending_print_start=False,
+        is_preparing_print=False,
+        start_stored_file=lambda path: (start_calls.append(path) or True),
+    )
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+
+    try:
+        usb = client.post(
+            "/api/files/printer/print",
+            json={"source": "usb", "path": "/tmp/udisk/udisk1/Top parts 5h_PETG_M5 grey.gcode"},
+            headers={"X-Api-Key": API_KEY},
+        )
+        onboard = client.post(
+            "/api/files/printer/print",
+            json={"source": "onboard", "path": "/usr/data/local/model/AnkerMake Model/Autodesk_Kickstarter_Geometry.gcode"},
+            headers={"X-Api-Key": API_KEY},
+        )
+        bad_source = client.post(
+            "/api/files/printer/print",
+            json={"source": "cloud", "path": "/tmp/udisk/udisk1/file.gcode"},
+            headers={"X-Api-Key": API_KEY},
+        )
+        mismatched = client.post(
+            "/api/files/printer/print",
+            json={"source": "usb", "path": "/usr/data/local/model/model.gcode"},
+            headers={"X-Api-Key": API_KEY},
+        )
+        mqtt.is_printing = True
+        busy = client.post(
+            "/api/files/printer/print",
+            json={"source": "usb", "path": "/tmp/udisk/udisk1/another.gcode"},
+            headers={"X-Api-Key": API_KEY},
+        )
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert usb.status_code == 200
+    assert usb.get_json()["source"] == "usb"
+    assert onboard.status_code == 200
+    assert onboard.get_json()["source"] == "onboard"
+    assert bad_source.status_code == 400
+    assert mismatched.status_code == 400
+    assert busy.status_code == 409
+    assert start_calls == [
+        "/tmp/udisk/udisk1/Top parts 5h_PETG_M5 grey.gcode",
+        "/usr/data/local/model/AnkerMake Model/Autodesk_Kickstarter_Geometry.gcode",
+    ]
+
+
+def test_printer_storage_print_route_returns_error_when_printer_never_confirms_start():
+    mqtt = SimpleNamespace(
+        is_printing=False,
+        has_pending_print_start=False,
+        is_preparing_print=False,
+        start_stored_file=lambda path: False,
+    )
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+
+    try:
+        response = client.post(
+            "/api/files/printer/print",
+            json={"source": "usb", "path": "/tmp/udisk/udisk1/Top parts 5h_PETG_M5 grey.gcode"},
+            headers={"X-Api-Key": API_KEY},
+        )
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 504
+    assert "did not confirm the job start" in response.get_json()["error"]
+
+
 def test_printer_z_offset_routes_refresh_set_and_nudge():
     send_calls = []
     state = {"available": True, "steps": 12, "mm": 0.12, "source": "cached", "seq": 1}
@@ -262,8 +435,179 @@ def test_history_routes_require_auth_and_clear_entries():
     assert unauthorized.status_code == 401
     assert authorized.status_code == 200
     assert authorized.get_json()["total"] == 3
+    assert authorized.get_json()["entries"][0]["thumbnail_url"] is None
     assert cleared.status_code == 200
     assert calls == [("get", 500, 0), ("clear",)]
+
+
+def test_history_delete_selected_route_deletes_finished_entries(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+    first_id = history.record_start("one.gcode")
+    second_id = history.record_start("two.gcode")
+    history.record_finish(filename="two.gcode")
+    history.record_finish(filename="one.gcode")
+    mqtt = SimpleNamespace(history=history)
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+
+    try:
+        response = client.post(
+            "/api/history/delete",
+            json={"ids": [first_id]},
+            headers={"X-Api-Key": API_KEY},
+        )
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 200
+    assert response.get_json()["deleted"] == 1
+    assert history.get_entry(first_id) is None
+    assert history.get_entry(second_id) is not None
+
+
+def test_history_delete_selected_route_rejects_active_entries(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+    entry_id = history.record_start("active.gcode")
+    mqtt = SimpleNamespace(history=history)
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+
+    try:
+        response = client.post(
+            "/api/history/delete",
+            json={"ids": [entry_id]},
+            headers={"X-Api-Key": API_KEY},
+        )
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 409
+    assert "in-progress" in response.get_json()["error"]
+
+
+def test_history_thumbnail_route_serves_local_archive_thumbnail(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+    archive_info = history.archive_upload(
+        "cube.gcode",
+        (
+            b"; thumbnail begin 32x32 10\n"
+            b"; iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5ZQAAAAASUVORK5CYII=\n"
+            b"; thumbnail end\n"
+            b"G28\n"
+        ),
+    )
+    entry_id = history.record_start(
+        "cube.gcode",
+        archive_relpath=archive_info["archive_relpath"],
+        archive_size=archive_info["archive_size"],
+    )
+    history.record_finish(filename="cube.gcode")
+    mqtt = SimpleNamespace(history=history)
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+
+    try:
+        history_resp = client.get("/api/history", headers={"X-Api-Key": API_KEY})
+        thumb_resp = client.get(f"/api/history/{entry_id}/thumbnail", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert history_resp.status_code == 200
+    assert history_resp.get_json()["entries"][0]["thumbnail_url"].endswith(f"/api/history/{entry_id}/thumbnail")
+    assert thumb_resp.status_code == 200
+    assert thumb_resp.mimetype == "image/png"
+    assert thumb_resp.data.startswith(b"\x89PNG")
+
+
+def test_history_thumbnail_route_proxies_preview_url_when_no_local_thumbnail(monkeypatch, tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+    entry_id = history.record_start(
+        "usb-file.gcode",
+        preview_url="https://example.test/history-thumb.png",
+    )
+    history.record_finish(filename="usb-file.gcode")
+    mqtt = SimpleNamespace(history=history)
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+    captured = []
+    monkeypatch.setattr(
+        "web._fetch_remote_image",
+        lambda url, timeout=10.0: (captured.append(url) or (b"history-thumb", "image/jpeg")),
+    )
+
+    try:
+        response = client.get(f"/api/history/{entry_id}/thumbnail", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 200
+    assert response.data == b"history-thumb"
+    assert response.mimetype == "image/jpeg"
+    assert captured == ["https://example.test/history-thumb.png"]
+
+
+def test_history_reprint_route_dispatches_archived_upload_and_validates_busy(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+    archive_info = history.archive_upload("cube.gcode", b"G28\nM104 S200\n")
+    entry_id = history.record_start(
+        "cube.gcode",
+        archive_relpath=archive_info["archive_relpath"],
+        archive_size=archive_info["archive_size"],
+    )
+    history.record_finish(filename="cube.gcode")
+
+    upload_calls = []
+    mqtt = SimpleNamespace(
+        is_printing=False,
+        has_pending_print_start=False,
+        is_preparing_print=False,
+        history=history,
+    )
+    filetransfer = SimpleNamespace(
+        send_bytes=lambda *args, **kwargs: upload_calls.append((args, kwargs)),
+    )
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt, filetransfer=filetransfer)
+
+    try:
+        ok = client.post(f"/api/history/{entry_id}/reprint", headers={"X-Api-Key": API_KEY})
+        missing = client.post("/api/history/99999/reprint", headers={"X-Api-Key": API_KEY})
+        mqtt.is_printing = True
+        busy = client.post(f"/api/history/{entry_id}/reprint", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert ok.status_code == 200
+    assert ok.get_json()["name"] == "cube.gcode"
+    assert missing.status_code == 404
+    assert busy.status_code == 409
+    assert len(upload_calls) == 1
+    args, kwargs = upload_calls[0]
+    assert args[1] == "cube.gcode"
+    assert kwargs["start_print"] is True
+    assert kwargs["archive_info"]["archive_relpath"] == archive_info["archive_relpath"]
+
+
+def test_history_reprint_route_requires_archived_file(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+    entry_id = history.record_start("usb-file.gcode")
+    history.record_finish(filename="usb-file.gcode")
+    mqtt = SimpleNamespace(
+        is_printing=False,
+        has_pending_print_start=False,
+        is_preparing_print=False,
+        history=history,
+    )
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt, filetransfer=SimpleNamespace(send_bytes=lambda *args, **kwargs: None))
+
+    try:
+        response = client.post(f"/api/history/{entry_id}/reprint", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 404
+    assert "No archived GCode" in response.get_json()["error"]
 
 
 def test_timelapse_routes_list_download_delete_and_reject_traversal(tmp_path):

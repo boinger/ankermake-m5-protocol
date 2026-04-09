@@ -37,6 +37,25 @@ class FileTransferService(Service):
 
     def send_file(self, fd, user_name, rate_limit_mbps=None, start_print=True, printer_index=None):
         raw = fd.read()
+        return self.send_bytes(
+            raw,
+            fd.filename,
+            user_name,
+            rate_limit_mbps=rate_limit_mbps,
+            start_print=start_print,
+            printer_index=printer_index,
+        )
+
+    def send_bytes(
+        self,
+        raw,
+        filename,
+        user_name,
+        rate_limit_mbps=None,
+        start_print=True,
+        printer_index=None,
+        archive_info=None,
+    ):
         layer_count = extract_layer_count(raw)
         data = patch_gcode_time(raw)
         start_print_flag = bool(start_print)
@@ -55,9 +74,17 @@ class FileTransferService(Service):
         except Exception:
             pass
         file_uuid = uuid.uuid4().hex.upper()
-        fui = FileUploadInfo.from_data(data, fd.filename, user_name=user_name, user_id=user_id, machine_id=file_uuid)
+        fui = FileUploadInfo.from_data(data, filename, user_name=user_name, user_id=user_id, machine_id=file_uuid)
         log.info(f"Going to upload {fui.size} bytes as {fui.name!r}")
         upload_name = fui.name
+        if start_print_flag and archive_info is None:
+            try:
+                with borrow_mqtt(printer_index) as mqtt:
+                    history = getattr(mqtt, "history", None)
+                    if history and hasattr(history, "archive_upload"):
+                        archive_info = history.archive_upload(upload_name, data)
+            except Exception as e:
+                log.warning(f"Could not archive uploaded GCode locally: {e}")
         self._notify_upload({"status": "start", "name": upload_name, "size": fui.size, "start_print": start_print_flag})
         if rate_limit_mbps:
             log.info(f"Using upload rate limit: {rate_limit_mbps} Mbps")
@@ -102,7 +129,10 @@ class FileTransferService(Service):
                 api.aabb_request(b"", frametype=FileTransfer.END, timeout=15.0)
                 try:
                     with borrow_mqtt(printer_index) as mqtt:
-                        mqtt.mark_pending_print_start(upload_name)
+                        try:
+                            mqtt.mark_pending_print_start(upload_name, archive_info=archive_info)
+                        except TypeError:
+                            mqtt.mark_pending_print_start(upload_name)
                 except Exception as e:
                     log.warning(f"Could not mark pending print start in mqttqueue: {e}")
             else:

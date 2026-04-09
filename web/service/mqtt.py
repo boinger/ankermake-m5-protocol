@@ -53,7 +53,25 @@ MQTT_PRINT_STATE_LABELS = {
     8: "preparing_or_aborted",
 }
 
+FILAMENT_STATE_LABELS = {
+    "unknown": "Unknown",
+    "loaded": "Loaded",
+    "changing": "Changing",
+    "not_loaded": "Not Loaded",
+}
+
+FILAMENT_RUNOUT_ERROR_CODE = "0xFF01030001"
+
 G28_DEDUPE_WINDOW_SEC = 10.0
+STORED_FILE_SELECTION_TIMEOUT_SEC = 2.0
+STORED_FILE_START_CONFIRM_TIMEOUT_SEC = 12.0
+STORED_FILE_ONBOARD_START_CONFIRM_TIMEOUT_SEC = 20.0
+STORED_FILE_LIST_PAGE_SIZE = 47
+STORED_FILE_SOURCE_ROOTS = (
+    "/tmp/udisk/",
+    "/usr/data/local/model/",
+)
+STORED_FILE_TMPMODEL_ROOT = "/usr/data/local/tmpmodel/"
 HOME_MOVE_ZERO_VALUE_BY_AXIS = {
     "xy": 0,
     "z": 2,
@@ -88,9 +106,11 @@ class MqttQueue(Service):
         printer_sn = None
         printer_name = None
         self._control_username = None
+        self._control_user_id = None
         with app.config["config"].open() as cfg:
             if cfg and getattr(cfg, "account", None):
                 self._control_username = getattr(cfg.account, "email", None)
+                self._control_user_id = getattr(cfg.account, "user_id", None)
             if cfg and cfg.printers:
                 printer = cfg.printers[self.printer_index]
                 printer_sn = getattr(printer, "sn", None)
@@ -109,6 +129,18 @@ class MqttQueue(Service):
         self._z_offset_updated_at = 0.0
         self._z_offset_seq = 0
         self._z_offset_cond = threading.Condition()
+        self._filament_state = "unknown"
+        self._filament_change_value = None
+        self._filament_change_progress = None
+        self._filament_change_step_len = None
+        self._stored_file_selection_cond = threading.Condition(self._state_lock)
+        self._stored_file_preview_request_lock = threading.Lock()
+        self._stored_file_preview_cache = {}
+        self._stored_file_preview_seq = 0
+        self._last_selected_storage_file_path = None
+        self._last_selected_storage_file_name = None
+        self._pending_stored_file_path = None
+        self._preview_file_path = None
         self._last_g28_command = None
         self._last_g28_command_at = 0.0
 
@@ -137,8 +169,15 @@ class MqttQueue(Service):
         self._last_task_id = None
         self._failure_sent = False
         self._preview_url = None
+        self._preview_file_path = None
         self._pending_history_start = False
         self._stop_requested = False
+        self._pending_archive_info = None
+        self._pending_stored_file_path = None
+        self._last_selected_storage_file_path = None
+        self._last_selected_storage_file_name = None
+        self._last_print_schedule_filename = None
+        self._last_print_schedule_seen_at = 0.0
         # Preserve debug setting across resets if possible, but init here if missing
         if not hasattr(self, "_debug_log_payloads"):
              self._debug_log_payloads = False
@@ -186,7 +225,14 @@ class MqttQueue(Service):
         effective_filename = filename or self._last_filename
 
         if effective_filename:
-            self._history.record_start(effective_filename, task_id=self._last_task_id)
+            archive_info = self._claim_pending_archive_info(effective_filename)
+            record_kwargs = {"task_id": self._last_task_id}
+            if archive_info:
+                record_kwargs["archive_relpath"] = archive_info.get("archive_relpath")
+                record_kwargs["archive_size"] = archive_info.get("archive_size")
+            if self._preview_url:
+                record_kwargs["preview_url"] = self._preview_url
+            self._history.record_start(effective_filename, **record_kwargs)
             self._pending_history_start = False
             log.info(f"Print started, filename={effective_filename!r}")
             self._timelapse.start_capture(effective_filename)
@@ -202,7 +248,14 @@ class MqttQueue(Service):
     def _complete_deferred_print_start(self):
         """Record and start helpers when filename arrives after print activation."""
         if self._state == PrintState.PRINTING and self._pending_history_start and self._last_filename:
-            self._history.record_start(self._last_filename, task_id=self._last_task_id)
+            archive_info = self._claim_pending_archive_info(self._last_filename)
+            record_kwargs = {"task_id": self._last_task_id}
+            if archive_info:
+                record_kwargs["archive_relpath"] = archive_info.get("archive_relpath")
+                record_kwargs["archive_size"] = archive_info.get("archive_size")
+            if self._preview_url:
+                record_kwargs["preview_url"] = self._preview_url
+            self._history.record_start(self._last_filename, **record_kwargs)
             self._timelapse.start_capture(self._last_filename)
             self._pending_history_start = False
             log.info(f"Print start completed after filename arrived, filename={self._last_filename!r}")
@@ -261,15 +314,242 @@ class MqttQueue(Service):
     def request_status(self):
         self._send_status_query()
 
-    def mark_pending_print_start(self, filename=None, task_id=None):
+    def _claim_pending_archive_info(self, filename=None):
+        archive_info = getattr(self, "_pending_archive_info", None)
+        if not archive_info:
+            return None
+        expected_name = os.path.basename(str(archive_info.get("filename") or ""))
+        target_name = os.path.basename(str(filename or ""))
+        if expected_name and target_name and expected_name != target_name:
+            return None
+        self._pending_archive_info = None
+        return archive_info
+
+    def mark_pending_print_start(self, filename=None, task_id=None, archive_info=None):
         with self._state_lock:
             if filename:
                 self._last_filename = filename
             if task_id:
                 self._last_task_id = task_id
+            if archive_info and archive_info.get("archive_relpath"):
+                self._pending_archive_info = {
+                    "filename": filename,
+                    "archive_relpath": archive_info.get("archive_relpath"),
+                    "archive_size": archive_info.get("archive_size"),
+                }
             self._state = PrintState.PREPARING
             self._stop_requested = False
         log.info("Marked pending print start for %r", self._last_filename)
+
+    def _ensure_stored_file_selection_state(self):
+        if not hasattr(self, "_stored_file_selection_cond"):
+            self._stored_file_selection_cond = threading.Condition(self._state_lock)
+        if not hasattr(self, "_last_selected_storage_file_path"):
+            self._last_selected_storage_file_path = None
+        if not hasattr(self, "_last_selected_storage_file_name"):
+            self._last_selected_storage_file_name = None
+        if not hasattr(self, "_pending_stored_file_path"):
+            self._pending_stored_file_path = None
+        if not hasattr(self, "_stored_file_preview_request_lock"):
+            self._stored_file_preview_request_lock = threading.Lock()
+        if not hasattr(self, "_stored_file_preview_cache"):
+            self._stored_file_preview_cache = {}
+        if not hasattr(self, "_stored_file_preview_seq"):
+            self._stored_file_preview_seq = 0
+
+    @staticmethod
+    def _is_stored_file_source_path(file_path):
+        file_path = str(file_path or "")
+        return any(file_path.startswith(root) for root in STORED_FILE_SOURCE_ROOTS)
+
+    @staticmethod
+    def _is_tmpmodel_path(file_path):
+        return str(file_path or "").startswith(STORED_FILE_TMPMODEL_ROOT)
+
+    @classmethod
+    def _is_preprint_preview_path(cls, file_path):
+        file_path = str(file_path or "")
+        return cls._is_tmpmodel_path(file_path) or (
+            file_path.startswith("/tmp/")
+            and not file_path.startswith("/tmp/udisk/")
+        )
+
+    def _note_stored_file_selection(self, *, file_path=None, file_name=None):
+        self._ensure_stored_file_selection_state()
+        with self._stored_file_selection_cond:
+            if file_path and self._is_stored_file_source_path(file_path):
+                self._last_selected_storage_file_path = file_path
+            if file_name:
+                self._last_selected_storage_file_name = str(file_name)
+            self._stored_file_selection_cond.notify_all()
+
+    def _await_stored_file_selection(self, file_path, timeout_sec=STORED_FILE_SELECTION_TIMEOUT_SEC):
+        self._ensure_stored_file_selection_state()
+        file_path = str(file_path or "").strip()
+        if not file_path:
+            return False
+
+        def selection_ready():
+            return self._last_selected_storage_file_path == file_path
+
+        with self._stored_file_selection_cond:
+            if selection_ready():
+                return True
+            self._stored_file_selection_cond.wait_for(selection_ready, timeout=timeout_sec)
+            return selection_ready()
+
+    def _cache_stored_file_preview(self, file_path, preview_url):
+        self._ensure_stored_file_selection_state()
+        file_path = str(file_path or "").strip()
+        preview_url = str(preview_url or "").strip()
+        if not file_path or not preview_url:
+            return
+        with self._stored_file_selection_cond:
+            self._stored_file_preview_seq += 1
+            self._stored_file_preview_cache[file_path] = {
+                "url": preview_url,
+                "seq": self._stored_file_preview_seq,
+            }
+            self._stored_file_selection_cond.notify_all()
+
+    def get_cached_stored_file_preview_url(self, file_path):
+        self._ensure_stored_file_selection_state()
+        file_path = str(file_path or "").strip()
+        if not file_path:
+            return None
+        with self._stored_file_selection_cond:
+            cached = self._stored_file_preview_cache.get(file_path) or {}
+            return cached.get("url")
+
+    def get_stored_file_preview_url(self, file_path, timeout_sec=2.5, allow_probe=True):
+        self._ensure_stored_file_selection_state()
+        file_path = str(file_path or "").strip()
+        if not file_path:
+            raise ValueError("Stored file path is required")
+
+        cached_url = self.get_cached_stored_file_preview_url(file_path)
+        if cached_url or not allow_probe:
+            return cached_url
+
+        with self._stored_file_preview_request_lock:
+            cached_url = self.get_cached_stored_file_preview_url(file_path)
+            if cached_url:
+                return cached_url
+
+            with self._stored_file_selection_cond:
+                baseline_seq = self._stored_file_preview_seq
+
+            self.client.command(self._build_stored_file_list_request_payload(file_path))
+            time.sleep(0.12)
+            self.client.command(self._build_stored_file_request_payload(file_path))
+
+            def preview_ready():
+                cached = self._stored_file_preview_cache.get(file_path) or {}
+                return bool(cached.get("url")) and cached.get("seq", 0) > baseline_seq
+
+            with self._stored_file_selection_cond:
+                if not preview_ready():
+                    self._stored_file_selection_cond.wait_for(preview_ready, timeout=timeout_sec)
+                cached = self._stored_file_preview_cache.get(file_path) or {}
+                return cached.get("url")
+
+    def _send_start_print_control(self):
+        nested_data = {"value": 0}
+        if self._control_username:
+            nested_data["userName"] = self._control_username
+        self.client.command({
+            "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
+            "data": nested_data,
+        })
+        self.client.command({
+            "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
+            "value": 0,
+        })
+
+    @staticmethod
+    def _derive_control_display_name(value):
+        value = str(value or "").strip()
+        if not value:
+            return None
+        if "@" in value:
+            local_part = value.split("@", 1)[0].strip()
+            if local_part:
+                return local_part
+        return value
+
+    def _build_stored_file_request_payload(self, file_path):
+        payload = {
+            "commandType": MqttMsgType.ZZ_MQTT_CMD_GCODE_FILE_REQUEST.value,
+            "filePath": file_path,
+            "type": 0,
+        }
+        if self._control_user_id:
+            payload["userId"] = self._control_user_id
+        return payload
+
+    def _build_stored_file_list_request_payload(self, file_path):
+        source = cli.mqtt.infer_storage_source_from_path(file_path)
+        value = cli.mqtt.mqtt_file_list_source_value(source=source or "onboard")
+        payload = {
+            "commandType": MqttMsgType.ZZ_MQTT_CMD_FILE_LIST_REQUEST.value,
+            "value": value,
+            "isFirst": 1,
+            "index": 1,
+            "num": STORED_FILE_LIST_PAGE_SIZE,
+        }
+        if self._control_user_id:
+            payload["userId"] = self._control_user_id
+        return payload
+
+    def _send_stored_file_start_print_control(self, file_path):
+        payload = {
+            "commandType": MqttMsgType.ZZ_MQTT_CMD_PRINT_CONTROL.value,
+            "value": 1,
+            "printMode": 1,
+            "filePath": file_path,
+        }
+        display_name = self._derive_control_display_name(self._control_username)
+        if display_name:
+            payload["userName"] = display_name
+        if self._control_user_id:
+            payload["userId"] = self._control_user_id
+        self.client.command(payload)
+
+    @staticmethod
+    def _stored_file_start_timeout_sec(file_path):
+        file_path = str(file_path or "")
+        if file_path.startswith("/usr/data/local/model/"):
+            return STORED_FILE_ONBOARD_START_CONFIRM_TIMEOUT_SEC
+        return STORED_FILE_START_CONFIRM_TIMEOUT_SEC
+
+    def _stored_file_start_confirmed(self, file_path=None):
+        target_name = os.path.basename(str(file_path or "")) or None
+        with self._state_lock:
+            preview_path = getattr(self, "_preview_file_path", None)
+            preview_name = os.path.basename(preview_path) if preview_path else None
+            schedule_name = getattr(self, "_last_print_schedule_filename", None)
+            return (
+                self._state in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED)
+                or self.is_preparing_print
+                or (target_name is not None and schedule_name == target_name)
+                or (
+                    preview_path
+                    and self._is_preprint_preview_path(preview_path)
+                    and (target_name is None or preview_name == target_name)
+                )
+            )
+
+    def _await_stored_file_start_confirmation(
+        self,
+        file_path,
+        timeout_sec=STORED_FILE_START_CONFIRM_TIMEOUT_SEC,
+    ):
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if self._stored_file_start_confirmed(file_path):
+                return True
+            time.sleep(0.1)
+        return self._stored_file_start_confirmed(file_path)
 
     @staticmethod
     def _extract_z_offset_steps(payload):
@@ -543,6 +823,58 @@ class MqttQueue(Service):
                 return value.strip().lower()
         return None
 
+    @staticmethod
+    def _normalize_filament_state(payload):
+        if not isinstance(payload, dict):
+            return "unknown"
+
+        value = MqttQueue._safe_int(payload.get("value"))
+        progress = MqttQueue._safe_int(payload.get("progress"))
+        if "stepLen" in payload:
+            step_len_raw = payload.get("stepLen")
+        else:
+            step_len_raw = payload.get("step_len")
+        step_len = MqttQueue._safe_int(step_len_raw)
+
+        if value == 0:
+            return "loaded"
+        # Firmware exposes filament change mode more clearly than a strict
+        # "filament present" sensor. Treat any active movement/progress as
+        # a changing state, and the idle 0/0/0 mode as loaded/ready.
+        if (progress is not None and progress > 0) or (step_len is not None and step_len > 0):
+            return "changing"
+        if value is None:
+            return "unknown"
+        return "changing"
+
+    def _update_filament_state(self, payload):
+        if not isinstance(payload, dict):
+            return
+        command_type = payload.get("commandType")
+
+        if command_type == MqttMsgType.ZZ_MQTT_CMD_ENTER_OR_QUIT_MATERIEL:
+            self._filament_change_value = self._safe_int(payload.get("value"))
+            self._filament_change_progress = self._safe_int(payload.get("progress"))
+            if "stepLen" in payload:
+                step_len_raw = payload.get("stepLen")
+            else:
+                step_len_raw = payload.get("step_len")
+            self._filament_change_step_len = self._safe_int(step_len_raw)
+            self._filament_state = self._normalize_filament_state(payload)
+            return
+
+        if command_type == 1085 and str(payload.get("errorCode") or "") == FILAMENT_RUNOUT_ERROR_CODE:
+            self._filament_state = "not_loaded"
+            return
+
+        if (
+            command_type == MqttMsgType.ZZ_MQTT_CMD_EVENT_NOTIFY
+            and self._safe_int(payload.get("subType")) == 2
+            and self._safe_int(payload.get("value")) == 6
+        ):
+            self._filament_state = "not_loaded"
+            return
+
     def _forward_to_ha(self, payload):
         """Update cached MQTT state and forward relevant data to Home Assistant."""
         if not isinstance(payload, dict):
@@ -550,6 +882,8 @@ class MqttQueue(Service):
 
         command_type = payload.get("commandType")
         ha_updates = {}
+
+        self._update_filament_state(payload)
 
         # Nozzle temperature (command 1003 = 0x03eb)
         if command_type == MqttMsgType.ZZ_MQTT_CMD_NOZZLE_TEMP:
@@ -626,23 +960,37 @@ class MqttQueue(Service):
             return
 
         command_type = payload.get("commandType")
+        self._update_filament_state(payload)
         preview_url = self._extract_preview_url(payload)
         if preview_url:
             self._preview_url = preview_url
 
-        # --- commandType 1044: file upload started, capture filename ---
+        if command_type == MqttMsgType.ZZ_MQTT_CMD_GCODE_FILE_REQUEST.value and payload.get("reply") == 0:
+            self._note_stored_file_selection(file_name=payload.get("fileName"))
+
+        # --- commandType 1044: preview image or staged tmpmodel update ---
         if command_type == 1044:
             file_path = payload.get("filePath", "")
             if file_path:
+                self._preview_file_path = file_path
                 self._last_filename = os.path.basename(file_path)
                 log.info(f"History: captured filename from ct 1044: {self._last_filename}")
+                if preview_url:
+                    self._cache_stored_file_preview(file_path, preview_url)
+                self._note_stored_file_selection(file_path=file_path, file_name=self._last_filename)
+                if preview_url:
+                    self._history.update_preview_url(
+                        preview_url,
+                        filename=self._last_filename,
+                        task_id=self._last_task_id,
+                    )
             # If ct=1000 value=1 arrived before ct=1044, record the start now that we have the filename
             self._complete_deferred_print_start()
             # Activate print early so Stop sends value=4 (not the prepare-cancel path)
             # during the G28/calibration window before ct=1000 value=1 arrives.
-            # Only activate if a print was actually requested (PREPARING state),
-            # so upload-only flows are not affected.
-            if self._state == PrintState.PREPARING:
+            # Only do this for staged tmpmodel paths; source storage previews arrive
+            # during stored-file selection and should not count as an active print yet.
+            if self._is_preprint_preview_path(file_path) and (self._state == PrintState.PREPARING or self.is_preparing_print):
                 self._state = PrintState.PRE_PRINT
                 self._stop_requested = False
                 log.info("Early print activation via ct 1044")
@@ -709,7 +1057,10 @@ class MqttQueue(Service):
                     self._record_failure(payload, self._last_progress or 0, "aborted")
                     self._reset_print_state()
             elif value == 8:
-                self._state = PrintState.IDLE
+                if self._state == PrintState.PREPARING:
+                    log.info("Pending print start entered firmware prepare state (ct 1000 value=8)")
+                else:
+                    self._state = PrintState.IDLE
             log.debug(
                 "Printer state trace: ct=1000 value=%r (%s) internal=%s->%s stop_requested=%s pending_start=%s preparing=%s",
                 value,
@@ -752,6 +1103,9 @@ class MqttQueue(Service):
 
         filename = self._extract_filename(payload)
         if filename:
+            if command_type == MqttMsgType.ZZ_MQTT_CMD_PRINT_SCHEDULE:
+                self._last_print_schedule_filename = filename
+                self._last_print_schedule_seen_at = time.monotonic()
             if self._last_filename and filename != self._last_filename and self._state == PrintState.PRINTING:
                 if progress <= 1:
                     self._reset_print_state()
@@ -761,6 +1115,18 @@ class MqttQueue(Service):
             else:
                 self._last_filename = filename
             self._complete_deferred_print_start()
+
+        pending_name = os.path.basename(self._pending_stored_file_path) if self._pending_stored_file_path else None
+        if (
+            command_type == MqttMsgType.ZZ_MQTT_CMD_PRINT_SCHEDULE
+            and self._state == PrintState.PREPARING
+            and pending_name
+            and filename == pending_name
+            and progress == 0
+        ):
+            self._state = PrintState.PRE_PRINT
+            self._stop_requested = False
+            log.info("Stored file start entered pre-print state via print schedule for %r", filename)
 
         if self._last_progress is not None and progress < self._last_progress and progress <= 1:
             same_task = task_id and prev_task_id and task_id == prev_task_id
@@ -898,6 +1264,14 @@ class MqttQueue(Service):
                 "bed_target": self._bed_temp_target,
             },
             "z_offset": self.get_z_offset_state(),
+            "filament": {
+                "state": getattr(self, "_filament_state", "unknown"),
+                "label": FILAMENT_STATE_LABELS.get(getattr(self, "_filament_state", "unknown"), "Unknown"),
+                "loaded": True if getattr(self, "_filament_state", "unknown") == "loaded" else None,
+                "raw_value": getattr(self, "_filament_change_value", None),
+                "progress": getattr(self, "_filament_change_progress", None),
+                "step_len": getattr(self, "_filament_change_step_len", None),
+            },
             "debug_logging": getattr(self, "_debug_log_payloads", False),
             "timelapse": {
                 "enabled": getattr(self._timelapse, "enabled", None),
@@ -1034,6 +1408,51 @@ class MqttQueue(Service):
             "commandType": MqttMsgType.ZZ_MQTT_CMD_MOVE_ZERO.value,
             "value": value,
         })
+
+    def start_stored_file(self, file_path):
+        self._ensure_stored_file_selection_state()
+        file_path = str(file_path or "").strip()
+        if not file_path:
+            raise ValueError("Stored file path is required")
+
+        filename = os.path.basename(file_path)
+        with self._stored_file_selection_cond:
+            self._pending_stored_file_path = file_path
+            self._last_selected_storage_file_path = None
+            self._last_selected_storage_file_name = None
+        log.debug("Refreshing stored file list context for: %s", file_path)
+        self.client.command(self._build_stored_file_list_request_payload(file_path))
+        time.sleep(0.12)
+        log.debug("Selecting stored GCode file: %s", file_path)
+        self.client.command(self._build_stored_file_request_payload(file_path))
+
+        selection_ready = self._await_stored_file_selection(file_path)
+        if selection_ready:
+            log.info("Stored file selection confirmed for %s", file_path)
+        else:
+            log.warning("Stored file selection was not confirmed before start for %s", file_path)
+
+        self.mark_pending_print_start(filename)
+        log.debug("Starting selected stored GCode file: %s", filename)
+        self._send_stored_file_start_print_control(file_path)
+        timeout_sec = self._stored_file_start_timeout_sec(file_path)
+        start_confirmed = self._await_stored_file_start_confirmation(file_path, timeout_sec=timeout_sec)
+        if start_confirmed:
+            log.info("Stored file start confirmed for %s", file_path)
+        else:
+            log.warning(
+                "Printer did not confirm stored file start for %s within %.1fs",
+                file_path,
+                timeout_sec,
+            )
+            with self._state_lock:
+                if self._state == PrintState.PREPARING and not self.is_preparing_print:
+                    self._state = PrintState.IDLE
+                    self._stop_requested = False
+        with self._stored_file_selection_cond:
+            if self._pending_stored_file_path == file_path:
+                self._pending_stored_file_path = None
+        return start_confirmed
 
     def send_print_control(self, value):
         value = int(value)

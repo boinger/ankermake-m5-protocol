@@ -16,6 +16,7 @@ def _queue():
         record_start=lambda *args, **kwargs: history_calls.append(("start", args, kwargs)),
         record_finish=lambda *args, **kwargs: history_calls.append(("finish", args, kwargs)),
         record_fail=lambda *args, **kwargs: history_calls.append(("fail", args, kwargs)),
+        update_preview_url=lambda *args, **kwargs: history_calls.append(("preview", args, kwargs)),
     )
     queue._timelapse = SimpleNamespace(
         start_capture=lambda filename="unknown": timelapse_calls.append(("start", filename)),
@@ -36,7 +37,12 @@ def _queue():
     queue._nozzle_temp_target = None
     queue._bed_temp = None
     queue._bed_temp_target = None
+    queue._filament_state = "unknown"
+    queue._filament_change_value = None
+    queue._filament_change_progress = None
+    queue._filament_change_step_len = None
     queue._control_username = "tester@example.com"
+    queue._control_user_id = "user-123"
     queue._debug_log_payloads = False
     queue._reset_print_state()
     return queue
@@ -77,6 +83,76 @@ def test_forward_to_ha_keeps_local_temperature_state_when_ha_is_disabled():
     assert queue._bed_temp == 65
     assert queue._bed_temp_target == 70
     assert ha_updates == []
+
+
+def test_forward_to_ha_tracks_filament_state_from_material_change_mode():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._forward_to_ha({"commandType": 1023, "value": 0, "progress": 0, "stepLen": 0})
+    state = queue.get_state()["filament"]
+
+    assert state["state"] == "loaded"
+    assert state["label"] == "Loaded"
+    assert state["loaded"] is True
+    assert state["raw_value"] == 0
+    assert state["progress"] == 0
+    assert state["step_len"] == 0
+
+
+def test_handle_notification_tracks_filament_changing_state():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._handle_notification({"commandType": 1023, "value": 1, "progress": 25, "stepLen": 40})
+    state = queue.get_state()["filament"]
+
+    assert state["state"] == "changing"
+    assert state["label"] == "Changing"
+    assert state["loaded"] is None
+    assert state["raw_value"] == 1
+    assert state["progress"] == 25
+    assert state["step_len"] == 40
+
+
+def test_handle_notification_tracks_filament_runout_alarm_state():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._handle_notification({
+        "commandType": 1085,
+        "errorCode": "0xFF01030001",
+        "errorLevel": "P1",
+    })
+    state = queue.get_state()["filament"]
+
+    assert state["state"] == "not_loaded"
+    assert state["label"] == "Not Loaded"
+    assert state["loaded"] is None
+
+
+def test_event_notify_filament_break_sets_not_loaded_until_change_cycle_completes():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._handle_notification({
+        "commandType": 1000,
+        "subType": 2,
+        "value": 6,
+    })
+    assert queue.get_state()["filament"]["state"] == "not_loaded"
+
+    queue._handle_notification({"commandType": 1023, "value": 2, "progress": 50, "stepLen": 20})
+    assert queue.get_state()["filament"]["state"] == "changing"
+
+    queue._handle_notification({"commandType": 1023, "value": 0, "progress": 100, "stepLen": 20})
+    state = queue.get_state()["filament"]
+    assert state["state"] == "loaded"
+    assert state["label"] == "Loaded"
 
 
 def test_emit_progress_respects_bucket_interval():
@@ -274,6 +350,125 @@ def test_send_home_uses_native_move_zero_payloads():
     ]
 
 
+def test_start_stored_file_selects_filepath_then_starts_print(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    sent = []
+    queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
+    monkeypatch.setattr(queue, "_await_stored_file_selection", lambda file_path, timeout_sec=2.0: True)
+    timeouts = []
+
+    def confirm(file_path, timeout_sec=12.0):
+        timeouts.append(timeout_sec)
+        return True
+
+    monkeypatch.setattr(queue, "_await_stored_file_start_confirmation", confirm)
+
+    started = queue.start_stored_file("/tmp/udisk/udisk1/Top parts 5h_PETG_M5 grey.gcode")
+
+    assert sent == [
+        {
+            "commandType": 1009,
+            "value": 0,
+            "isFirst": 1,
+            "index": 1,
+            "num": 47,
+            "userId": "user-123",
+        },
+        {
+            "commandType": 1010,
+            "filePath": "/tmp/udisk/udisk1/Top parts 5h_PETG_M5 grey.gcode",
+            "type": 0,
+            "userId": "user-123",
+        },
+        {
+            "commandType": 1008,
+            "value": 1,
+            "printMode": 1,
+            "userName": "tester",
+            "filePath": "/tmp/udisk/udisk1/Top parts 5h_PETG_M5 grey.gcode",
+            "userId": "user-123",
+        },
+    ]
+    assert started is True
+    assert timeouts == [12.0]
+    assert queue.get_state()["print"]["pending_start"] is True
+    assert queue.get_state()["print"]["last_filename"] == "Top parts 5h_PETG_M5 grey.gcode"
+
+
+def test_start_stored_file_uses_longer_confirmation_timeout_for_onboard_storage(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    sent = []
+    queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
+    monkeypatch.setattr(queue, "_await_stored_file_selection", lambda file_path, timeout_sec=2.0: True)
+    timeouts = []
+
+    def confirm(file_path, timeout_sec=12.0):
+        timeouts.append(timeout_sec)
+        return True
+
+    monkeypatch.setattr(queue, "_await_stored_file_start_confirmation", confirm)
+
+    started = queue.start_stored_file(
+        "/usr/data/local/model/AnkerMake Model/Autodesk_Kickstarter_Geometry.gcode"
+    )
+
+    assert started is True
+    assert timeouts == [20.0]
+    assert sent[0] == {
+        "commandType": 1009,
+        "value": 1,
+        "isFirst": 1,
+        "index": 1,
+        "num": 47,
+        "userId": "user-123",
+    }
+
+
+def test_stored_file_selection_waits_for_exact_filepath_preview():
+    queue = _queue()
+    queue._ensure_stored_file_selection_state()
+    target_path = "/usr/data/local/model/AnkerMake Model/Autodesk_Kickstarter_Geometry.gcode"
+    queue._pending_stored_file_path = target_path
+    queue._note_stored_file_selection(file_name="Autodesk_Kickstarter_Geometry.gcode")
+
+    assert queue._await_stored_file_selection(target_path, timeout_sec=0.0) is False
+
+    queue._note_stored_file_selection(file_path=target_path, file_name="Autodesk_Kickstarter_Geometry.gcode")
+
+    assert queue._await_stored_file_selection(target_path, timeout_sec=0.0) is True
+
+
+def test_uploaded_archive_is_attached_to_next_history_start():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue.mark_pending_print_start(
+        "cube.gcode",
+        archive_info={"archive_relpath": "saved/cube.gcode", "archive_size": 1234},
+    )
+    queue._handle_notification({"commandType": 1044, "filePath": "/tmp/cube.gcode"})
+    queue._handle_notification({"commandType": 1000, "value": 1})
+
+    start_records = [call for call in history_calls if call[0] == "start"]
+    assert len(start_records) == 1
+    assert start_records[0][2] == {
+        "task_id": None,
+        "archive_relpath": "saved/cube.gcode",
+        "archive_size": 1234,
+    }
+
+
+def test_derive_control_display_name_uses_email_local_part():
+    assert MqttQueue._derive_control_display_name("tester@example.com") == "tester"
+    assert MqttQueue._derive_control_display_name("plain-user") == "plain-user"
+    assert MqttQueue._derive_control_display_name("") is None
+
+
 def test_1044_captures_filename_without_marking_prepare_state():
     global ha_updates, history_calls, timelapse_calls, events
     ha_updates, history_calls, timelapse_calls, events = [], [], [], []
@@ -287,6 +482,129 @@ def test_1044_captures_filename_without_marking_prepare_state():
     assert state["last_filename"] == "prepare.gcode"
 
 
+def test_stored_file_source_preview_does_not_activate_pre_print_window():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue.mark_pending_print_start("Top parts 5h_PETG_M5 grey.gcode")
+    queue._handle_notification({
+        "commandType": 1044,
+        "filePath": "/tmp/udisk/udisk1/Top parts 5h_PETG_M5 grey.gcode",
+    })
+
+    state = queue.get_state()["print"]
+    assert state["pending_start"] is True
+    assert state["in_pre_print_window"] is False
+    assert state["active"] is False
+
+
+def test_1044_preview_url_is_cached_for_stored_file_paths():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._handle_notification({
+        "commandType": 1044,
+        "filePath": "/tmp/udisk/udisk1/preview-me.gcode",
+        "url": "https://example.test/preview.png",
+    })
+
+    assert queue.get_cached_stored_file_preview_url("/tmp/udisk/udisk1/preview-me.gcode") == "https://example.test/preview.png"
+    assert ("preview", ("https://example.test/preview.png",), {"filename": "preview-me.gcode", "task_id": None}) in history_calls
+
+
+def test_get_stored_file_preview_url_requests_selection_and_returns_cached_preview(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    queue._ensure_stored_file_selection_state()
+    sent = []
+    queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
+    monkeypatch.setattr("web.service.mqtt.time.sleep", lambda seconds: None)
+
+    def fake_wait_for(predicate, timeout=None):
+        queue._cache_stored_file_preview("/tmp/udisk/udisk1/file.gcode", "https://example.test/thumb.png")
+        return True
+
+    monkeypatch.setattr(queue._stored_file_selection_cond, "wait_for", fake_wait_for)
+
+    preview_url = queue.get_stored_file_preview_url("/tmp/udisk/udisk1/file.gcode")
+
+    assert preview_url == "https://example.test/thumb.png"
+    assert sent == [
+        {
+            "commandType": 1009,
+            "value": 0,
+            "isFirst": 1,
+            "index": 1,
+            "num": 47,
+            "userId": "user-123",
+        },
+        {
+            "commandType": 1010,
+            "filePath": "/tmp/udisk/udisk1/file.gcode",
+            "type": 0,
+            "userId": "user-123",
+        },
+    ]
+
+
+def test_tmpmodel_preview_activates_pre_print_window():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue.mark_pending_print_start("Top parts 5h_PETG_M5 grey.gcode")
+    queue._handle_notification({
+        "commandType": 1044,
+        "filePath": "/usr/data/local/tmpmodel/Top parts 5h_PETG_M5 grey.gcode",
+    })
+
+    state = queue.get_state()["print"]
+    assert state["pending_start"] is False
+    assert state["in_pre_print_window"] is True
+    assert state["active"] is True
+
+
+def test_tmpmodel_preview_activates_pre_print_window_after_prepare_value_8():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue.mark_pending_print_start("Top parts 5h_PETG_M5 grey.gcode")
+    queue._handle_notification({"commandType": 1000, "value": 8})
+    queue._handle_notification({
+        "commandType": 1044,
+        "filePath": "/usr/data/local/tmpmodel/Top parts 5h_PETG_M5 grey.gcode",
+    })
+
+    state = queue.get_state()["print"]
+    assert state["pending_start"] is False
+    assert state["in_pre_print_window"] is True
+    assert state["active"] is True
+
+
+def test_print_schedule_can_confirm_onboard_stored_file_pre_print_window():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue.mark_pending_print_start("Autodesk_Kickstarter_Geometry.gcode")
+    queue._pending_stored_file_path = "/usr/data/local/model/Autodesk_Kickstarter_Geometry.gcode"
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 0,
+        "name": "Autodesk_Kickstarter_Geometry.gcode",
+        "time": 120,
+    })
+
+    state = queue.get_state()["print"]
+    assert state["pending_start"] is False
+    assert state["in_pre_print_window"] is True
+    assert state["last_filename"] == "Autodesk_Kickstarter_Geometry.gcode"
+
+
 def test_value_8_marks_prepare_state_before_print_start():
     global ha_updates, history_calls, timelapse_calls, events
     ha_updates, history_calls, timelapse_calls, events = [], [], [], []
@@ -297,6 +615,19 @@ def test_value_8_marks_prepare_state_before_print_start():
     state = queue.get_state()["print"]
     assert state["preparing"] is True
     assert state["active"] is False
+
+
+def test_value_8_preserves_pending_start_state():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue.mark_pending_print_start("queued.gcode")
+    queue._handle_notification({"commandType": 1000, "value": 8})
+
+    state = queue.get_state()["print"]
+    assert state["pending_start"] is True
+    assert state["preparing"] is True
 
 
 def test_upload_only_idle_transition_does_not_create_fake_print_history():

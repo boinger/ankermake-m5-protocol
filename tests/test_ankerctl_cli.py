@@ -1,8 +1,11 @@
+import json
 from types import SimpleNamespace
 
 from click.testing import CliRunner
 
 import ankerctl
+import cli.mqtt
+from libflagship.mqtt import MqttMsgType
 
 
 class FakeConfigManager:
@@ -125,6 +128,114 @@ def test_mqtt_monitor_can_sniff_wildcard_command_topics(monkeypatch):
     assert fake_client.wildcard is True
     assert ankerctl.mqtt_topic_direction("/device/maker/SN123/command") == "app->printer"
     assert "[1025] move_direction" in result.output
+
+
+def test_mqtt_file_list_probe_defaults_to_onboard_and_collects_replies(monkeypatch):
+    runner = CliRunner()
+    fake_config = FakeConfigManager()
+    fake_client = object()
+    calls = []
+
+    def mqtt_collect_command(client, msg, timeout, collect_window):
+        calls.append((client, msg, timeout, collect_window))
+        return [{"commandType": msg["commandType"], "value": msg["value"], "files": ["local.gcode"]}]
+
+    monkeypatch.setattr("ankerctl.cli.config.configmgr", lambda: fake_config)
+    monkeypatch.setattr("ankerctl.cli.logfmt.setup_logging", lambda level, log_dir=None: None)
+    monkeypatch.setattr("ankerctl.Environment.upgrade_config_if_needed", lambda self: None)
+    monkeypatch.setattr("ankerctl.Environment.load_config", lambda self, required=True: None)
+    monkeypatch.setattr("ankerctl.cli.mqtt.mqtt_open", lambda *args, **kwargs: fake_client)
+    monkeypatch.setattr("ankerctl.cli.mqtt.mqtt_collect_command", mqtt_collect_command)
+
+    result = runner.invoke(ankerctl.main, ["mqtt", "file-list-probe"])
+
+    assert result.exit_code == 0
+    assert calls == [
+        (
+            fake_client,
+            {
+                "commandType": MqttMsgType.ZZ_MQTT_CMD_FILE_LIST_REQUEST.value,
+                "value": 1,
+            },
+            10.0,
+            3.0,
+        )
+    ]
+    assert "Probing file list with value=1 (printer/onboard)" in result.output
+    assert '"reply_count": 1' in result.output
+    assert "local.gcode" in result.output
+
+
+def test_mqtt_file_list_probe_uses_usb_default_value_and_allows_override(monkeypatch):
+    runner = CliRunner()
+    fake_config = FakeConfigManager()
+    fake_client = object()
+    calls = []
+
+    def mqtt_collect_command(client, msg, timeout, collect_window):
+        calls.append((client, msg, timeout, collect_window))
+        return [{"commandType": msg["commandType"], "value": msg["value"], "files": ["usb.gcode"]}]
+
+    monkeypatch.setattr("ankerctl.cli.config.configmgr", lambda: fake_config)
+    monkeypatch.setattr("ankerctl.cli.logfmt.setup_logging", lambda level, log_dir=None: None)
+    monkeypatch.setattr("ankerctl.Environment.upgrade_config_if_needed", lambda self: None)
+    monkeypatch.setattr("ankerctl.Environment.load_config", lambda self, required=True: None)
+    monkeypatch.setattr("ankerctl.cli.mqtt.mqtt_open", lambda *args, **kwargs: fake_client)
+    monkeypatch.setattr("ankerctl.cli.mqtt.mqtt_collect_command", mqtt_collect_command)
+
+    usb_result = runner.invoke(ankerctl.main, ["mqtt", "file-list-probe", "--source", "usb"])
+    override_result = runner.invoke(
+        ankerctl.main,
+        ["mqtt", "file-list-probe", "--source", "usb", "--value", "2", "--timeout", "5", "--window", "1.5"],
+    )
+
+    assert usb_result.exit_code == 0
+    assert override_result.exit_code == 0
+    assert calls == [
+        (
+            fake_client,
+            {
+                "commandType": MqttMsgType.ZZ_MQTT_CMD_FILE_LIST_REQUEST.value,
+                "value": 0,
+            },
+            10.0,
+            3.0,
+        ),
+        (
+            fake_client,
+            {
+                "commandType": MqttMsgType.ZZ_MQTT_CMD_FILE_LIST_REQUEST.value,
+                "value": 2,
+            },
+            5.0,
+            1.5,
+        ),
+    ]
+    assert "value=0 (usb/thumb drive candidate)" in usb_result.output
+    assert "value=2 (usb/thumb drive candidate)" in override_result.output
+
+
+def test_parse_file_list_replies_filters_mismatched_storage_paths():
+    result = cli.mqtt.parse_file_list_replies(
+        [{
+            "commandType": 1009,
+            "fileLists": json.dumps([
+                {"name": "cube.gcode", "path": "/usr/data/local/model/cube.gcode", "timestamp": 123},
+                {"name": "usb.gcode", "path": "/tmp/udisk/udisk1/usb.gcode", "timestamp": 456},
+            ]),
+        }],
+        requested_source="onboard",
+    )
+
+    assert result["reply_count"] == 1
+    assert result["files"] == [
+        {
+            "name": "cube.gcode",
+            "path": "/usr/data/local/model/cube.gcode",
+            "timestamp": 123,
+            "source": "onboard",
+        }
+    ]
 
 
 def test_http_calc_sec_code_and_webserver_run_dispatch(monkeypatch):

@@ -1,3 +1,4 @@
+import logging
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -5,6 +6,7 @@ from types import SimpleNamespace
 
 from cli.model import Account, Config, Printer
 from libflagship import resolve_root_dir
+from web import _AccessLogNoiseFilter, _ConsoleLogBuffer
 from web import (
     _build_command_group,
     _build_filament_move_gcode,
@@ -16,6 +18,7 @@ from web import (
     _filament_service_length,
     _filament_service_temp,
     _format_signed_mm,
+    _probe_printer_storage_files,
     _parse_z_offset_mm,
     _resolve_apprise,
     _safe_same_site_redirect_target,
@@ -24,6 +27,7 @@ from web import (
     _z_offset_steps_to_mm,
     app,
 )
+import web as web_module
 from web.util import flash_redirect
 
 
@@ -201,6 +205,80 @@ def test_api_health_and_version_routes():
         app.config["api_key"] = old_api_key
 
 
+def test_console_log_buffer_supports_recent_tail_and_incremental_updates():
+    buffer = _ConsoleLogBuffer(max_lines=3)
+    for idx in range(1, 6):
+        buffer.append(f"line {idx}")
+
+    recent = buffer.snapshot(limit=10)
+    incremental = buffer.snapshot(after_id=3, limit=10)
+    truncated = buffer.snapshot(after_id=1, limit=10)
+
+    assert [entry["text"] for entry in recent["entries"]] == ["line 3", "line 4", "line 5"]
+    assert recent["first_id"] == 3
+    assert recent["last_id"] == 5
+    assert [entry["text"] for entry in incremental["entries"]] == ["line 4", "line 5"]
+    assert incremental["truncated"] is False
+    assert truncated["truncated"] is True
+
+
+def test_access_log_noise_filter_suppresses_console_polling_and_static_assets():
+    filt = _AccessLogNoiseFilter()
+
+    console_record = logging.LogRecord(
+        name="werkzeug", level=logging.INFO, pathname=__file__, lineno=0,
+        msg='127.0.0.1 - - [08/Apr/2026 17:57:47] "GET /api/console/logs?limit=200&after=108 HTTP/1.1" 200 -',
+        args=(), exc_info=None,
+    )
+    static_record = logging.LogRecord(
+        name="werkzeug", level=logging.INFO, pathname=__file__, lineno=0,
+        msg='127.0.0.1 - - [08/Apr/2026 17:57:47] "GET /static/ankersrv.js HTTP/1.1" 304 -',
+        args=(), exc_info=None,
+    )
+    api_record = logging.LogRecord(
+        name="werkzeug", level=logging.INFO, pathname=__file__, lineno=0,
+        msg='127.0.0.1 - - [08/Apr/2026 17:57:47] "GET /api/health HTTP/1.1" 200 -',
+        args=(), exc_info=None,
+    )
+
+    assert filt.filter(console_record) is False
+    assert filt.filter(static_record) is False
+    assert filt.filter(api_record) is True
+
+
+def test_api_console_logs_returns_recent_entries(monkeypatch):
+    calls = []
+
+    class FakeConsoleBuffer:
+        def snapshot(self, *, limit=200, after_id=None):
+            calls.append((limit, after_id))
+            return {
+                "entries": [{"id": 42, "text": "[*] printer ready"}],
+                "first_id": 40,
+                "last_id": 42,
+                "next_after": 42,
+                "truncated": False,
+                "max_lines": 2000,
+            }
+
+    client = app.test_client()
+    old_login = app.config.get("login")
+    old_api_key = app.config.get("api_key")
+    monkeypatch.setattr(web_module, "_get_console_log_buffer", lambda: FakeConsoleBuffer())
+    app.config["login"] = True
+    app.config["api_key"] = None
+
+    try:
+        response = client.get("/api/console/logs?limit=25&after=10")
+    finally:
+        app.config["login"] = old_login
+        app.config["api_key"] = old_api_key
+
+    assert response.status_code == 200
+    assert response.get_json()["entries"] == [{"id": 42, "text": "[*] printer ready"}]
+    assert calls == [(25, 10)]
+
+
 def test_api_printers_and_switch_active_printer(monkeypatch):
     cfg = Config(
         account=Account(
@@ -309,6 +387,53 @@ def test_root_shows_ffmpeg_warning_only_for_camera_capable_devices(monkeypatch):
     assert "Camera features need `ffmpeg`" in camera.get_data(as_text=True)
     assert no_camera.status_code == 200
     assert "Camera features need `ffmpeg`" not in no_camera.get_data(as_text=True)
+
+
+def test_probe_printer_storage_files_uses_one_shot_mqtt_probe(monkeypatch):
+    cfg = Config(
+        account=Account(
+            auth_token="token",
+            region="eu",
+            user_id="user-1",
+            email="user@example.com",
+        ),
+        printers=[_printer("SN1", "Printer One", ip_addr="192.168.1.10")],
+    )
+    manager = FakeConfigManager(cfg)
+    disconnects = []
+    fake_client = SimpleNamespace(_mqtt=SimpleNamespace(disconnect=lambda: disconnects.append(True)))
+
+    old_values = {
+        "config": app.config.get("config"),
+        "printer_index": app.config.get("printer_index"),
+        "insecure": app.config.get("insecure"),
+    }
+    app.config["config"] = manager
+    app.config["printer_index"] = 0
+    app.config["insecure"] = False
+
+    monkeypatch.setattr("web.cli.mqtt.mqtt_open", lambda config, printer_index, insecure: fake_client)
+    monkeypatch.setattr(
+        "web.cli.mqtt.mqtt_file_list_probe",
+        lambda client, source, source_value, timeout, collect_window: {
+            "request": {"commandType": 1009, "value": 1},
+            "source_value": 1,
+            "reply_count": 1,
+            "replies": [{"commandType": 1009, "reply": 0}],
+            "files": [{"name": "cube.gcode", "path": "/usr/data/local/model/cube.gcode", "timestamp": 123, "source": "onboard"}],
+        },
+    )
+
+    try:
+        result, error = _probe_printer_storage_files(source="onboard")
+    finally:
+        for key, value in old_values.items():
+            app.config[key] = value
+
+    assert error is None
+    assert result["source_value"] == 1
+    assert result["files"][0]["path"] == "/usr/data/local/model/cube.gcode"
+    assert disconnects == [True]
 
 
 def test_printer_control_guard_without_login():

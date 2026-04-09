@@ -1,3 +1,4 @@
+import base64
 import re
 import sys
 import os
@@ -84,8 +85,9 @@ class FileSizeType(click.ParamType):
 
 def parse_json(msg):
     if isinstance(msg, dict):
-        for key, value in msg.items():
-            msg[key] = parse_json(value)
+        return {key: parse_json(value) for key, value in msg.items()}
+    elif isinstance(msg, list):
+        return [parse_json(value) for value in msg]
     elif isinstance(msg, str):
         try:
             msg = parse_json(json.loads(msg))
@@ -251,6 +253,60 @@ def patch_gcode_time(data: bytes) -> bytes:
     lines.insert(g28_index, f";TIME:{seconds}\n")
     log.debug(f"patch_gcode_time: inserted ;TIME:{seconds} before line {g28_index + 1}")
     return "".join(lines).encode("utf-8")
+
+
+_THUMBNAIL_BEGIN_PATTERN = re.compile(
+    r"^;\s*(?:thumbnail|png)\s+begin\s+(\d+)[x*](\d+)(?:\s+\d+)?",
+    re.IGNORECASE,
+)
+_THUMBNAIL_END_PATTERN = re.compile(r"^;\s*(?:thumbnail|png)\s+end\b", re.IGNORECASE)
+
+
+def extract_gcode_thumbnail(data: bytes) -> bytes | None:
+    """Extract the largest embedded thumbnail image from slicer GCode."""
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        return None
+
+    best_image = None
+    best_area = -1
+    current_area = None
+    current_lines = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        begin_match = _THUMBNAIL_BEGIN_PATTERN.match(line)
+        if begin_match:
+            current_area = int(begin_match.group(1)) * int(begin_match.group(2))
+            current_lines = []
+            continue
+
+        if current_area is not None and _THUMBNAIL_END_PATTERN.match(line):
+            encoded = "".join(current_lines).strip()
+            current_area_value = current_area
+            current_area = None
+            current_lines = []
+            if not encoded:
+                continue
+            try:
+                image_bytes = base64.b64decode(encoded, validate=False)
+            except (ValueError, TypeError):
+                continue
+            if image_bytes and current_area_value > best_area:
+                best_image = image_bytes
+                best_area = current_area_value
+            continue
+
+        if current_area is None:
+            continue
+
+        if line.startswith(";"):
+            line = line[1:].strip()
+        if line:
+            current_lines.append(line)
+
+    return best_image
 
 
 _LAYER_COUNT_PATTERNS = [

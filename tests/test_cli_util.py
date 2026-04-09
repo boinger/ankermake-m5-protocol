@@ -6,6 +6,7 @@ import pytest
 
 import cli.checkver
 from cli.util import (
+    extract_gcode_thumbnail,
     extract_layer_count,
     json_key_value,
     normalize_gcode_lines,
@@ -103,8 +104,32 @@ def test_extract_layer_count_reads_header_and_falls_back_to_markers():
     assert extract_layer_count(fallback) == 2
 
 
+def test_extract_gcode_thumbnail_reads_embedded_png_and_prefers_largest():
+    small_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5ZQAAAAASUVORK5CYII="
+    large_png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAusB9WfKJeYAAAAASUVORK5CYII="
+    gcode = (
+        "; thumbnail begin 32x32 10\n"
+        f"; {small_png}\n"
+        "; thumbnail end\n"
+        "; thumbnail begin 256x256 10\n"
+        f"; {large_png}\n"
+        "; thumbnail end\n"
+    ).encode("utf-8")
+
+    thumbnail = extract_gcode_thumbnail(gcode)
+
+    assert thumbnail is not None
+    assert thumbnail.startswith(b"\x89PNG\r\n\x1a\n")
+    assert thumbnail.endswith(b"IEND\xaeB`\x82")
+
+
+def test_extract_gcode_thumbnail_returns_none_without_embedded_preview():
+    assert extract_gcode_thumbnail(b"G28\nM104 S200\n") is None
+
+
 def test_json_and_http_helpers():
     assert parse_json({"nested": '{"value": 1}'}) == {"nested": {"value": 1}}
+    assert parse_json({"nested": '[{"value": 1}]'}) == {"nested": [{"value": 1}]}
     assert '"value": 1' in pretty_json('{"value": 1}')
     assert parse_http_bool("true") is True
     assert parse_http_bool("0") is False
