@@ -127,6 +127,39 @@ code {
     padding: 0;
 }
 
+.gcode-thumbnail-shell {
+    position: relative;
+    width: 56px;
+    height: 56px;
+    flex: 0 0 56px;
+    overflow: hidden;
+    border-radius: 0.5rem;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: #1f1f1f;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.gcode-thumbnail-fallback {
+    color: #8f9ba8;
+    font-size: 1.2rem;
+    line-height: 1;
+}
+
+.gcode-thumbnail-image {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background: #1f1f1f;
+}
+
+.history-file-cell {
+    min-width: 220px;
+}
+
 /* Setup pill-tab navigation */
 
 .setup-pills {

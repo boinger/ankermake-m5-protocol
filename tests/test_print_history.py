@@ -75,7 +75,15 @@ def test_history_clear_and_fallback_finish_latest_active(tmp_path):
 def test_archive_upload_and_reprint_flags(tmp_path):
     history = PrintHistory(db_path=tmp_path / "history.db")
 
-    archive_info = history.archive_upload("cube.gcode", b"G28\nM104 S200\n")
+    archive_info = history.archive_upload(
+        "cube.gcode",
+        (
+            b"; thumbnail begin 32x32 10\n"
+            b"; iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5ZQAAAAASUVORK5CYII=\n"
+            b"; thumbnail end\n"
+            b"G28\nM104 S200\n"
+        ),
+    )
     row_id = history.record_start(
         "cube.gcode",
         task_id="task-archive",
@@ -87,7 +95,9 @@ def test_archive_upload_and_reprint_flags(tmp_path):
 
     assert entry["archive_available"] is True
     assert entry["can_reprint"] is True
+    assert entry["thumbnail_available"] is True
     assert history.get_archive_path(row_id) is not None
+    assert history.get_thumbnail_path(row_id) is not None
 
 
 def test_history_clear_removes_archived_gcode_files(tmp_path):
@@ -104,3 +114,17 @@ def test_history_clear_removes_archived_gcode_files(tmp_path):
     history.clear()
 
     assert history.get_archive_path(row_id) is None
+
+
+def test_history_preview_url_marks_entry_thumbnail_available(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+
+    row_id = history.record_start(
+        "usb-file.gcode",
+        preview_url="https://example.test/preview.png",
+    )
+
+    entry = history.get_entry(row_id)
+
+    assert entry["thumbnail_available"] is True
+    assert entry["preview_url"] == "https://example.test/preview.png"

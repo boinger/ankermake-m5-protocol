@@ -223,6 +223,7 @@ def test_printer_storage_file_list_route_returns_files_and_validates_input(monke
     assert onboard.status_code == 200
     assert onboard.get_json()["source"] == "onboard"
     assert onboard.get_json()["files"][0]["path"] == "/usr/data/local/model/cube.gcode"
+    assert "/api/files/printer/thumbnail" in onboard.get_json()["files"][0]["thumbnail_url"]
     assert usb.status_code == 200
     assert usb.get_json()["source"] == "usb"
     assert usb.get_json()["files"][0]["path"] == "/tmp/udisk/udisk1/usb-part.gcode"
@@ -232,6 +233,36 @@ def test_printer_storage_file_list_route_returns_files_and_validates_input(monke
         ("onboard", None, 5.0, 1.0),
         ("usb", None, 5.0, 1.0),
     ]
+
+
+def test_printer_storage_thumbnail_route_fetches_preview_url(monkeypatch):
+    mqtt = SimpleNamespace(
+        is_printing=False,
+        has_pending_print_start=False,
+        is_preparing_print=False,
+        get_cached_stored_file_preview_url=lambda path: None,
+        get_stored_file_preview_url=lambda path, allow_probe=True: "https://example.test/storage-thumb.png",
+    )
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+    captured = []
+    monkeypatch.setattr(
+        "web._fetch_remote_image",
+        lambda url, timeout=10.0: (captured.append(url) or (b"png-bytes", "image/png")),
+    )
+
+    try:
+        response = client.get(
+            "/api/files/printer/thumbnail?source=usb&path=/tmp/udisk/udisk1/file.gcode",
+            headers={"X-Api-Key": API_KEY},
+        )
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 200
+    assert response.data == b"png-bytes"
+    assert response.mimetype == "image/png"
+    assert captured == ["https://example.test/storage-thumb.png"]
 
 
 def test_printer_storage_file_list_route_surfaces_probe_errors(monkeypatch):
@@ -404,8 +435,70 @@ def test_history_routes_require_auth_and_clear_entries():
     assert unauthorized.status_code == 401
     assert authorized.status_code == 200
     assert authorized.get_json()["total"] == 3
+    assert authorized.get_json()["entries"][0]["thumbnail_url"] is None
     assert cleared.status_code == 200
     assert calls == [("get", 500, 0), ("clear",)]
+
+
+def test_history_thumbnail_route_serves_local_archive_thumbnail(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+    archive_info = history.archive_upload(
+        "cube.gcode",
+        (
+            b"; thumbnail begin 32x32 10\n"
+            b"; iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5ZQAAAAASUVORK5CYII=\n"
+            b"; thumbnail end\n"
+            b"G28\n"
+        ),
+    )
+    entry_id = history.record_start(
+        "cube.gcode",
+        archive_relpath=archive_info["archive_relpath"],
+        archive_size=archive_info["archive_size"],
+    )
+    history.record_finish(filename="cube.gcode")
+    mqtt = SimpleNamespace(history=history)
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+
+    try:
+        history_resp = client.get("/api/history", headers={"X-Api-Key": API_KEY})
+        thumb_resp = client.get(f"/api/history/{entry_id}/thumbnail", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert history_resp.status_code == 200
+    assert history_resp.get_json()["entries"][0]["thumbnail_url"].endswith(f"/api/history/{entry_id}/thumbnail")
+    assert thumb_resp.status_code == 200
+    assert thumb_resp.mimetype == "image/png"
+    assert thumb_resp.data.startswith(b"\x89PNG")
+
+
+def test_history_thumbnail_route_proxies_preview_url_when_no_local_thumbnail(monkeypatch, tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+    entry_id = history.record_start(
+        "usb-file.gcode",
+        preview_url="https://example.test/history-thumb.png",
+    )
+    history.record_finish(filename="usb-file.gcode")
+    mqtt = SimpleNamespace(history=history)
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(mqtt=mqtt)
+    captured = []
+    monkeypatch.setattr(
+        "web._fetch_remote_image",
+        lambda url, timeout=10.0: (captured.append(url) or (b"history-thumb", "image/jpeg")),
+    )
+
+    try:
+        response = client.get(f"/api/history/{entry_id}/thumbnail", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 200
+    assert response.data == b"history-thumb"
+    assert response.mimetype == "image/jpeg"
+    assert captured == ["https://example.test/history-thumb.png"]
 
 
 def test_history_reprint_route_dispatches_archived_upload_and_validates_busy(tmp_path):

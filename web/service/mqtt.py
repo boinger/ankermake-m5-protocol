@@ -121,6 +121,9 @@ class MqttQueue(Service):
         self._z_offset_seq = 0
         self._z_offset_cond = threading.Condition()
         self._stored_file_selection_cond = threading.Condition(self._state_lock)
+        self._stored_file_preview_request_lock = threading.Lock()
+        self._stored_file_preview_cache = {}
+        self._stored_file_preview_seq = 0
         self._last_selected_storage_file_path = None
         self._last_selected_storage_file_name = None
         self._pending_stored_file_path = None
@@ -214,6 +217,8 @@ class MqttQueue(Service):
             if archive_info:
                 record_kwargs["archive_relpath"] = archive_info.get("archive_relpath")
                 record_kwargs["archive_size"] = archive_info.get("archive_size")
+            if self._preview_url:
+                record_kwargs["preview_url"] = self._preview_url
             self._history.record_start(effective_filename, **record_kwargs)
             self._pending_history_start = False
             log.info(f"Print started, filename={effective_filename!r}")
@@ -235,6 +240,8 @@ class MqttQueue(Service):
             if archive_info:
                 record_kwargs["archive_relpath"] = archive_info.get("archive_relpath")
                 record_kwargs["archive_size"] = archive_info.get("archive_size")
+            if self._preview_url:
+                record_kwargs["preview_url"] = self._preview_url
             self._history.record_start(self._last_filename, **record_kwargs)
             self._timelapse.start_capture(self._last_filename)
             self._pending_history_start = False
@@ -330,6 +337,12 @@ class MqttQueue(Service):
             self._last_selected_storage_file_name = None
         if not hasattr(self, "_pending_stored_file_path"):
             self._pending_stored_file_path = None
+        if not hasattr(self, "_stored_file_preview_request_lock"):
+            self._stored_file_preview_request_lock = threading.Lock()
+        if not hasattr(self, "_stored_file_preview_cache"):
+            self._stored_file_preview_cache = {}
+        if not hasattr(self, "_stored_file_preview_seq"):
+            self._stored_file_preview_seq = 0
 
     @staticmethod
     def _is_stored_file_source_path(file_path):
@@ -371,6 +384,61 @@ class MqttQueue(Service):
                 return True
             self._stored_file_selection_cond.wait_for(selection_ready, timeout=timeout_sec)
             return selection_ready()
+
+    def _cache_stored_file_preview(self, file_path, preview_url):
+        self._ensure_stored_file_selection_state()
+        file_path = str(file_path or "").strip()
+        preview_url = str(preview_url or "").strip()
+        if not file_path or not preview_url:
+            return
+        with self._stored_file_selection_cond:
+            self._stored_file_preview_seq += 1
+            self._stored_file_preview_cache[file_path] = {
+                "url": preview_url,
+                "seq": self._stored_file_preview_seq,
+            }
+            self._stored_file_selection_cond.notify_all()
+
+    def get_cached_stored_file_preview_url(self, file_path):
+        self._ensure_stored_file_selection_state()
+        file_path = str(file_path or "").strip()
+        if not file_path:
+            return None
+        with self._stored_file_selection_cond:
+            cached = self._stored_file_preview_cache.get(file_path) or {}
+            return cached.get("url")
+
+    def get_stored_file_preview_url(self, file_path, timeout_sec=2.5, allow_probe=True):
+        self._ensure_stored_file_selection_state()
+        file_path = str(file_path or "").strip()
+        if not file_path:
+            raise ValueError("Stored file path is required")
+
+        cached_url = self.get_cached_stored_file_preview_url(file_path)
+        if cached_url or not allow_probe:
+            return cached_url
+
+        with self._stored_file_preview_request_lock:
+            cached_url = self.get_cached_stored_file_preview_url(file_path)
+            if cached_url:
+                return cached_url
+
+            with self._stored_file_selection_cond:
+                baseline_seq = self._stored_file_preview_seq
+
+            self.client.command(self._build_stored_file_list_request_payload(file_path))
+            time.sleep(0.12)
+            self.client.command(self._build_stored_file_request_payload(file_path))
+
+            def preview_ready():
+                cached = self._stored_file_preview_cache.get(file_path) or {}
+                return bool(cached.get("url")) and cached.get("seq", 0) > baseline_seq
+
+            with self._stored_file_selection_cond:
+                if not preview_ready():
+                    self._stored_file_selection_cond.wait_for(preview_ready, timeout=timeout_sec)
+                cached = self._stored_file_preview_cache.get(file_path) or {}
+                return cached.get("url")
 
     def _send_start_print_control(self):
         nested_data = {"value": 0}
@@ -839,7 +907,15 @@ class MqttQueue(Service):
                 self._preview_file_path = file_path
                 self._last_filename = os.path.basename(file_path)
                 log.info(f"History: captured filename from ct 1044: {self._last_filename}")
+                if preview_url:
+                    self._cache_stored_file_preview(file_path, preview_url)
                 self._note_stored_file_selection(file_path=file_path, file_name=self._last_filename)
+                if preview_url:
+                    self._history.update_preview_url(
+                        preview_url,
+                        filename=self._last_filename,
+                        task_id=self._last_task_id,
+                    )
             # If ct=1000 value=1 arrived before ct=1044, record the start now that we have the filename
             self._complete_deferred_print_start()
             # Activate print early so Stop sends value=4 (not the prepare-cancel path)

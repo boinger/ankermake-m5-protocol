@@ -9,6 +9,8 @@ import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import cli.util
+
 log = logging.getLogger("history")
 
 
@@ -30,7 +32,8 @@ CREATE TABLE IF NOT EXISTS print_history (
     failure_reason TEXT,
     task_id     TEXT,
     archive_relpath TEXT,
-    archive_size INTEGER
+    archive_size INTEGER,
+    preview_url TEXT
 );
 """
 
@@ -99,6 +102,9 @@ class PrintHistory:
             if "archive_size" not in columns:
                 log.info("History: migrating schema, adding archive_size column")
                 conn.execute("ALTER TABLE print_history ADD COLUMN archive_size INTEGER")
+            if "preview_url" not in columns:
+                log.info("History: migrating schema, adding preview_url column")
+                conn.execute("ALTER TABLE print_history ADD COLUMN preview_url TEXT")
         except Exception as e:
             log.warning(f"History: schema migration failed: {e}")
 
@@ -152,6 +158,12 @@ class PrintHistory:
         archive_path = os.path.join(archive_dir, stored_name)
         with open(archive_path, "wb") as fh:
             fh.write(payload)
+        thumbnail_bytes = cli.util.extract_gcode_thumbnail(payload)
+        if thumbnail_bytes:
+            thumbnail_path = self._thumbnail_abspath(self._thumbnail_relpath(stored_name))
+            if thumbnail_path:
+                with open(thumbnail_path, "wb") as fh:
+                    fh.write(thumbnail_bytes)
         return {
             "archive_relpath": stored_name,
             "archive_size": len(payload),
@@ -167,11 +179,25 @@ class PrintHistory:
             return None
         return archive_path
 
+    @staticmethod
+    def _thumbnail_relpath(archive_relpath):
+        if not archive_relpath:
+            return None
+        return f"{archive_relpath}.thumbnail.png"
+
+    def _thumbnail_abspath(self, thumbnail_relpath):
+        return self._archive_abspath(thumbnail_relpath)
+
     def _decorate_entry(self, row):
         entry = dict(row)
         archive_path = self._archive_abspath(entry.get("archive_relpath"))
+        thumbnail_path = self._thumbnail_abspath(self._thumbnail_relpath(entry.get("archive_relpath")))
         entry["archive_available"] = bool(archive_path and os.path.exists(archive_path))
         entry["can_reprint"] = entry["archive_available"]
+        entry["thumbnail_available"] = bool(
+            (thumbnail_path and os.path.exists(thumbnail_path))
+            or entry.get("preview_url")
+        )
         return entry
 
     def _delete_unreferenced_archives(self, conn):
@@ -185,6 +211,11 @@ class PrintHistory:
             ).fetchall()
             if row[0]
         }
+        keep |= {
+            self._thumbnail_relpath(name)
+            for name in keep
+            if self._thumbnail_relpath(name)
+        }
         for name in os.listdir(archive_dir):
             if name in keep:
                 continue
@@ -197,7 +228,7 @@ class PrintHistory:
             except Exception as exc:
                 log.warning(f"History: could not delete unreferenced archive {path}: {exc}")
 
-    def record_start(self, filename, task_id=None, archive_relpath=None, archive_size=None):
+    def record_start(self, filename, task_id=None, archive_relpath=None, archive_size=None, preview_url=None):
         """Record a print start. Returns the row id.
 
         If an open 'started' entry exists with the same task_id, it is resumed.
@@ -219,6 +250,11 @@ class PrintHistory:
                         (task_id,)
                     ).fetchone()
                     if existing:
+                        if preview_url:
+                            conn.execute(
+                                "UPDATE print_history SET preview_url=COALESCE(?, preview_url) WHERE id=?",
+                                (preview_url, existing["id"]),
+                            )
                         log.info(f"History: resuming entry id={existing['id']} for task_id={task_id}")
                         conn.commit()
                         return existing["id"]
@@ -250,14 +286,15 @@ class PrintHistory:
 
                 # 3. Create new entry
                 cur = conn.execute(
-                    "INSERT INTO print_history (filename, status, started_at, task_id, archive_relpath, archive_size) "
-                    "VALUES (?, 'started', ?, ?, ?, ?)",
+                    "INSERT INTO print_history (filename, status, started_at, task_id, archive_relpath, archive_size, preview_url) "
+                    "VALUES (?, 'started', ?, ?, ?, ?, ?)",
                     (
                         filename,
                         datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                         task_id,
                         archive_relpath,
                         archive_size,
+                        preview_url,
                     )
                 )
                 row_id = cur.lastrowid
@@ -358,6 +395,30 @@ class PrintHistory:
         if not archive_path or not os.path.exists(archive_path):
             return None
         return archive_path
+
+    def get_thumbnail_path(self, entry_id):
+        entry = self.get_entry(entry_id)
+        if not entry:
+            return None
+        thumbnail_path = self._thumbnail_abspath(self._thumbnail_relpath(entry.get("archive_relpath")))
+        if not thumbnail_path or not os.path.exists(thumbnail_path):
+            return None
+        return thumbnail_path
+
+    def update_preview_url(self, preview_url, filename=None, task_id=None):
+        if not preview_url:
+            return False
+        with self._lock:
+            with self._connect() as conn:
+                row = self._find_active(conn, filename, task_id)
+                if not row:
+                    return False
+                conn.execute(
+                    "UPDATE print_history SET preview_url=? WHERE id=?",
+                    (preview_url, row["id"]),
+                )
+                conn.commit()
+                return True
 
     def list_entries(self, limit=50, offset=0):
         """Backward-compatible alias for get_history()."""

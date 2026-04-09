@@ -16,6 +16,7 @@ def _queue():
         record_start=lambda *args, **kwargs: history_calls.append(("start", args, kwargs)),
         record_finish=lambda *args, **kwargs: history_calls.append(("finish", args, kwargs)),
         record_fail=lambda *args, **kwargs: history_calls.append(("fail", args, kwargs)),
+        update_preview_url=lambda *args, **kwargs: history_calls.append(("preview", args, kwargs)),
     )
     queue._timelapse = SimpleNamespace(
         start_capture=lambda filename="unknown": timelapse_calls.append(("start", filename)),
@@ -422,6 +423,57 @@ def test_stored_file_source_preview_does_not_activate_pre_print_window():
     assert state["pending_start"] is True
     assert state["in_pre_print_window"] is False
     assert state["active"] is False
+
+
+def test_1044_preview_url_is_cached_for_stored_file_paths():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._handle_notification({
+        "commandType": 1044,
+        "filePath": "/tmp/udisk/udisk1/preview-me.gcode",
+        "url": "https://example.test/preview.png",
+    })
+
+    assert queue.get_cached_stored_file_preview_url("/tmp/udisk/udisk1/preview-me.gcode") == "https://example.test/preview.png"
+    assert ("preview", ("https://example.test/preview.png",), {"filename": "preview-me.gcode", "task_id": None}) in history_calls
+
+
+def test_get_stored_file_preview_url_requests_selection_and_returns_cached_preview(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    queue._ensure_stored_file_selection_state()
+    sent = []
+    queue.client = SimpleNamespace(command=lambda payload: sent.append(payload))
+    monkeypatch.setattr("web.service.mqtt.time.sleep", lambda seconds: None)
+
+    def fake_wait_for(predicate, timeout=None):
+        queue._cache_stored_file_preview("/tmp/udisk/udisk1/file.gcode", "https://example.test/thumb.png")
+        return True
+
+    monkeypatch.setattr(queue._stored_file_selection_cond, "wait_for", fake_wait_for)
+
+    preview_url = queue.get_stored_file_preview_url("/tmp/udisk/udisk1/file.gcode")
+
+    assert preview_url == "https://example.test/thumb.png"
+    assert sent == [
+        {
+            "commandType": 1009,
+            "value": 0,
+            "isFirst": 1,
+            "index": 1,
+            "num": 47,
+            "userId": "user-123",
+        },
+        {
+            "commandType": 1010,
+            "filePath": "/tmp/udisk/udisk1/file.gcode",
+            "type": 0,
+            "userId": "user-123",
+        },
+    ]
 
 
 def test_tmpmodel_preview_activates_pre_print_window():

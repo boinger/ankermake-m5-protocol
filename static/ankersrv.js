@@ -2342,6 +2342,20 @@ $(function () {
 
     let _selectedGCodeStorageFile = null;
 
+    function buildGCodeThumbnail(url, altText) {
+        const safeAlt = escapeHtml(altText || "GCode thumbnail");
+        const safeUrl = url ? escapeHtml(url) : "";
+        const img = safeUrl
+            ? `<img src="${safeUrl}" alt="${safeAlt}" class="gcode-thumbnail-image" loading="lazy" onerror="this.remove()">`
+            : "";
+        return (
+            '<div class="gcode-thumbnail-shell">' +
+            '<div class="gcode-thumbnail-fallback"><i class="bi bi-card-image"></i></div>' +
+            img +
+            "</div>"
+        );
+    }
+
     function formatStorageTimestamp(timestamp) {
         const value = Number(timestamp);
         if (!Number.isFinite(value) || value <= 0) {
@@ -2375,9 +2389,14 @@ $(function () {
         const source = gcodeStorageSourceLabel(file.source || $("#gcode-storage-source").val() || "onboard");
         selected
             .html(
+                '<div class="d-flex align-items-start gap-3">' +
+                buildGCodeThumbnail(file.thumbnail_url, file.name || "Stored file thumbnail") +
+                '<div class="flex-grow-1 min-w-0">' +
                 `<div class="fw-semibold">${escapeHtml(file.name || "Unnamed file")}</div>` +
                 `<div class="text-break"><code>${escapeHtml(file.path || "-")}</code></div>` +
-                `<div class="text-muted">Modified: ${escapeHtml(formatStorageTimestamp(file.timestamp))} · Source: ${escapeHtml(source)}</div>`
+                `<div class="text-muted">Modified: ${escapeHtml(formatStorageTimestamp(file.timestamp))} · Source: ${escapeHtml(source)}</div>` +
+                "</div>" +
+                "</div>"
             )
             .show();
         setGCodeStoragePrintEnabled(true);
@@ -2409,9 +2428,14 @@ $(function () {
             const path = normalizedFile && normalizedFile.path ? String(normalizedFile.path) : "-";
             const item = $(`
                 <button type="button" class="list-group-item list-group-item-action text-start">
-                    <div class="fw-semibold text-truncate">${escapeHtml(name)}</div>
-                    <div class="small text-muted text-truncate"><code>${escapeHtml(path)}</code></div>
-                    <div class="small text-muted">Modified: ${escapeHtml(formatStorageTimestamp(file.timestamp))}</div>
+                    <div class="d-flex align-items-start gap-3">
+                        ${buildGCodeThumbnail(normalizedFile.thumbnail_url, name)}
+                        <div class="flex-grow-1 min-w-0">
+                            <div class="fw-semibold text-truncate">${escapeHtml(name)}</div>
+                            <div class="small text-muted text-truncate"><code>${escapeHtml(path)}</code></div>
+                            <div class="small text-muted">Modified: ${escapeHtml(formatStorageTimestamp(file.timestamp))}</div>
+                        </div>
+                    </div>
                 </button>
             `);
             item.on("click", function () {
@@ -2827,11 +2851,17 @@ $(function () {
                 data.entries.forEach(e => {
                     const started = e.started_at ? new Date(e.started_at + "Z").toLocaleString() : "-";
                     const safeFilename = escapeHtml(e.filename);
+                    const thumbnail = buildGCodeThumbnail(e.thumbnail_url, e.filename || "History thumbnail");
                     const actionCell = e.can_reprint
                         ? `<button class="btn btn-sm btn-outline-primary history-reprint-btn" data-history-id="${e.id}" data-history-name="${safeFilename}">Reprint</button>`
                         : '<span class="text-muted small">-</span>';
                     const row = `<tr>
-                        <td class="text-truncate" style="max-width:200px;" title="${safeFilename}">${safeFilename}</td>
+                        <td class="history-file-cell" title="${safeFilename}">
+                            <div class="d-flex align-items-center gap-2">
+                                ${thumbnail}
+                                <div class="text-truncate" style="max-width:200px;">${safeFilename}</div>
+                            </div>
+                        </td>
                         <td>${statusBadge(e.status)}</td>
                         <td class="small">${started}</td>
                         <td>${formatDuration(e.duration_sec)}</td>

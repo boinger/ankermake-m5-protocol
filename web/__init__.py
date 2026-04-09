@@ -1603,13 +1603,46 @@ def app_api_files_printer():
         payload, status = error
         return payload, status
 
+    resolved_source = "onboard" if result["source_value"] == 1 else source
+    files = []
+    for entry in result["files"]:
+        item = dict(entry)
+        item["thumbnail_url"] = url_for(
+            "app_api_files_printer_thumbnail",
+            path=item.get("path", ""),
+            source=resolved_source,
+        )
+        files.append(item)
+
     return {
         "status": "ok",
-        "source": "onboard" if result["source_value"] == 1 else source,
+        "source": resolved_source,
         "source_value": result["source_value"],
         "reply_count": result["reply_count"],
-        "files": result["files"],
+        "files": files,
     }
+
+
+@app.get("/api/files/printer/thumbnail")
+def app_api_files_printer_thumbnail():
+    source = str(request.args.get("source", "") or "").strip().lower() or None
+    try:
+        file_path, _ = _validate_printer_storage_path(request.args.get("path"), source=source)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        preview_url = mqtt.get_cached_stored_file_preview_url(file_path)
+        if not preview_url:
+            allow_probe = not (mqtt.is_printing or mqtt.has_pending_print_start or mqtt.is_preparing_print)
+            preview_url = mqtt.get_stored_file_preview_url(file_path, allow_probe=allow_probe)
+
+    if not preview_url:
+        return {"error": "Thumbnail not available for this stored file"}, 404
+
+    return _proxy_preview_image_response(preview_url)
 
 
 @app.post("/api/files/printer/print")
@@ -2204,6 +2237,39 @@ def _validate_printer_storage_path(file_path, source=None):
     return normalized_path, inferred_source
 
 
+def _fetch_remote_image(preview_url, timeout=10.0):
+    from urllib.error import HTTPError, URLError
+    from urllib.request import Request, urlopen
+
+    preview_url = str(preview_url or "").strip()
+    if not preview_url.startswith(("http://", "https://")):
+        raise ValueError("Invalid preview URL")
+
+    request_obj = Request(preview_url, headers={"User-Agent": "ankerctl"})
+    try:
+        with urlopen(request_obj, timeout=timeout) as remote:
+            data = remote.read()
+            content_type = remote.headers.get_content_type() if remote.headers else None
+            return data, (content_type or "image/jpeg")
+    except HTTPError as exc:
+        raise RuntimeError(f"Preview image request failed with HTTP {exc.code}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Preview image request failed: {exc.reason}") from exc
+
+
+def _proxy_preview_image_response(preview_url):
+    try:
+        data, content_type = _fetch_remote_image(preview_url)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
+    except RuntimeError as exc:
+        return {"error": str(exc)}, 502
+
+    response = Response(data, mimetype=content_type)
+    response.headers["Cache-Control"] = "private, max-age=600"
+    return response
+
+
 def _clean_printer_report_output(raw_output):
     import re
 
@@ -2526,7 +2592,16 @@ def app_api_history():
             return {"entries": [], "total": 0}
         entries = mqtt.history.get_history(limit=limit, offset=offset)
         total = mqtt.history.get_count()
-    return {"entries": entries, "total": total}
+    serialized_entries = []
+    for entry in entries:
+        item = dict(entry)
+        item["thumbnail_url"] = (
+            url_for("app_api_history_thumbnail", entry_id=item["id"])
+            if item.get("thumbnail_available")
+            else None
+        )
+        serialized_entries.append(item)
+    return {"entries": serialized_entries, "total": total}
 
 
 @app.delete("/api/history")
@@ -2535,6 +2610,35 @@ def app_api_history_clear():
     with borrow_mqtt() as mqtt:
         mqtt.history.clear()
     return {"status": "ok"}
+
+
+@app.get("/api/history/<int:entry_id>/thumbnail")
+def app_api_history_thumbnail(entry_id):
+    from flask import send_file
+
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        entry = mqtt.history.get_entry(entry_id)
+        if not entry:
+            return {"error": "History entry not found"}, 404
+        thumbnail_path = mqtt.history.get_thumbnail_path(entry_id)
+        preview_url = entry.get("preview_url")
+
+    if thumbnail_path:
+        response = send_file(
+            thumbnail_path,
+            mimetype="image/png",
+            as_attachment=False,
+            download_name=os.path.basename(thumbnail_path),
+        )
+        response.headers["Cache-Control"] = "private, max-age=600"
+        return response
+
+    if preview_url:
+        return _proxy_preview_image_response(preview_url)
+
+    return {"error": "Thumbnail not available for this history entry"}, 404
 
 
 @app.post("/api/history/<int:entry_id>/reprint")
