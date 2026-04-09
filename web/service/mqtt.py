@@ -60,6 +60,14 @@ FILAMENT_STATE_LABELS = {
     "not_loaded": "Not Loaded",
 }
 
+FILAMENT_ISSUE_LABELS = {
+    "runout": "Filament runout",
+}
+
+PAUSE_REASON_LABELS = {
+    "filament_runout": "Filament runout",
+}
+
 FILAMENT_RUNOUT_ERROR_CODE = "0xFF01030001"
 
 G28_DEDUPE_WINDOW_SEC = 10.0
@@ -134,6 +142,9 @@ class MqttQueue(Service):
         self._filament_change_value = None
         self._filament_change_progress = None
         self._filament_change_step_len = None
+        self._filament_issue = None
+        self._filament_issue_code = None
+        self._pause_reason = None
         self._stored_file_selection_cond = threading.Condition(self._state_lock)
         self._stored_file_preview_request_lock = threading.Lock()
         self._stored_file_preview_cache = {}
@@ -182,6 +193,7 @@ class MqttQueue(Service):
         self._last_selected_storage_file_name = None
         self._last_print_schedule_filename = None
         self._last_print_schedule_seen_at = 0.0
+        self._pause_reason = None
         # Preserve debug setting across resets if possible, but init here if missing
         if not hasattr(self, "_debug_log_payloads"):
              self._debug_log_payloads = False
@@ -208,6 +220,7 @@ class MqttQueue(Service):
             return False
 
         self._state = PrintState.PRINTING
+        self._pause_reason = None
         self._ha.update_state(print_status="printing")
         return True
 
@@ -226,6 +239,7 @@ class MqttQueue(Service):
         self._print_started_at = time.monotonic()
         self._failure_sent = False
         self._last_progress_bucket = None
+        self._pause_reason = None
 
         effective_filename = filename or self._last_filename
 
@@ -882,6 +896,26 @@ class MqttQueue(Service):
             return "unknown"
         return "changing"
 
+    def _filament_detail(self):
+        state = getattr(self, "_filament_state", "unknown")
+        issue = getattr(self, "_filament_issue", None)
+        progress = getattr(self, "_filament_change_progress", None)
+
+        if state == "changing":
+            if progress is not None and 0 < progress < 100:
+                return f"Filament swap in progress ({progress}%)"
+            return "Filament swap in progress"
+
+        if state == "loaded" and getattr(self, "_pause_reason", None) == "filament_runout" and self._state == PrintState.PAUSED:
+            return "Filament loaded. Resume the print when ready."
+
+        if issue == "runout":
+            if self._state == PrintState.PAUSED:
+                return "Printer paused for filament reload."
+            return "Filament runout or break detected."
+
+        return None
+
     def _update_filament_state(self, payload):
         if not isinstance(payload, dict):
             return
@@ -896,10 +930,17 @@ class MqttQueue(Service):
                 step_len_raw = payload.get("step_len")
             self._filament_change_step_len = self._safe_int(step_len_raw)
             self._filament_state = self._normalize_filament_state(payload)
+            if self._filament_state in ("changing", "loaded"):
+                self._filament_issue = None
+                self._filament_issue_code = None
             return
 
         if command_type == 1085 and str(payload.get("errorCode") or "") == FILAMENT_RUNOUT_ERROR_CODE:
             self._filament_state = "not_loaded"
+            self._filament_issue = "runout"
+            self._filament_issue_code = FILAMENT_RUNOUT_ERROR_CODE
+            if self._state in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED):
+                self._pause_reason = "filament_runout"
             return
 
         if (
@@ -908,6 +949,10 @@ class MqttQueue(Service):
             and self._safe_int(payload.get("value")) == 6
         ):
             self._filament_state = "not_loaded"
+            self._filament_issue = "runout"
+            self._filament_issue_code = FILAMENT_RUNOUT_ERROR_CODE
+            if self._state in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED):
+                self._pause_reason = "filament_runout"
             return
 
     def _forward_to_ha(self, payload):
@@ -1059,6 +1104,8 @@ class MqttQueue(Service):
                     self._transition_to_active(payload, progress=0)
             elif value == 2 and self._state == PrintState.PRINTING:
                 self._state = PrintState.PAUSED
+                if getattr(self, "_filament_issue", None) == "runout":
+                    self._pause_reason = "filament_runout"
                 self._ha.update_state(print_status="paused")
                 log.info("Print paused (ct 1000 value=2)")
             elif value == 3 and self._state == PrintState.PAUSED:
@@ -1319,6 +1366,8 @@ class MqttQueue(Service):
                 "last_task_id": self._last_task_id,
                 "failure_sent": self._failure_sent,
                 "preview_url": self._preview_url,
+                "pause_reason": getattr(self, "_pause_reason", None),
+                "pause_reason_label": PAUSE_REASON_LABELS.get(getattr(self, "_pause_reason", None)),
             },
             "temperature": {
                 "nozzle": self._nozzle_temp,
@@ -1331,6 +1380,12 @@ class MqttQueue(Service):
                 "state": getattr(self, "_filament_state", "unknown"),
                 "label": FILAMENT_STATE_LABELS.get(getattr(self, "_filament_state", "unknown"), "Unknown"),
                 "loaded": True if getattr(self, "_filament_state", "unknown") == "loaded" else None,
+                "issue": getattr(self, "_filament_issue", None),
+                "issue_label": FILAMENT_ISSUE_LABELS.get(getattr(self, "_filament_issue", None)),
+                "issue_code": getattr(self, "_filament_issue_code", None),
+                "detail": self._filament_detail(),
+                "pause_reason": getattr(self, "_pause_reason", None),
+                "pause_reason_label": PAUSE_REASON_LABELS.get(getattr(self, "_pause_reason", None)),
                 "raw_value": getattr(self, "_filament_change_value", None),
                 "progress": getattr(self, "_filament_change_progress", None),
                 "step_len": getattr(self, "_filament_change_step_len", None),

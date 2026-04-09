@@ -420,6 +420,17 @@ $(function () {
         return "Changing";
     }
 
+    function getFilamentStateDetail(label, progress) {
+        if (label !== "Changing") {
+            return null;
+        }
+        const parsedProgress = Number(progress);
+        if (Number.isFinite(parsedProgress) && parsedProgress > 0 && parsedProgress < 100) {
+            return `Filament swap in progress (${Math.round(parsedProgress)}%)`;
+        }
+        return "Filament swap in progress";
+    }
+
     function isFilamentRunoutEvent(data) {
         if (!data || typeof data !== "object") {
             return false;
@@ -432,8 +443,32 @@ $(function () {
             && Number(data.value) === 6;
     }
 
-    function setFilamentState(label) {
+    const _filamentStatus = {
+        label: "Unknown",
+        detail: null,
+        issue: null,
+        pauseReason: null,
+    };
+
+    function setPrintStatusDetail(message, tone = "warning") {
+        const el = $("#print-status-detail");
+        if (!el.length) {
+            return;
+        }
+        const value = String(message || "").trim();
+        el.removeClass("d-none text-warning text-danger text-muted text-success");
+        if (!value) {
+            el.text("");
+            el.addClass("d-none");
+            return;
+        }
+        el.text(value);
+        el.addClass(`text-${tone}`);
+    }
+
+    function setFilamentState(label, detail = null) {
         const el = $("#filament-state");
+        const detailEl = $("#filament-state-detail");
         if (!el.length) {
             return;
         }
@@ -450,6 +485,58 @@ $(function () {
         } else {
             el.addClass("text-muted");
         }
+
+        if (detailEl.length) {
+            const detailText = String(detail || "").trim();
+            detailEl.text(detailText);
+            detailEl.toggleClass("d-none", !detailText);
+        }
+    }
+
+    function renderFilamentStatus() {
+        const pausedForFilament = _currentPrintState === PRINT_STATE.PAUSED && !!_filamentStatus.pauseReason;
+        let detail = _filamentStatus.detail || null;
+
+        if (!detail && pausedForFilament && _filamentStatus.label === "Loaded") {
+            detail = "Filament loaded. Resume the print when ready.";
+        }
+
+        setFilamentState(_filamentStatus.label || "Unknown", detail);
+        if (pausedForFilament) {
+            setPrintStatusDetail(`Paused: ${_filamentStatus.pauseReason}`, "warning");
+        } else {
+            setPrintStatusDetail(null);
+        }
+    }
+
+    function applyRuntimeState(data) {
+        if (!data || typeof data !== "object") {
+            return;
+        }
+
+        const filament = data.filament || {};
+        _filamentStatus.label = String(filament.label || "Unknown");
+        _filamentStatus.detail = filament.detail || null;
+        _filamentStatus.issue = filament.issue || null;
+        _filamentStatus.pauseReason = filament.pause_reason_label || null;
+
+        if (data.print && data.print.state !== undefined) {
+            _updatePrintControlButtons(_normalizePrintStateValue(data.print.state));
+            return;
+        }
+        renderFilamentStatus();
+    }
+
+    async function loadPrinterRuntimeState() {
+        if (!document.getElementById("filament-state")) {
+            return;
+        }
+        const resp = await fetch("/api/printer/runtime-state");
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+        applyRuntimeState(data);
     }
 
     /**
@@ -732,7 +819,11 @@ $(function () {
             }
             if (data.commandType == 1000) {
                 // Printer state machine: normalize firmware resume acknowledgements for UI controls.
-                _updatePrintControlButtons(_normalizePrintStateValue(data.value));
+                const normalizedState = _normalizePrintStateValue(data.value);
+                if (normalizedState !== PRINT_STATE.PAUSED) {
+                    _filamentStatus.pauseReason = null;
+                }
+                _updatePrintControlButtons(normalizedState);
                 if (typeof _onMqttStateChange === "function") {
                     _onMqttStateChange(data.value);
                 }
@@ -796,9 +887,21 @@ $(function () {
             } else if (data.commandType == 1021) {
                 applyZOffsetState(data, { populateTarget: false });
             } else if (isFilamentRunoutEvent(data)) {
-                setFilamentState("Not Loaded");
+                _filamentStatus.label = "Not Loaded";
+                _filamentStatus.detail = _currentPrintState === PRINT_STATE.PAUSED
+                    ? "Printer paused for filament reload."
+                    : "Filament runout or break detected.";
+                _filamentStatus.issue = "runout";
+                _filamentStatus.pauseReason = "Filament runout";
+                renderFilamentStatus();
             } else if (data.commandType == 1023) {
-                setFilamentState(getFilamentStateLabel(data.value, data.progress, data.stepLen));
+                const label = getFilamentStateLabel(data.value, data.progress, data.stepLen);
+                _filamentStatus.label = label;
+                _filamentStatus.detail = getFilamentStateDetail(label, data.progress);
+                if (label === "Changing" || label === "Loaded") {
+                    _filamentStatus.issue = null;
+                }
+                renderFilamentStatus();
             } else if (data.commandType == 1044) {
                 // Print start notification — extract basename from filePath
                 const filePath = data.filePath || "";
@@ -826,7 +929,11 @@ $(function () {
             $("#set-bed-temp").val(0);
             $("#print-speed").text("0mm/s");
             $("#print-layer").text("0 / 0");
-            setFilamentState("Unknown");
+            _filamentStatus.label = "Unknown";
+            _filamentStatus.detail = null;
+            _filamentStatus.issue = null;
+            _filamentStatus.pauseReason = null;
+            renderFilamentStatus();
             document.title = "ankerctl";
             _updatePrintControlButtons(PRINT_STATE.IDLE);
             _zOffsetCurrentMm = null;
@@ -1105,6 +1212,11 @@ $(function () {
     }
     if ($("#upload-progressbar").length) {
         sockets.upload.connect();
+    }
+    if (document.getElementById("filament-state")) {
+        loadPrinterRuntimeState().catch(function (err) {
+            console.warn("Failed to load printer runtime state", err);
+        });
     }
 
     sockets.video.autoReconnect = false;
@@ -1711,6 +1823,7 @@ $(function () {
         if (!isGCodeStorageLocked()) {
             maybeRefreshGCodeStorageAfterUnlock();
         }
+        renderFilamentStatus();
     }
 
     const getStepDist = () => $('input[name="step-dist"]:checked').val() || "1";

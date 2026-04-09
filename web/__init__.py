@@ -2475,6 +2475,15 @@ def app_api_printer_settings_summary():
         return {"error": str(exc)}, 503
 
 
+@app.get("/api/printer/runtime-state")
+def app_api_printer_runtime_state():
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        state = mqtt.get_state()
+    return {"status": "ok", **state}
+
+
 @app.get("/api/printer/bed-leveling/last")
 def app_api_printer_bed_leveling_last():
     """Return the most recently saved bed leveling grid from the log directory."""

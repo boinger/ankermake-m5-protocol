@@ -343,6 +343,52 @@ def test_api_printers_and_switch_active_printer(monkeypatch):
             app.config[key] = value
 
 
+def test_api_printer_runtime_state_returns_filament_details():
+    mqtt = SimpleNamespace(
+        get_state=lambda: {
+            "print": {
+                "print_state": "paused",
+                "state": 2,
+                "pause_reason": "filament_runout",
+                "pause_reason_label": "Filament runout",
+            },
+            "filament": {
+                "state": "not_loaded",
+                "label": "Not Loaded",
+                "issue": "runout",
+                "issue_label": "Filament runout",
+                "detail": "Printer paused for filament reload.",
+                "pause_reason": "filament_runout",
+                "pause_reason_label": "Filament runout",
+            },
+        }
+    )
+    client = app.test_client()
+    old_values = {
+        "login": app.config.get("login"),
+        "api_key": app.config.get("api_key"),
+    }
+    old_svc = app.svc
+
+    app.config["login"] = True
+    app.config["api_key"] = None
+    app.svc = FakeServices(mqtt)
+
+    try:
+        response = client.get("/api/printer/runtime-state")
+    finally:
+        app.svc = old_svc
+        for key, value in old_values.items():
+            app.config[key] = value
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "ok"
+    assert data["print"]["pause_reason_label"] == "Filament runout"
+    assert data["filament"]["issue"] == "runout"
+    assert data["filament"]["detail"] == "Printer paused for filament reload."
+
+
 def test_root_shows_ffmpeg_warning_only_for_camera_capable_devices(monkeypatch):
     cfg = Config(
         account=Account(

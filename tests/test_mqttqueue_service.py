@@ -132,6 +132,30 @@ def test_handle_notification_tracks_filament_runout_alarm_state():
     assert state["state"] == "not_loaded"
     assert state["label"] == "Not Loaded"
     assert state["loaded"] is None
+    assert state["issue"] == "runout"
+    assert state["issue_label"] == "Filament runout"
+    assert state["detail"] == "Filament runout or break detected."
+
+
+def test_handle_notification_exposes_filament_pause_reason_when_print_pauses():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    queue._state = PrintState.PRINTING
+
+    queue._handle_notification({
+        "commandType": 1085,
+        "errorCode": "0xFF01030001",
+        "errorLevel": "P1",
+    })
+    queue._handle_notification({"commandType": 1000, "value": 2})
+
+    state = queue.get_state()
+    assert state["print"]["pause_reason"] == "filament_runout"
+    assert state["print"]["pause_reason_label"] == "Filament runout"
+    assert state["filament"]["pause_reason"] == "filament_runout"
+    assert state["filament"]["pause_reason_label"] == "Filament runout"
+    assert state["filament"]["detail"] == "Printer paused for filament reload."
 
 
 def test_event_notify_filament_break_sets_not_loaded_until_change_cycle_completes():
@@ -153,6 +177,7 @@ def test_event_notify_filament_break_sets_not_loaded_until_change_cycle_complete
     state = queue.get_state()["filament"]
     assert state["state"] == "loaded"
     assert state["label"] == "Loaded"
+    assert state["issue"] is None
 
 
 def test_emit_progress_respects_bucket_interval():
