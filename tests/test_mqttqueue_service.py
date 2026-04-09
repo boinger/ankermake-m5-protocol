@@ -809,6 +809,74 @@ def test_pre_print_window_upgrades_to_full_print():
     assert len(timelapse_calls) > 0, "Pre-print upgrade should start timelapse"
 
 
+def test_stale_post_completion_updates_for_same_task_are_ignored(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    now = [100.0]
+    monkeypatch.setattr("web.service.mqtt.time.monotonic", lambda: now[0])
+
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 2500,
+        "name": "cube.gcode",
+        "task_id": "task-dup",
+    })
+    queue._handle_notification({"commandType": 1000, "value": 0})
+
+    history_calls.clear()
+    timelapse_calls.clear()
+    events.clear()
+
+    now[0] += 5.0
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 9900,
+        "name": "cube.gcode",
+        "task_id": "task-dup",
+    })
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 10000,
+        "name": "cube.gcode",
+        "task_id": "task-dup",
+    })
+
+    assert queue._state == PrintState.IDLE
+    assert history_calls == []
+    assert timelapse_calls == []
+    assert events == []
+
+
+def test_bare_ct1000_start_is_ignored_immediately_after_completion(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    now = [100.0]
+    monkeypatch.setattr("web.service.mqtt.time.monotonic", lambda: now[0])
+
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 2500,
+        "name": "cube.gcode",
+        "task_id": "task-bare",
+    })
+    queue._handle_notification({"commandType": 1000, "value": 0})
+
+    history_calls.clear()
+    timelapse_calls.clear()
+    events.clear()
+
+    now[0] += 2.0
+    queue._handle_notification({"commandType": 1000, "value": 1})
+
+    assert queue._state == PrintState.IDLE
+    assert queue._pending_history_start is False
+    assert history_calls == []
+    assert timelapse_calls == []
+    assert events == []
+
+
 def test_ct1001_blocked_during_pre_print_window():
     """Progress messages (ct=1001) during the pre-print window should NOT
     upgrade to full print activation. Only ct=1000 value=1 does that."""

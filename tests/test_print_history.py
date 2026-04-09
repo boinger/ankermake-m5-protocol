@@ -46,6 +46,33 @@ def test_record_finish_and_fail_update_active_entries(tmp_path):
     assert entries[1]["progress"] == 100
 
 
+def test_record_start_dedupes_completed_task_id(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+
+    first_id = history.record_start(
+        "cube.gcode",
+        task_id="task-finished",
+        archive_relpath="saved/cube.gcode",
+        archive_size=1234,
+    )
+    history.record_finish(task_id="task-finished", progress=100)
+
+    duplicate_id = history.record_start(
+        "cube.gcode",
+        task_id="task-finished",
+        preview_url="https://example.test/cube.png",
+    )
+
+    entries = history.get_history(limit=10)
+
+    assert duplicate_id == first_id
+    assert history.get_count() == 1
+    assert entries[0]["status"] == "finished"
+    assert entries[0]["archive_relpath"] == "saved/cube.gcode"
+    assert entries[0]["archive_size"] == 1234
+    assert entries[0]["preview_url"] == "https://example.test/cube.png"
+
+
 def test_history_prunes_to_max_entries(tmp_path):
     history = PrintHistory(db_path=tmp_path / "history.db", max_entries=2)
 

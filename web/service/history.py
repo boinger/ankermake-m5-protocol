@@ -232,7 +232,9 @@ class PrintHistory:
         """Record a print start. Returns the row id.
 
         If an open 'started' entry exists with the same task_id, it is resumed.
-        Otherwise, any existing open entries are closed (orphaned) and a new one is created.
+        If a completed entry already exists with the same task_id, it is reused instead of
+        creating a duplicate row for stale post-finish firmware updates. Otherwise, any
+        existing open entries are closed (orphaned) and a new one is created.
 
         Returns None immediately if *filename* is a placeholder (empty, 'unknown', etc.)
         to avoid polluting history with uninformative entries.
@@ -243,19 +245,35 @@ class PrintHistory:
 
         with self._lock:
             with self._connect() as conn:
-                # 1. Resume existing open entry for the same task_id
+                # 1. Reuse existing entry for the same task_id. The printer can emit
+                # late duplicate updates for an already-finished job; task_id is the
+                # safest stable identity we have for deduplicating those.
                 if task_id:
                     existing = conn.execute(
-                        "SELECT id FROM print_history WHERE status='started' AND task_id=?",
+                        "SELECT id, status, archive_relpath, archive_size, preview_url "
+                        "FROM print_history WHERE task_id=? ORDER BY id DESC LIMIT 1",
                         (task_id,)
                     ).fetchone()
                     if existing:
-                        if preview_url:
+                        if archive_relpath or archive_size is not None or preview_url:
                             conn.execute(
-                                "UPDATE print_history SET preview_url=COALESCE(?, preview_url) WHERE id=?",
-                                (preview_url, existing["id"]),
+                                "UPDATE print_history "
+                                "SET archive_relpath=COALESCE(archive_relpath, ?), "
+                                "    archive_size=COALESCE(archive_size, ?), "
+                                "    preview_url=COALESCE(preview_url, ?) "
+                                "WHERE id=?",
+                                (archive_relpath, archive_size, preview_url, existing["id"]),
                             )
-                        log.info(f"History: resuming entry id={existing['id']} for task_id={task_id}")
+                        if existing["status"] == "started":
+                            log.info(f"History: resuming entry id={existing['id']} for task_id={task_id}")
+                        else:
+                            log.info(
+                                "History: ignoring duplicate start for completed task_id=%s "
+                                "(existing id=%s status=%s)",
+                                task_id,
+                                existing["id"],
+                                existing["status"],
+                            )
                         conn.commit()
                         return existing["id"]
 

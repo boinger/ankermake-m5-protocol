@@ -67,6 +67,7 @@ STORED_FILE_SELECTION_TIMEOUT_SEC = 2.0
 STORED_FILE_START_CONFIRM_TIMEOUT_SEC = 12.0
 STORED_FILE_ONBOARD_START_CONFIRM_TIMEOUT_SEC = 20.0
 STORED_FILE_LIST_PAGE_SIZE = 47
+RECENT_COMPLETION_GUARD_SEC = 120.0
 STORED_FILE_SOURCE_ROOTS = (
     "/tmp/udisk/",
     "/usr/data/local/model/",
@@ -143,6 +144,9 @@ class MqttQueue(Service):
         self._preview_file_path = None
         self._last_g28_command = None
         self._last_g28_command_at = 0.0
+        self._recent_completion_filename = None
+        self._recent_completion_task_id = None
+        self._recent_completion_at = 0.0
 
     def set_gcode_layer_count(self, count: int):
         """Store the layer count extracted from a GCode header for UI display."""
@@ -184,6 +188,7 @@ class MqttQueue(Service):
 
     def _record_failure(self, payload, progress, reason):
         """Record a print failure: history, timelapse, HA state, and notification event."""
+        self._remember_recent_completion()
         self._history.record_fail(filename=self._last_filename, reason=reason, task_id=self._last_task_id)
         self._timelapse.fail_capture()
         self._ha.update_state(print_status="failed")
@@ -325,6 +330,35 @@ class MqttQueue(Service):
         self._pending_archive_info = None
         return archive_info
 
+    def _clear_recent_completion(self):
+        self._recent_completion_filename = None
+        self._recent_completion_task_id = None
+        self._recent_completion_at = 0.0
+
+    def _remember_recent_completion(self, filename=None, task_id=None):
+        saved_filename = os.path.basename(str(filename or self._last_filename or "")).strip()
+        saved_task_id = str(task_id or self._last_task_id or "").strip()
+        self._recent_completion_filename = saved_filename or None
+        self._recent_completion_task_id = saved_task_id or None
+        self._recent_completion_at = time.monotonic()
+
+    def _recent_completion_matches(self, *, task_id=None, filename=None):
+        recent_completion_at = getattr(self, "_recent_completion_at", 0.0)
+        if not recent_completion_at:
+            return False
+        if (time.monotonic() - recent_completion_at) > RECENT_COMPLETION_GUARD_SEC:
+            return False
+
+        recent_task_id = getattr(self, "_recent_completion_task_id", None)
+        recent_filename = getattr(self, "_recent_completion_filename", None)
+        normalized_task_id = str(task_id or "").strip() or None
+        normalized_filename = os.path.basename(str(filename or "")).strip() or None
+        if normalized_task_id and recent_task_id == normalized_task_id:
+            return True
+        if normalized_filename and recent_filename == normalized_filename:
+            return True
+        return False
+
     def mark_pending_print_start(self, filename=None, task_id=None, archive_info=None):
         with self._state_lock:
             if filename:
@@ -337,6 +371,7 @@ class MqttQueue(Service):
                     "archive_relpath": archive_info.get("archive_relpath"),
                     "archive_size": archive_info.get("archive_size"),
                 }
+            self._clear_recent_completion()
             self._state = PrintState.PREPARING
             self._stop_requested = False
         log.info("Marked pending print start for %r", self._last_filename)
@@ -1010,7 +1045,18 @@ class MqttQueue(Service):
                 if self._transition_from_paused_to_printing():
                     log.info("Print resumed (ct 1000 value=1)")
             elif value == 1:
-                self._transition_to_active(payload, progress=0)
+                if (
+                    previous_state == PrintState.IDLE
+                    and not self._last_filename
+                    and not self._last_task_id
+                    and not was_preparing_print
+                    and not was_pending_start
+                    and getattr(self, "_recent_completion_at", 0.0)
+                    and (time.monotonic() - getattr(self, "_recent_completion_at", 0.0)) <= RECENT_COMPLETION_GUARD_SEC
+                ):
+                    log.info("Ignoring bare ct 1000 value=1 immediately after print completion")
+                else:
+                    self._transition_to_active(payload, progress=0)
             elif value == 2 and self._state == PrintState.PRINTING:
                 self._state = PrintState.PAUSED
                 self._ha.update_state(print_status="paused")
@@ -1027,6 +1073,7 @@ class MqttQueue(Service):
                     else:
                         # Print ended normally
                         log.info(f"History: print finished (ct 1000 value=0), filename={self._last_filename!r}")
+                        self._remember_recent_completion()
                         self._history.record_finish(filename=self._last_filename, task_id=self._last_task_id)
                         self._timelapse.finish_capture(final=True)
                         self._ha.update_state(print_status="complete", print_progress=100)
@@ -1091,6 +1138,20 @@ class MqttQueue(Service):
         prev_filename = self._last_filename
 
         task_id = self._extract_task_id(payload)
+        incoming_filename = self._extract_filename(payload)
+        if (
+            task_id
+            and self._state == PrintState.IDLE
+            and not self.has_pending_print_start
+            and not self.is_preparing_print
+            and self._recent_completion_matches(task_id=task_id, filename=incoming_filename)
+        ):
+            log.info(
+                "Ignoring stale post-completion update for task_id=%s filename=%r",
+                task_id,
+                incoming_filename,
+            )
+            return
         if task_id:
             if self._last_task_id and task_id != self._last_task_id and self._state == PrintState.PRINTING:
                 if progress <= 1:
@@ -1101,7 +1162,7 @@ class MqttQueue(Service):
             else:
                 self._last_task_id = task_id
 
-        filename = self._extract_filename(payload)
+        filename = incoming_filename
         if filename:
             if command_type == MqttMsgType.ZZ_MQTT_CMD_PRINT_SCHEDULE:
                 self._last_print_schedule_filename = filename
@@ -1150,6 +1211,7 @@ class MqttQueue(Service):
                     self._build_payload(payload, 100),
                     include_image=True,
                 )
+                self._remember_recent_completion()
                 self._history.record_finish(filename=self._last_filename, task_id=self._last_task_id)
                 self._timelapse.finish_capture(final=True)
                 self._ha.update_state(print_status="complete", print_progress=100)
@@ -1162,6 +1224,7 @@ class MqttQueue(Service):
                 self._build_payload(payload, 100),
                 include_image=True,
             )
+            self._remember_recent_completion()
             self._history.record_finish(filename=self._last_filename, task_id=self._last_task_id)
             self._timelapse.finish_capture(final=True)
             self._ha.update_state(print_status="complete", print_progress=100)
