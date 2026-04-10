@@ -192,6 +192,25 @@ def test_timelapse_start_capture_resumes_pending_session(monkeypatch, tmp_path):
     assert calls == ["stop-thread", "cancel-finalize", "enable-video", "thread-start"]
 
 
+def test_timelapse_discard_pending_resume(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+    resume_dir = tmp_path / _IN_PROGRESS_SUBDIR / "resume_discard"
+    resume_dir.mkdir(parents=True, exist_ok=True)
+    (resume_dir / "frame_00000.jpg").write_bytes(b"x")
+    svc._resume_dir = str(resume_dir)
+    svc._resume_filename = "cube.gcode"
+    svc._resume_frame_count = 1
+
+    discarded = svc.discard_pending_resume("cube.gcode")
+
+    assert discarded is True
+    assert svc._resume_dir is None
+    assert svc._resume_filename is None
+    assert svc._resume_frame_count == 0
+    assert not resume_dir.exists()
+
+
 def test_timelapse_take_snapshot_retries_and_restores_light(monkeypatch, tmp_path):
     cfg = FakeConfigManager(tmp_path)
     svc = TimelapseService(cfg, captures_dir=tmp_path)

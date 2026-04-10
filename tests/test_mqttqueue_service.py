@@ -877,6 +877,102 @@ def test_early_stop_during_pre_print_window_sends_value4_and_cancels():
     assert queue.get_state()["print"]["in_pre_print_window"] is False
 
 
+def test_stop_confirmation_reply_cancels_active_print_without_value_zero():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._handle_notification({"commandType": 1044, "filePath": "/tmp/cube.gcode"})
+    queue._handle_notification({"commandType": 1000, "value": 1})
+
+    history_calls.clear()
+    timelapse_calls.clear()
+    events.clear()
+
+    queue._stop_requested = True
+    queue._handle_notification({"commandType": 1057, "reply": 0})
+
+    assert queue._state == PrintState.IDLE
+    assert history_calls == [("fail", (), {"filename": "cube.gcode", "reason": "cancelled", "task_id": None})]
+    assert timelapse_calls == [("fail",)]
+    assert len(events) == 1
+    assert events[0][0] == "print_failed"
+    assert events[0][2] is False
+    assert events[0][1]["filename"] == "cube.gcode"
+    assert events[0][1]["reason"] == "cancelled"
+    assert queue.get_state()["timelapse"]["prompt_start"] is False
+
+
+def test_startup_attached_print_prompts_before_starting_timelapse(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    now = [100.0]
+    monkeypatch.setattr("web.service.mqtt.time.monotonic", lambda: now[0])
+    queue = _queue()
+    queue._timelapse_start_prompt_window_until = now[0] + 20.0
+
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 2500,
+        "name": "startup.gcode",
+    })
+
+    assert queue._state == PrintState.PRINTING
+    assert history_calls == [("start", ("startup.gcode",), {"task_id": None})]
+    assert timelapse_calls == []
+    state = queue.get_state()
+    assert state["timelapse"]["prompt_start"] is True
+    assert state["timelapse"]["prompt_filename"] == "startup.gcode"
+    assert state["timelapse"]["detail"] == "Open Timelapse to continue or dismiss capture for this print."
+
+    filename = queue.start_timelapse_for_current_print()
+
+    assert filename == "startup.gcode"
+    assert timelapse_calls == [("start", "startup.gcode")]
+    assert queue.get_state()["timelapse"]["prompt_start"] is False
+
+
+def test_active_print_after_startup_window_auto_starts_timelapse(monkeypatch):
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    now = [100.0]
+    monkeypatch.setattr("web.service.mqtt.time.monotonic", lambda: now[0])
+    queue = _queue()
+    queue._timelapse_start_prompt_window_until = now[0] - 1.0
+
+    queue._handle_notification({
+        "commandType": 1001,
+        "progress": 2500,
+        "name": "auto-start.gcode",
+    })
+
+    assert queue._state == PrintState.PRINTING
+    assert timelapse_calls == [("start", "auto-start.gcode")]
+    assert queue.get_state()["timelapse"]["prompt_start"] is False
+
+
+def test_dismiss_timelapse_offer_discards_pending_resume():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+    discarded = []
+    queue._timelapse = SimpleNamespace(
+        enabled=True,
+        _capture_thread=None,
+        discard_pending_resume=lambda filename=None: discarded.append(filename) or True,
+        get_runtime_state=lambda: {"enabled": True, "capturing": False},
+    )
+    queue._state = PrintState.PRINTING
+    queue._last_filename = "active.gcode"
+    queue._timelapse_start_prompt_pending = True
+    queue._timelapse_start_prompt_filename = "active.gcode"
+
+    queue.dismiss_timelapse_start_offer()
+
+    assert discarded == ["active.gcode"]
+    assert queue.get_state()["timelapse"]["prompt_start"] is False
+
+
 def test_build_payload_get_state_and_simulate_event(monkeypatch):
     global ha_updates, history_calls, timelapse_calls, events
     ha_updates, history_calls, timelapse_calls, events = [], [], [], []

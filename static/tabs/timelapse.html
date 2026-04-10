@@ -4,6 +4,24 @@
             {{ macro.bi_icon("exclamation-triangle") }}
             Timelapse is disabled. Enable it in <strong>Setup → Timelapse</strong>.
         </div>
+        <div id="timelapse-action-card" class="card border-warning mb-3" style="display:none;">
+            <div class="card-body">
+                <div class="d-flex flex-column flex-md-row align-items-md-center justify-content-between gap-3">
+                    <div>
+                        <div class="fw-semibold" id="timelapse-action-title">Active print detected</div>
+                        <div class="text-muted small" id="timelapse-action-detail"></div>
+                    </div>
+                    <div class="d-flex gap-2 flex-shrink-0">
+                        <button type="button" class="btn btn-success" id="timelapse-action-start">
+                            {{ macro.bi_icon("play-fill") }} Continue Timelapse
+                        </button>
+                        <button type="button" class="btn btn-outline-secondary" id="timelapse-action-dismiss">
+                            Dismiss
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
         <div class="row g-3">
             <!-- Left: Video player -->
             <div class="col-lg-8">

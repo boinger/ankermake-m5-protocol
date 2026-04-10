@@ -112,16 +112,20 @@ class TimelapseService:
         return self._enabled
 
     def get_runtime_state(self):
-        capture_thread = self._capture_thread
-        return {
-            "enabled": self._enabled,
-            "capturing": bool(capture_thread and capture_thread.is_alive()),
-            "paused": self._capture_pause_reason is not None,
-            "pause_reason": self._capture_pause_reason,
-            "recovering": self._recovery_active,
-            "recovery_reason": self._recovery_reason,
-            "detail": self._runtime_detail(),
-        }
+        with self._lock:
+            capture_thread = self._capture_thread
+            return {
+                "enabled": self._enabled,
+                "capturing": bool(capture_thread and capture_thread.is_alive()),
+                "paused": self._capture_pause_reason is not None,
+                "pause_reason": self._capture_pause_reason,
+                "recovering": self._recovery_active,
+                "recovery_reason": self._recovery_reason,
+                "resume_available": bool(self._resume_dir),
+                "resume_filename": self._resume_filename,
+                "resume_frame_count": self._resume_frame_count,
+                "detail": self._runtime_detail(),
+            }
 
     def _runtime_detail(self):
         if self._recovery_active:
@@ -315,6 +319,27 @@ class TimelapseService:
             self._resume_dir = None
             self._resume_filename = None
             self._resume_frame_count = 0
+
+    def discard_pending_resume(self, filename=None):
+        """Discard a pending resumable capture, optionally scoped by filename."""
+        with self._lock:
+            if self._capture_thread and self._capture_thread.is_alive():
+                return False
+
+            requested = os.path.basename(str(filename or "")).strip() or None
+            current = os.path.basename(str(self._resume_filename or "")).strip() or None
+            if requested and current and requested != current:
+                return False
+            if not self._resume_dir:
+                return False
+
+            log.info(f"Timelapse: discarded pending capture for '{self._resume_filename}'")
+            self._cancel_pending_resume()
+            self._capture_pause_reason = None
+            self._recovery_active = False
+            self._recovery_reason = None
+            self._disable_video_for_timelapse()
+            return True
 
     def _schedule_finalize(self, dir_path, filename, frame_count, suffix=""):
         """Save capture state and schedule delayed assembly.

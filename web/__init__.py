@@ -3226,6 +3226,29 @@ def app_api_timelapses():
     return {"videos": videos, "enabled": enabled}
 
 
+@app.post("/api/timelapse/current/start")
+def app_api_timelapse_current_start():
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        try:
+            filename = mqtt.start_timelapse_for_current_print()
+        except RuntimeError as exc:
+            return {"error": str(exc)}, 409
+        state = mqtt.get_state()
+    return {"status": "ok", "filename": filename, **state}
+
+
+@app.post("/api/timelapse/current/dismiss")
+def app_api_timelapse_current_dismiss():
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        mqtt.dismiss_timelapse_start_offer()
+        state = mqtt.get_state()
+    return {"status": "ok", **state}
+
+
 @app.get("/api/timelapse/<filename>")
 def app_api_timelapse_download(filename):
     """Download a timelapse video."""

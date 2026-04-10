@@ -495,6 +495,10 @@ $(function () {
         capturing: false,
         recovering: false,
         detail: null,
+        promptStart: false,
+        promptFilename: null,
+        resumeAvailable: false,
+        resumeFrameCount: 0,
     };
 
     function setFilamentState(label, detail = null, detailTone = null) {
@@ -586,6 +590,46 @@ $(function () {
         }
     }
 
+    function renderTimelapseActionCard() {
+        const card = document.getElementById("timelapse-action-card");
+        const title = document.getElementById("timelapse-action-title");
+        const detail = document.getElementById("timelapse-action-detail");
+        const startBtn = document.getElementById("timelapse-action-start");
+        const dismissBtn = document.getElementById("timelapse-action-dismiss");
+        if (!card || !title || !detail || !startBtn || !dismissBtn) {
+            return;
+        }
+
+        if (!_timelapseRuntime.promptStart || _timelapseRuntime.capturing) {
+            card.style.display = "none";
+            return;
+        }
+
+        const fileName = String(_timelapseRuntime.promptFilename || "this print").trim() || "this print";
+        const frameCount = Number(_timelapseRuntime.resumeFrameCount || 0);
+        const canResume = !!_timelapseRuntime.resumeAvailable && frameCount > 0;
+        title.textContent = canResume
+            ? "Resume timelapse for active print"
+            : "Start timelapse for active print";
+        detail.textContent = canResume
+            ? `${fileName} already has ${frameCount} saved frame${frameCount === 1 ? "" : "s"}. Continue or dismiss this pending capture.`
+            : `${fileName} is already printing. Continue or dismiss timelapse capture for this print.`;
+        startBtn.textContent = canResume ? "Continue Timelapse" : "Start Timelapse";
+        card.style.display = "";
+    }
+
+    async function sendTimelapseCurrentAction(endpoint, successMessage) {
+        const resp = await fetch(endpoint, { method: "POST" });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+        applyRuntimeState(data);
+        if (successMessage) {
+            flash_message(successMessage, "success", 4000);
+        }
+    }
+
     function applyRuntimeState(data) {
         if (!data || typeof data !== "object") {
             return;
@@ -601,16 +645,21 @@ $(function () {
         _timelapseRuntime.capturing = !!timelapse.capturing;
         _timelapseRuntime.recovering = !!timelapse.recovering;
         _timelapseRuntime.detail = timelapse.detail || null;
+        _timelapseRuntime.promptStart = !!timelapse.prompt_start;
+        _timelapseRuntime.promptFilename = timelapse.prompt_filename || null;
+        _timelapseRuntime.resumeAvailable = !!timelapse.resume_available;
+        _timelapseRuntime.resumeFrameCount = Number(timelapse.resume_frame_count || 0);
 
         if (data.print && data.print.state !== undefined) {
             _updatePrintControlButtons(_normalizePrintStateValue(data.print.state));
         }
         renderFilamentStatus();
         renderTimelapseRuntimeStatus();
+        renderTimelapseActionCard();
     }
 
     async function loadPrinterRuntimeState() {
-        if (!document.getElementById("filament-state") || _printerRuntimeLoading) {
+        if (_printerRuntimeLoading) {
             return;
         }
         _printerRuntimeLoading = true;
@@ -627,9 +676,6 @@ $(function () {
     }
 
     function startPrinterRuntimePolling() {
-        if (!document.getElementById("filament-state")) {
-            return;
-        }
         loadPrinterRuntimeState().catch(function (err) {
             console.warn("Failed to load printer runtime state", err);
         });
@@ -3551,6 +3597,9 @@ $(function () {
     let _timelapseInterval = null;
     if (timelapseTabBtn) {
         timelapseTabBtn.addEventListener("shown.bs.tab", function () {
+            loadPrinterRuntimeState().catch(function (err) {
+                console.warn("Failed to refresh timelapse runtime state", err);
+            });
             loadTimelapses();
             if (!_timelapseInterval) {
                 _timelapseInterval = setInterval(loadTimelapses, 15000);
@@ -3563,6 +3612,31 @@ $(function () {
             }
         });
     }
+
+    $("#timelapse-action-start").on("click", async function () {
+        const btn = $(this);
+        const fileName = String(_timelapseRuntime.promptFilename || "this print").trim() || "this print";
+        btn.prop("disabled", true);
+        try {
+            await sendTimelapseCurrentAction("/api/timelapse/current/start", `Timelapse started for ${fileName}.`);
+        } catch (err) {
+            flash_message(`Timelapse start failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#timelapse-action-dismiss").on("click", async function () {
+        const btn = $(this);
+        btn.prop("disabled", true);
+        try {
+            await sendTimelapseCurrentAction("/api/timelapse/current/dismiss", "Pending timelapse capture dismissed.");
+        } catch (err) {
+            flash_message(`Dismiss failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
 
     // Delete timelapse (list button or player delete button)
     $(document).on("click", ".timelapse-delete", function () {

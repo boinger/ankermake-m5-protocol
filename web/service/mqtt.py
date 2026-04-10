@@ -70,6 +70,10 @@ PAUSE_REASON_LABELS = {
 
 FILAMENT_RUNOUT_ERROR_CODE = "0xFF01030001"
 FILAMENT_RUNOUT_CONFIRM_WINDOW_SEC = 8.0
+TIMELAPSE_START_PROMPT_BOOT_WINDOW_SEC = 20.0
+STOP_CONFIRMATION_COMMAND_TYPES = {
+    1057,  # Observed firmware stop-complete reply on stored-file jobs
+}
 
 G28_DEDUPE_WINDOW_SEC = 10.0
 STORED_FILE_SELECTION_TIMEOUT_SEC = 2.0
@@ -177,6 +181,9 @@ class MqttQueue(Service):
         self._reset_print_state()
         self._ha.update_state(mqtt_connected=True)
         self._last_query = 0
+        self._timelapse_start_prompt_window_until = (
+            time.monotonic() + TIMELAPSE_START_PROMPT_BOOT_WINDOW_SEC
+        )
 
     def _reset_print_state(self):
         self._state = PrintState.IDLE
@@ -198,6 +205,7 @@ class MqttQueue(Service):
         self._last_selected_storage_file_name = None
         self._last_print_schedule_filename = None
         self._last_print_schedule_seen_at = 0.0
+        self._clear_timelapse_start_offer()
         self._pause_reason = None
         self._filament_runout_pending = False
         self._filament_runout_pending_at = 0.0
@@ -236,6 +244,23 @@ class MqttQueue(Service):
 
         set_capture_paused(reason is not None, reason=reason)
 
+    def _clear_timelapse_start_offer(self):
+        self._timelapse_start_prompt_pending = False
+        self._timelapse_start_prompt_filename = None
+
+    def _mark_timelapse_start_offer(self, filename=None):
+        normalized = os.path.basename(str(filename or self._last_filename or "")).strip()
+        self._timelapse_start_prompt_pending = True
+        self._timelapse_start_prompt_filename = normalized or None
+
+    def _should_prompt_for_timelapse_start(self):
+        if not getattr(self._timelapse, "enabled", False):
+            return False
+        if self._state != PrintState.IDLE:
+            return False
+        window_until = getattr(self, "_timelapse_start_prompt_window_until", 0.0)
+        return bool(window_until) and time.monotonic() <= window_until
+
     @staticmethod
     def _print_state_value_label(value):
         return MQTT_PRINT_STATE_LABELS.get(value, f"unknown_{value}")
@@ -267,6 +292,12 @@ class MqttQueue(Service):
         if self._state not in (PrintState.IDLE, PrintState.PREPARING, PrintState.PRE_PRINT, PrintState.FAILED):
             return False
 
+        previous_state = self._state
+        defer_timelapse_start = (
+            previous_state == PrintState.IDLE
+            and self._should_prompt_for_timelapse_start()
+        )
+
         self._state = PrintState.PRINTING
         self._print_started_at = time.monotonic()
         self._failure_sent = False
@@ -286,10 +317,21 @@ class MqttQueue(Service):
             self._history.record_start(effective_filename, **record_kwargs)
             self._pending_history_start = False
             log.info(f"Print started, filename={effective_filename!r}")
-            self._timelapse.start_capture(effective_filename)
+            if defer_timelapse_start:
+                self._mark_timelapse_start_offer(effective_filename)
+                log.info(
+                    "Timelapse: active print detected on startup; waiting for user confirmation"
+                )
+            else:
+                self._clear_timelapse_start_offer()
+                self._timelapse.start_capture(effective_filename)
         else:
             self._pending_history_start = True
-            log.info("Print started, history deferred (no filename yet)")
+            if defer_timelapse_start:
+                self._mark_timelapse_start_offer()
+                log.info("Print started, history deferred and timelapse awaiting user confirmation")
+            else:
+                log.info("Print started, history deferred (no filename yet)")
 
         self._ha.update_state(print_status="printing")
         self._send_event(EVENT_PRINT_STARTED, self._build_payload(payload, progress))
@@ -307,7 +349,10 @@ class MqttQueue(Service):
             if self._preview_url:
                 record_kwargs["preview_url"] = self._preview_url
             self._history.record_start(self._last_filename, **record_kwargs)
-            self._timelapse.start_capture(self._last_filename)
+            if getattr(self, "_timelapse_start_prompt_pending", False):
+                self._mark_timelapse_start_offer(self._last_filename)
+            else:
+                self._timelapse.start_capture(self._last_filename)
             self._pending_history_start = False
             log.info(f"Print start completed after filename arrived, filename={self._last_filename!r}")
 
@@ -1172,6 +1217,21 @@ class MqttQueue(Service):
                 log.info("Early print activation via ct 1044")
             return
 
+        if (
+            command_type in STOP_CONFIRMATION_COMMAND_TYPES
+            and payload.get("reply") == 0
+            and self._stop_requested
+            and self._state in (PrintState.PREPARING, PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED)
+        ):
+            log.info(
+                "History: print cancelled (firmware stop confirmation %s), filename=%r",
+                command_type,
+                self._last_filename,
+            )
+            self._record_failure(payload, self._last_progress or 0, "cancelled")
+            self._reset_print_state()
+            return
+
         # --- commandType 1000: printer state machine transitions ---
         if command_type == 1000:
             value = payload.get("value")
@@ -1459,6 +1519,19 @@ class MqttQueue(Service):
                 "enabled": getattr(self._timelapse, "enabled", None),
                 "capturing": bool(capture_thread and capture_thread.is_alive()),
             }
+        prompt_filename = (
+            getattr(self, "_timelapse_start_prompt_filename", None)
+            or self._last_filename
+        )
+        timelapse_state = dict(timelapse_state)
+        timelapse_state["prompt_start"] = bool(
+            getattr(self, "_timelapse_start_prompt_pending", False)
+            and self._state in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED)
+            and not timelapse_state.get("capturing")
+        )
+        timelapse_state["prompt_filename"] = prompt_filename
+        if timelapse_state["prompt_start"] and not timelapse_state.get("detail"):
+            timelapse_state["detail"] = "Open Timelapse to continue or dismiss capture for this print."
         return {
             "print": {
                 "print_state": self._state.value,
@@ -1501,6 +1574,30 @@ class MqttQueue(Service):
             "debug_logging": getattr(self, "_debug_log_payloads", False),
             "timelapse": timelapse_state,
         }
+
+    def start_timelapse_for_current_print(self):
+        with self._state_lock:
+            if not getattr(self._timelapse, "enabled", False):
+                raise RuntimeError("Timelapse is disabled.")
+            if self._state not in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED):
+                raise RuntimeError("No active print is available for timelapse.")
+            filename = os.path.basename(str(self._last_filename or "")).strip()
+            if not filename:
+                raise RuntimeError("Current print filename is not available yet.")
+            self._clear_timelapse_start_offer()
+
+        self._timelapse.start_capture(filename)
+        return filename
+
+    def dismiss_timelapse_start_offer(self):
+        with self._state_lock:
+            filename = os.path.basename(
+                str(getattr(self, "_timelapse_start_prompt_filename", None) or self._last_filename or "")
+            ).strip() or None
+            self._clear_timelapse_start_offer()
+        discard_pending_resume = getattr(self._timelapse, "discard_pending_resume", None)
+        if callable(discard_pending_resume):
+            discard_pending_resume(filename)
 
     def simulate_event(self, event_type, payload=None):
         """Simulate an MQTT event for testing.

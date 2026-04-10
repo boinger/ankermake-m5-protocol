@@ -428,6 +428,51 @@ def test_api_printer_runtime_state_returns_filament_details():
     assert data["timelapse"]["detail"] == "Recovering video stream..."
 
 
+def test_api_timelapse_current_start_and_dismiss():
+    calls = []
+    mqtt = SimpleNamespace(
+        start_timelapse_for_current_print=lambda: calls.append("start") or "cube.gcode",
+        dismiss_timelapse_start_offer=lambda: calls.append("dismiss"),
+        get_state=lambda: {
+            "print": {
+                "print_state": "printing",
+                "state": 1,
+            },
+            "timelapse": {
+                "enabled": True,
+                "capturing": "start" in calls,
+                "prompt_start": "dismiss" not in calls and "start" not in calls,
+                "prompt_filename": "cube.gcode",
+            },
+        },
+    )
+    client = app.test_client()
+    old_values = {
+        "login": app.config.get("login"),
+        "api_key": app.config.get("api_key"),
+    }
+    old_svc = app.svc
+
+    app.config["login"] = True
+    app.config["api_key"] = None
+    app.svc = FakeServices(mqtt)
+
+    try:
+        start_response = client.post("/api/timelapse/current/start")
+        dismiss_response = client.post("/api/timelapse/current/dismiss")
+    finally:
+        app.svc = old_svc
+        for key, value in old_values.items():
+            app.config[key] = value
+
+    assert start_response.status_code == 200
+    assert dismiss_response.status_code == 200
+    assert calls == ["start", "dismiss"]
+    assert start_response.get_json()["filename"] == "cube.gcode"
+    assert start_response.get_json()["timelapse"]["capturing"] is True
+    assert dismiss_response.get_json()["timelapse"]["prompt_start"] is False
+
+
 def test_api_printer_alerts_returns_recent_entries(monkeypatch):
     calls = []
 
