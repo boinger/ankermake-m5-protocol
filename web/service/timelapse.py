@@ -70,9 +70,9 @@ class TimelapseService:
         self._save_persistent = True
         self._light_mode = None  # None | "session" | "snapshot"
 
-        # Track whether timelapse enabled video/light so we can restore afterwards
+        # Track whether timelapse currently holds the printer-video session.
         self._video_enabled_by_timelapse = False
-        self._enable_generation = None  # VideoQueue generation when WE enabled video
+        self._enable_generation = None
         self._light_was_on = None  # original light state before timelapse touched it
 
         # Resume-window state: hold completed capture state while waiting to see
@@ -228,13 +228,12 @@ class TimelapseService:
             log.warning("Timelapse: videoqueue service not available, snapshots will be skipped")
             return
 
-        was_enabled = vq.video_enabled
-        self._video_enabled_by_timelapse = not was_enabled
+        self._video_enabled_by_timelapse = True
+        self._enable_generation = getattr(vq, "_enable_generation", None)
 
-        if not was_enabled:
-            log.info("Timelapse: enabling video streaming for capture")
-            vq.set_video_enabled(True)
-            self._enable_generation = vq._enable_generation
+        if not getattr(vq, "owns_video_for_timelapse", lambda: False)():
+            log.info("Timelapse: acquiring video streaming for capture")
+        vq.set_timelapse_enabled(True)
 
         # If service is Running but PPPP not connected (was started with video_enabled=False),
         # stop and restart so worker_start() runs with video_enabled=True.
@@ -278,12 +277,8 @@ class TimelapseService:
         if not self._video_enabled_by_timelapse:
             return
         if vq:
-            if (self._enable_generation is not None
-                    and vq._enable_generation != self._enable_generation):
-                log.info("Timelapse: video was re-enabled by user during capture, leaving it on")
-            else:
-                log.info("Timelapse: disabling video streaming after capture")
-                vq.set_video_enabled(False)
+            log.info("Timelapse: releasing video streaming after capture")
+            vq.set_timelapse_enabled(False)
         self._video_enabled_by_timelapse = False
         self._enable_generation = None
 
@@ -459,13 +454,6 @@ class TimelapseService:
             return
 
         with self._lock:
-            self._stop_capture_thread()
-            self._automatic_pause_reason = None
-            self._manual_pause_requested = False
-            self._capture_pause_reason = None
-            self._last_recovery_request_at = 0.0
-            self._recovery_active = False
-            self._recovery_reason = None
             self._capture_camera = self._resolve_capture_camera()
             if not self._capture_camera.get("effective_source"):
                 log.warning(
@@ -473,15 +461,54 @@ class TimelapseService:
                 )
                 return
 
+            active_same_capture = (
+                self._current_dir is not None
+                and self._current_filename == filename
+                and filename
+                and filename != "unknown"
+            )
+            capture_thread_alive = bool(self._capture_thread and self._capture_thread.is_alive())
+
+            if active_same_capture:
+                self._automatic_pause_reason = None
+                self._manual_pause_requested = False
+                self._capture_pause_reason = None
+                self._last_recovery_request_at = 0.0
+                self._recovery_active = False
+                self._recovery_reason = None
+                if self._capture_camera.get("effective_source") == web.camera.CAMERA_SOURCE_PRINTER:
+                    self._enable_video_for_timelapse()
+                if capture_thread_alive:
+                    log.info(
+                        f"Timelapse: capture already active for '{filename}', "
+                        f"keeping existing session ({self._frame_count} frames)"
+                    )
+                    return
+                log.info(
+                    f"Timelapse: restarting capture thread for '{filename}' "
+                    f"({self._frame_count} existing frames)"
+                )
+            else:
+                self._stop_capture_thread()
+                self._automatic_pause_reason = None
+                self._manual_pause_requested = False
+                self._capture_pause_reason = None
+                self._last_recovery_request_at = 0.0
+                self._recovery_active = False
+                self._recovery_reason = None
+
             # Check if we can seamlessly resume a previous capture of the same print
             can_resume = (
-                self._resume_dir is not None
+                not active_same_capture
+                and self._resume_dir is not None
                 and self._resume_filename == filename
                 and filename
                 and filename != "unknown"
             )
 
-            if can_resume:
+            if active_same_capture:
+                pass
+            elif can_resume:
                 log.info(
                     f"Timelapse: resuming capture for '{filename}' "
                     f"({self._resume_frame_count} existing frames)"

@@ -303,6 +303,90 @@ def test_timelapse_start_capture_resumes_pending_session(monkeypatch, tmp_path):
     assert calls == ["stop-thread", "cancel-finalize", "enable-video", "thread-start"]
 
 
+def test_timelapse_start_capture_same_active_file_keeps_existing_session(monkeypatch, tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+    active_dir = str(tmp_path / _IN_PROGRESS_SUBDIR / "active_same")
+    os.makedirs(active_dir, exist_ok=True)
+    svc._current_dir = active_dir
+    svc._current_filename = "cube.gcode"
+    svc._frame_count = 7
+
+    calls = []
+
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    class UnexpectedThread:
+        def __init__(self, *args, **kwargs):
+            calls.append("new-thread")
+
+        def start(self):
+            calls.append("thread-start")
+
+    svc._capture_thread = AliveThread()
+
+    monkeypatch.setattr("web.service.timelapse._resolve_ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        TimelapseService,
+        "_resolve_capture_camera",
+        lambda self: {"effective_source": web.camera.CAMERA_SOURCE_PRINTER},
+    )
+    monkeypatch.setattr(TimelapseService, "_enable_video_for_timelapse", lambda self: calls.append("enable-video"))
+    monkeypatch.setattr(TimelapseService, "_stop_capture_thread", lambda self: calls.append("stop-thread"))
+    monkeypatch.setattr("web.service.timelapse.threading.Thread", UnexpectedThread)
+
+    svc.start_capture("cube.gcode")
+
+    assert svc._current_dir == active_dir
+    assert svc._current_filename == "cube.gcode"
+    assert svc._frame_count == 7
+    assert calls == ["enable-video"]
+
+
+def test_timelapse_start_capture_same_active_file_restarts_dead_thread(monkeypatch, tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+    active_dir = str(tmp_path / _IN_PROGRESS_SUBDIR / "active_restart")
+    os.makedirs(active_dir, exist_ok=True)
+    svc._current_dir = active_dir
+    svc._current_filename = "cube.gcode"
+    svc._frame_count = 5
+
+    calls = []
+
+    class DeadThread:
+        def is_alive(self):
+            return False
+
+    class FakeThread:
+        def __init__(self, target=None, daemon=None, name=None):
+            self.target = target
+
+        def start(self):
+            calls.append("thread-start")
+
+    svc._capture_thread = DeadThread()
+
+    monkeypatch.setattr("web.service.timelapse._resolve_ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        TimelapseService,
+        "_resolve_capture_camera",
+        lambda self: {"effective_source": web.camera.CAMERA_SOURCE_PRINTER},
+    )
+    monkeypatch.setattr(TimelapseService, "_enable_video_for_timelapse", lambda self: calls.append("enable-video"))
+    monkeypatch.setattr(TimelapseService, "_stop_capture_thread", lambda self: calls.append("stop-thread"))
+    monkeypatch.setattr("web.service.timelapse.threading.Thread", FakeThread)
+
+    svc.start_capture("cube.gcode")
+
+    assert svc._current_dir == active_dir
+    assert svc._current_filename == "cube.gcode"
+    assert svc._frame_count == 5
+    assert calls == ["enable-video", "thread-start"]
+
+
 def test_timelapse_discard_pending_resume(tmp_path):
     cfg = FakeConfigManager(tmp_path)
     svc = TimelapseService(cfg, captures_dir=tmp_path)

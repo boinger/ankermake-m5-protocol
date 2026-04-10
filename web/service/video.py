@@ -60,6 +60,7 @@ VIDEO_PROFILE_DEFAULT_ID = "hd" if "hd" in VIDEO_PROFILES_BY_ID else VIDEO_PROFI
 class VideoQueue(Service):
     def __init__(self):
         self.video_enabled = False
+        self.timelapse_enabled = False
         self.last_frame_at = None
         self._enable_generation = 0  # increments each time video is enabled
         self._viewer_count = 0
@@ -74,6 +75,36 @@ class VideoQueue(Service):
         self._manual_recovery_force_pppp = False
         self._manual_recovery_requested_at = 0.0
         super().__init__()
+
+    def _video_requested(self):
+        return bool(getattr(self, "video_enabled", False) or getattr(self, "timelapse_enabled", False))
+
+    def _sync_persistent_state(self):
+        self.persistent = self._video_requested()
+
+    def _clear_live_state(self):
+        self._pending_disable = False
+        self._live_active = False
+        self._live_started_at = None
+        self.last_frame_at = None
+        self._last_start_live_at = 0.0
+        self._last_no_frame_log_at = 0.0
+        self._last_live_refresh_at = 0.0
+        self._stall_retry_count = 0
+        self._awaiting_pppp_recycle = False
+        self._pppp_recycle_requested_at = None
+
+    def _stop_if_unrequested(self):
+        if self._video_requested():
+            return True
+        self._clear_live_state()
+        if self._viewer_count > 0:
+            log.info(f"VideoQueue: disabling video; stopping service with {self._viewer_count} video client(s) connected")
+        if self.state in (RunState.Starting, RunState.Running):
+            self.stop()
+        elif self.state in (RunState.Stopping, RunState.Stopped):
+            self.wanted = False
+        return True
 
     def api_start_live(self):
         if not self.pppp or not getattr(self.pppp, "connected", False):
@@ -180,7 +211,7 @@ class VideoQueue(Service):
         self.notify(msg)
 
     def _start_live_if_needed(self, force=False):
-        if not self.video_enabled or not self.wanted:
+        if not self._video_requested() or not self.wanted:
             return False
         if not self.pppp or not getattr(self.pppp, "connected", False):
             return False
@@ -272,6 +303,7 @@ class VideoQueue(Service):
         self.saved_video_mode = None
         self.saved_video_profile_id = None
         self.last_frame_at = None
+        self.timelapse_enabled = False
         self._live_started_at = None
         self._last_no_frame_log_at = 0.0
         self._last_live_refresh_at = 0.0
@@ -293,8 +325,8 @@ class VideoQueue(Service):
 
     def request_live_recovery(self, reason="manual recovery", force_pppp_recycle=False):
         """Ask the worker thread to refresh the live stream for a stalled client."""
-        if not self.video_enabled:
-            log.debug("VideoQueue: ignoring live recovery request because video is disabled")
+        if not self._video_requested():
+            log.debug("VideoQueue: ignoring live recovery request because video is not requested")
             return False
 
         now = time.monotonic()
@@ -350,7 +382,7 @@ class VideoQueue(Service):
         Keeping /ws/video open avoids forcing the browser to rebuild the
         websocket/JMuxer pipeline on every hard video recovery.
         """
-        if not self.video_enabled or not self.wanted:
+        if not self._video_requested() or not self.wanted:
             log.info("VideoQueue: PPPP recycle skipped because video was disabled")
             return
 
@@ -392,7 +424,7 @@ class VideoQueue(Service):
 
     def worker_start(self):
         self._stall_retry_count = 0
-        if not self.video_enabled:
+        if not self._video_requested():
             return
 
         self.pppp = self._ensure_pppp_ready()
@@ -427,10 +459,10 @@ class VideoQueue(Service):
             self.api_video_mode(self.saved_video_mode)
 
     def worker_run(self, timeout):
-        if not self.video_enabled:
+        if not self._video_requested():
             return
         self.idle(timeout=timeout)
-        if not self.video_enabled or not self.wanted:
+        if not self._video_requested() or not self.wanted:
             return
 
         if self._in_place_recovery:
@@ -544,7 +576,7 @@ class VideoQueue(Service):
             self._live_active = False
             self.api_stop_live()
             time.sleep(0.5)
-            if not self.video_enabled or not self.wanted:
+            if not self._video_requested() or not self.wanted:
                 log.info("VideoQueue: live refresh cancelled because video was disabled")
                 return
             if not pppp or not getattr(pppp, "connected", False):
@@ -574,7 +606,7 @@ class VideoQueue(Service):
                 if self._handler in self.pppp.xzyh_handlers:
                     self.pppp.xzyh_handlers.remove(self._handler)
 
-        release_pppp = (not self.wanted) or (not self.video_enabled) or getattr(app.svc, "shutting_down", False) or self._recycle_pppp_on_restart
+        release_pppp = (not self.wanted) or (not self._video_requested()) or getattr(app.svc, "shutting_down", False) or self._recycle_pppp_on_restart
         if self.pppp and self._pppp_ref_held and release_pppp:
             if self._recycle_pppp_on_restart:
                 log.info("VideoQueue: releasing PPPP so it can be recycled for video recovery")
@@ -589,7 +621,7 @@ class VideoQueue(Service):
         self._last_start_live_at = 0.0
         self.api_id = None
         self._live_started_at = None
-        if self._recycle_pppp_on_restart and self.wanted and self.video_enabled:
+        if self._recycle_pppp_on_restart and self.wanted and self._video_requested():
             log.info("VideoQueue: PPPP will be reacquired on the next worker start")
         self._recycle_pppp_on_restart = False
 
@@ -604,42 +636,55 @@ class VideoQueue(Service):
         if self._viewer_count == 0 and self._pending_disable:
             log.info("VideoQueue: last viewer disconnected; clearing stale deferred disable")
             self._pending_disable = False
-        elif self._viewer_count == 0 and not self.video_enabled and self.state == RunState.Running:
+        elif self._viewer_count == 0 and not self._video_requested() and self.state == RunState.Running:
             log.info("VideoQueue: last viewer disconnected; stopping disabled video service")
             self.stop()
         return self._viewer_count
 
     def set_video_enabled(self, enabled):
+        enabled = bool(enabled)
         if enabled:
             self._pending_disable = False
-            self.persistent = True
-            if self.video_enabled:
-                return True
+            was_enabled = bool(getattr(self, "video_enabled", False))
             self.video_enabled = True
-            self._enable_generation += 1
+            self._sync_persistent_state()
+            if not was_enabled:
+                self._enable_generation += 1
             if self.state == RunState.Stopped:
+                self.start()
+            elif not self.wanted:
                 self.start()
             return True
 
-        self.persistent = False
-        if not self.video_enabled and not self._pending_disable:
+        was_enabled = bool(getattr(self, "video_enabled", False))
+        self.video_enabled = False
+        self._sync_persistent_state()
+        if self._video_requested():
+            if was_enabled and self._viewer_count > 0:
+                log.info("VideoQueue: live view disabled; keeping stream active for timelapse")
+            return True
+        if not was_enabled and not self._pending_disable:
+            return True
+        return self._stop_if_unrequested()
+
+    def set_timelapse_enabled(self, enabled):
+        enabled = bool(enabled)
+        was_enabled = bool(getattr(self, "timelapse_enabled", False))
+        self.timelapse_enabled = enabled
+        self._sync_persistent_state()
+
+        if enabled:
+            if self.state == RunState.Stopped:
+                self.start()
+            elif not self.wanted:
+                self.start()
             return True
 
-        self._pending_disable = False
-        self.video_enabled = False
-        self._live_active = False
-        self._live_started_at = None
-        self.last_frame_at = None
-        self._last_start_live_at = 0.0
-        self._last_no_frame_log_at = 0.0
-        self._last_live_refresh_at = 0.0
-        self._stall_retry_count = 0
-        self._awaiting_pppp_recycle = False
-        self._pppp_recycle_requested_at = None
-        if self._viewer_count > 0:
-            log.info(f"VideoQueue: disabling video; stopping service with {self._viewer_count} video client(s) connected")
-        if self.state in (RunState.Starting, RunState.Running):
-            self.stop()
-        elif self.state in (RunState.Stopping, RunState.Stopped):
-            self.wanted = False
-        return True
+        if self._video_requested():
+            return True
+        if not was_enabled and not self._pending_disable:
+            return True
+        return self._stop_if_unrequested()
+
+    def owns_video_for_timelapse(self):
+        return bool(getattr(self, "timelapse_enabled", False))
