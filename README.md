@@ -30,7 +30,9 @@ The `ankerctl` program uses [`libflagship`](documentation/developer-docs/libflag
 
 - Automatic **print history** with an SQLite-backed log of every print, including start time, duration, result, and reprint status.
 
-- Automatic **timelapse** capture during prints, assembled into an MP4 video at the end. Timelapse pauses automatically during filament break/change events (requires `ffmpeg`).
+- Automatic **timelapse** capture during prints, assembled into an MP4 video at the end. Timelapse pauses automatically during filament break/change events. Full control buttons. (requires `ffmpeg`).
+
+- Snapshot page to view Timelaps shots, along with manual takin snapshots. View, download and delete options.
 
 - Live Ankerctl console view directly on the home page.
 
@@ -46,7 +48,7 @@ The `ankerctl` program uses [`libflagship`](documentation/developer-docs/libflag
 
 - **Bed Level Map** (Setup tab → Tools) reads the 7×7 bilinear compensation grid from the printer via `M420 V`, renders it as a color-coded heatmap, and supports before/after snapshot comparison to evaluate leveling results.
 
-- Includes a downloadable launcher.
+- Includes a downloadable launcher (Windows only).
 
 Let us know what you want to see; Pull requests always welcome!
 
