@@ -43,12 +43,25 @@ def test_timelapse_meta_and_video_file_helpers(tmp_path):
     time.sleep(0.01)
     video_b.write_bytes(b"bb")
 
+    snapshot_dir = tmp_path / "snapshots" / "a"
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "frame_00000.jpg").write_bytes(b"frame")
+    svc._write_meta(
+        snapshot_dir,
+        "cube.gcode",
+        1,
+        video_filename="a.mp4",
+        archived_at="2026-04-10T12:00:00",
+        status="archived",
+    )
+
     videos = svc.list_videos()
     assert [video["filename"] for video in videos] == ["b.mp4", "a.mp4"]
     assert svc.get_video_path("a.mp4") == str(video_a)
     assert svc.get_video_path("../a.mp4") is None
     assert svc.delete_video("a.mp4") is True
     assert not video_a.exists()
+    assert not snapshot_dir.exists()
 
 
 def test_timelapse_snapshot_helpers_list_download_and_delete(tmp_path):

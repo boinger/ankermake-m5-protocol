@@ -4356,6 +4356,7 @@ $(function () {
                     clearTimelapseVideoPreview("Select a video to play");
                 }
                 loadTimelapses();
+                loadTimelapseSnapshots();
             });
     });
 

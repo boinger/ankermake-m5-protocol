@@ -1216,11 +1216,46 @@ class TimelapseService:
         log.info(f"Timelapse: deleted snapshot {filename} from {collection_id}")
         return True
 
+    def _snapshot_collection_dirs_for_video(self, filename):
+        safe_video = self._safe_path_component(filename)
+        if not safe_video:
+            return []
+
+        safe_stem = os.path.splitext(safe_video)[0]
+        matches = []
+        seen = set()
+        try:
+            for name in os.listdir(self._snapshot_archive_base()):
+                dir_path = os.path.join(self._snapshot_archive_base(), name)
+                if not os.path.isdir(dir_path):
+                    continue
+                meta = self._read_meta(dir_path) or {}
+                meta_video = self._safe_path_component(meta.get("video_filename"))
+                if name == safe_stem or meta_video == safe_video:
+                    real_path = os.path.realpath(dir_path)
+                    if real_path in seen:
+                        continue
+                    seen.add(real_path)
+                    matches.append(dir_path)
+        except OSError:
+            return []
+        return matches
+
     def delete_video(self, filename):
         """Delete a timelapse video."""
         path = self.get_video_path(filename)
         if path:
             os.remove(path)
-            log.info(f"Timelapse: deleted {filename}")
+            removed_collections = []
+            for collection_dir in self._snapshot_collection_dirs_for_video(filename):
+                shutil.rmtree(collection_dir, ignore_errors=True)
+                removed_collections.append(os.path.basename(collection_dir))
+            if removed_collections:
+                log.info(
+                    f"Timelapse: deleted {filename} and snapshot collection(s) "
+                    f"{', '.join(removed_collections)}"
+                )
+            else:
+                log.info(f"Timelapse: deleted {filename}")
             return True
         return False
