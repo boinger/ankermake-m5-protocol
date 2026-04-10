@@ -22,15 +22,19 @@ The `ankerctl` program uses [`libflagship`](documentation/developer-docs/libflag
 
  - Low-level access to MQTT, PPPP and HTTPS APIs.
 
- - Send print jobs (gcode files) to the printer.
+ - Send print jobs (gcode files) to the printer, print from printers internal or USB drive.
 
  - Stream camera image/video to your computer.
 
  - Easily monitor print status.
 
- - Automatic **print history** (SQLite-backed log of every print with start time, duration, result).
+ - Automatic **print history** (SQLite-backed log of every print with start time, duration, result, reprint).
 
- - Automatic **timelapse** capture during prints — assembled into MP4 video at the end (requires `ffmpeg`).
+ - Automatic **timelapse** capture during prints — assembled into MP4 video at the end, now pauses on filament break/change (requires `ffmpeg`).
+
+ - Live view of Ankerctl consel on home page.
+
+ - Filament indicator in printer stats.
 
  - **Push notifications** via [Apprise](https://github.com/caronc/apprise) for print start, finish, failure, and progress — with optional live camera snapshots attached.
 
