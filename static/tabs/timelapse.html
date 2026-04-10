@@ -22,25 +22,54 @@
                 </div>
             </div>
         </div>
+        <div class="card mb-3">
+            <div class="card-body">
+                <div class="d-flex flex-column flex-lg-row align-items-lg-center justify-content-between gap-3">
+                    <div>
+                        <div class="fw-semibold">Timelapse Controls</div>
+                        <div class="text-muted small" id="timelapse-control-status">Use these controls to start, pause, resume, or stop timelapse capture for the active print.</div>
+                    </div>
+                    <div class="d-flex flex-wrap gap-2">
+                        <button type="button" class="btn btn-success" id="timelapse-control-start">
+                            {{ macro.bi_icon("play-fill") }} Start
+                        </button>
+                        <button type="button" class="btn btn-outline-warning" id="timelapse-control-pause">
+                            {{ macro.bi_icon("pause-fill") }} Pause
+                        </button>
+                        <button type="button" class="btn btn-outline-success" id="timelapse-control-resume">
+                            {{ macro.bi_icon("play-fill") }} Resume
+                        </button>
+                        <button type="button" class="btn btn-outline-danger" id="timelapse-control-stop">
+                            {{ macro.bi_icon("stop-fill") }} Stop
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
         <div class="row g-3">
             <!-- Left: Video player -->
             <div class="col-lg-8">
-                <div class="card" id="timelapse-player-card" style="display:none;">
-                    <div class="card-header d-flex justify-content-between align-items-center">
+                <div class="card" id="timelapse-player-card">
+                    <div class="card-header d-flex justify-content-between align-items-center" id="timelapse-player-header" style="display:none;">
                         <span id="timelapse-player-title" class="text-truncate me-2 fw-semibold"></span>
                         <button type="button" class="btn btn-sm btn-outline-danger timelapse-delete flex-shrink-0" id="timelapse-player-delete">
                             {{ macro.bi_icon("trash") }} Delete
                         </button>
                     </div>
                     <div class="card-body p-2">
-                        <video id="timelapse-player" controls class="w-100 rounded" style="max-height:500px;"></video>
-                        <p class="text-muted small mt-1 mb-0" id="timelapse-player-meta"></p>
-                    </div>
-                </div>
-                <div id="timelapse-player-placeholder" class="card d-flex align-items-center justify-content-center text-muted" style="min-height:300px;">
-                    <div class="text-center py-5">
-                        <i class="bi bi-play-circle fs-1 d-block mb-2"></i>
-                        Select a video to play
+                        <div id="timelapse-player-frame"
+                             class="d-flex align-items-center justify-content-center text-muted rounded border bg-body-tertiary overflow-hidden"
+                             style="min-height:300px;">
+                            <div id="timelapse-player-placeholder" class="text-center py-5">
+                                <i class="bi bi-play-circle fs-1 d-block mb-2"></i>
+                                <span id="timelapse-player-placeholder-text">Select a video to play</span>
+                            </div>
+                            <video id="timelapse-player"
+                                   controls
+                                   class="w-100 rounded"
+                                   style="display:none; max-height:500px;"></video>
+                        </div>
+                        <p class="text-muted small mt-2 mb-0" id="timelapse-player-meta" style="display:none;"></p>
                     </div>
                 </div>
             </div>

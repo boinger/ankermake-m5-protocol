@@ -432,6 +432,9 @@ def test_api_timelapse_current_start_and_dismiss():
     calls = []
     mqtt = SimpleNamespace(
         start_timelapse_for_current_print=lambda: calls.append("start") or "cube.gcode",
+        pause_timelapse_for_current_print=lambda: calls.append("pause") or "cube.gcode",
+        resume_timelapse_for_current_print=lambda: calls.append("resume") or "cube.gcode",
+        stop_timelapse_for_current_print=lambda: calls.append("stop") or "cube.gcode",
         dismiss_timelapse_start_offer=lambda: calls.append("dismiss"),
         get_state=lambda: {
             "print": {
@@ -440,7 +443,11 @@ def test_api_timelapse_current_start_and_dismiss():
             },
             "timelapse": {
                 "enabled": True,
-                "capturing": "start" in calls,
+                "capturing": "start" in calls and "stop" not in calls,
+                "active_capture": "start" in calls and "stop" not in calls,
+                "paused": "pause" in calls and "resume" not in calls and "stop" not in calls,
+                "pause_reason": "manual" if "pause" in calls and "resume" not in calls and "stop" not in calls else None,
+                "manual_paused": "pause" in calls and "resume" not in calls and "stop" not in calls,
                 "prompt_start": "dismiss" not in calls and "start" not in calls,
                 "prompt_filename": "cube.gcode",
             },
@@ -459,6 +466,9 @@ def test_api_timelapse_current_start_and_dismiss():
 
     try:
         start_response = client.post("/api/timelapse/current/start")
+        pause_response = client.post("/api/timelapse/current/pause")
+        resume_response = client.post("/api/timelapse/current/resume")
+        stop_response = client.post("/api/timelapse/current/stop")
         dismiss_response = client.post("/api/timelapse/current/dismiss")
     finally:
         app.svc = old_svc
@@ -466,10 +476,17 @@ def test_api_timelapse_current_start_and_dismiss():
             app.config[key] = value
 
     assert start_response.status_code == 200
+    assert pause_response.status_code == 200
+    assert resume_response.status_code == 200
+    assert stop_response.status_code == 200
     assert dismiss_response.status_code == 200
-    assert calls == ["start", "dismiss"]
+    assert calls == ["start", "pause", "resume", "stop", "dismiss"]
     assert start_response.get_json()["filename"] == "cube.gcode"
     assert start_response.get_json()["timelapse"]["capturing"] is True
+    assert pause_response.get_json()["timelapse"]["paused"] is True
+    assert pause_response.get_json()["timelapse"]["pause_reason"] == "manual"
+    assert resume_response.get_json()["timelapse"]["paused"] is False
+    assert stop_response.get_json()["timelapse"]["capturing"] is False
     assert dismiss_response.get_json()["timelapse"]["prompt_start"] is False
 
 

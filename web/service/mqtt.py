@@ -1613,6 +1613,62 @@ class MqttQueue(Service):
         if callable(discard_pending_resume):
             discard_pending_resume(filename)
 
+    def pause_timelapse_for_current_print(self):
+        with self._state_lock:
+            if not getattr(self._timelapse, "enabled", False):
+                raise RuntimeError("Timelapse is disabled.")
+            if self._state not in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED):
+                raise RuntimeError("No active print is available for timelapse.")
+
+        has_active_capture = getattr(self._timelapse, "has_active_capture", None)
+        if not callable(has_active_capture) or not has_active_capture():
+            raise RuntimeError("No active timelapse capture is running.")
+
+        self._timelapse.set_manual_pause(True)
+        return os.path.basename(str(self._last_filename or "")).strip() or None
+
+    def resume_timelapse_for_current_print(self):
+        with self._state_lock:
+            if not getattr(self._timelapse, "enabled", False):
+                raise RuntimeError("Timelapse is disabled.")
+            if self._state not in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED):
+                raise RuntimeError("No active print is available for timelapse.")
+
+        has_active_capture = getattr(self._timelapse, "has_active_capture", None)
+        if not callable(has_active_capture) or not has_active_capture():
+            raise RuntimeError("No active timelapse capture is running.")
+        runtime_state_getter = getattr(self._timelapse, "get_runtime_state", None)
+        if callable(runtime_state_getter):
+            runtime_state = runtime_state_getter()
+            if not runtime_state.get("manual_paused"):
+                raise RuntimeError("Timelapse is not paused manually.")
+
+        self._timelapse.set_manual_pause(False)
+        return os.path.basename(str(self._last_filename or "")).strip() or None
+
+    def stop_timelapse_for_current_print(self):
+        with self._state_lock:
+            if not getattr(self._timelapse, "enabled", False):
+                raise RuntimeError("Timelapse is disabled.")
+            prompt_pending = bool(getattr(self, "_timelapse_start_prompt_pending", False))
+            if self._state not in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED) and not prompt_pending:
+                raise RuntimeError("No active print is available for timelapse.")
+            filename = os.path.basename(str(self._last_filename or "")).strip() or None
+            self._clear_timelapse_start_offer()
+
+        has_active_capture = getattr(self._timelapse, "has_active_capture", None)
+        if prompt_pending and (not callable(has_active_capture) or not has_active_capture()):
+            discard_pending_resume = getattr(self._timelapse, "discard_pending_resume", None)
+            if callable(discard_pending_resume):
+                discard_pending_resume(filename)
+            return filename
+
+        if not callable(has_active_capture) or not has_active_capture():
+            raise RuntimeError("No active timelapse capture is running.")
+
+        self._timelapse.finish_capture(final=True)
+        return filename
+
     def simulate_event(self, event_type, payload=None):
         """Simulate an MQTT event for testing.
 

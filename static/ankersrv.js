@@ -493,6 +493,10 @@ $(function () {
     };
     const _timelapseRuntime = {
         capturing: false,
+        activeCapture: false,
+        paused: false,
+        pauseReason: null,
+        manualPaused: false,
         recovering: false,
         detail: null,
         promptStart: false,
@@ -602,6 +606,51 @@ $(function () {
         } else {
             el.addClass("text-muted");
         }
+    }
+
+    function renderTimelapseControls() {
+        const startBtn = $("#timelapse-control-start");
+        const pauseBtn = $("#timelapse-control-pause");
+        const resumeBtn = $("#timelapse-control-resume");
+        const stopBtn = $("#timelapse-control-stop");
+        const statusEl = $("#timelapse-control-status");
+
+        if (!startBtn.length || !pauseBtn.length || !resumeBtn.length || !stopBtn.length || !statusEl.length) {
+            return;
+        }
+
+        const printActive = _currentPrintState === PRINT_STATE.CALIBRATING
+            || _currentPrintState === PRINT_STATE.PENDING_START
+            || _currentPrintState === PRINT_STATE.PRINTING
+            || _currentPrintState === PRINT_STATE.PAUSED;
+        const canStart = printActive && !_timelapseRuntime.capturing;
+        const canPause = _timelapseRuntime.capturing && !_timelapseRuntime.paused;
+        const canResume = _timelapseRuntime.capturing && _timelapseRuntime.manualPaused;
+        const canStop = _timelapseRuntime.capturing || _timelapseRuntime.activeCapture;
+
+        startBtn.prop("disabled", !canStart);
+        pauseBtn.prop("disabled", !canPause);
+        resumeBtn.prop("disabled", !canResume);
+        stopBtn.prop("disabled", !canStop);
+
+        let message = "Use these controls to start, pause, resume, or stop timelapse capture for the active print.";
+        if (_timelapseRuntime.promptStart && !_timelapseRuntime.capturing) {
+            message = "An active print is waiting for timelapse confirmation. Use Start or the action card to begin capture.";
+        } else if (_timelapseRuntime.recovering) {
+            message = "Timelapse is recovering the camera stream.";
+        } else if (_timelapseRuntime.capturing && _timelapseRuntime.paused) {
+            message = _timelapseRuntime.pauseReason === "manual"
+                ? "Timelapse is paused manually."
+                : `Timelapse is paused: ${_timelapseRuntime.detail || "capture is waiting to resume."}`;
+        } else if (_timelapseRuntime.capturing) {
+            message = "Timelapse capture is running for the active print.";
+        } else if (_timelapseRuntime.activeCapture) {
+            message = "Timelapse frames are still saved for this print, but capture is not actively running.";
+        } else if (!printActive) {
+            message = "Start a print to enable manual timelapse controls.";
+        }
+
+        statusEl.text(message);
     }
 
     function renderTimelapseActionCard() {
@@ -754,6 +803,10 @@ $(function () {
         _filamentStatus.pendingRunout = false;
         const timelapse = data.timelapse || {};
         _timelapseRuntime.capturing = !!timelapse.capturing;
+        _timelapseRuntime.activeCapture = !!timelapse.active_capture;
+        _timelapseRuntime.paused = !!timelapse.paused;
+        _timelapseRuntime.pauseReason = timelapse.pause_reason || null;
+        _timelapseRuntime.manualPaused = !!timelapse.manual_paused;
         _timelapseRuntime.recovering = !!timelapse.recovering;
         _timelapseRuntime.detail = timelapse.detail || null;
         _timelapseRuntime.promptStart = !!timelapse.prompt_start;
@@ -768,6 +821,7 @@ $(function () {
         renderFilamentStatus();
         renderTimelapseRuntimeStatus();
         renderTimelapseActionCard();
+        renderTimelapseControls();
     }
 
     async function loadPrinterRuntimeState() {
@@ -2385,7 +2439,7 @@ $(function () {
         }
         bedSnapSave(snaps);
         bedSnapRefreshUI();
-        flash_message("Snapshot saved.", "success", 3000);
+        flash_message("Bed map saved.", "success", 3000);
     }
 
     /**
@@ -2410,7 +2464,7 @@ $(function () {
             const prevA = selA.value;
             selA.innerHTML = "";
             if (snaps.length === 0) {
-                selA.innerHTML = '<option value="" disabled selected>No snapshots saved yet</option>';
+                selA.innerHTML = '<option value="" disabled selected>No bed maps saved yet</option>';
             } else {
                 snaps.forEach(s => {
                     const opt = document.createElement("option");
@@ -2440,7 +2494,7 @@ $(function () {
         const listEl = document.getElementById("bed-snap-list");
         if (listEl) {
             if (snaps.length === 0) {
-                listEl.innerHTML = '<span class="text-muted small">No snapshots saved yet.</span>';
+                listEl.innerHTML = '<span class="text-muted small">No bed maps saved yet.</span>';
             } else {
                 listEl.innerHTML = "";
                 snaps.forEach(s => {
@@ -2545,14 +2599,14 @@ $(function () {
 
         const snapIdA = selA ? selA.value : "";
         if (!snapIdA) {
-            statusEl.innerHTML = '<div class="alert alert-warning py-2 small mb-0">Please select Snapshot A first.</div>';
+            statusEl.innerHTML = '<div class="alert alert-warning py-2 small mb-0">Please select Bed Map A first.</div>';
             return;
         }
 
         const snaps = bedSnapLoad();
         const snapA = snaps.find(s => s.id === snapIdA);
         if (!snapA) {
-            statusEl.innerHTML = '<div class="alert alert-danger py-2 small mb-0">Snapshot A not found.</div>';
+            statusEl.innerHTML = '<div class="alert alert-danger py-2 small mb-0">Bed Map A not found.</div>';
             return;
         }
 
@@ -2583,7 +2637,7 @@ $(function () {
         } else {
             const snapB = snaps.find(s => s.id === snapBId);
             if (!snapB) {
-                statusEl.innerHTML = '<div class="alert alert-danger py-2 small mb-0">Snapshot B not found.</div>';
+                statusEl.innerHTML = '<div class="alert alert-danger py-2 small mb-0">Bed Map B not found.</div>';
                 return;
             }
             dataB = snapB.data;
@@ -2830,6 +2884,8 @@ $(function () {
             a.download = `ankerctl_snapshot_${Date.now()}.jpg`;
             a.click();
             URL.revokeObjectURL(url);
+            flash_message("Snapshot downloaded and saved to Snapshots.", "success", 4000);
+            loadTimelapseSnapshots();
         } catch (err) {
             const msg = err.message || String(err);
             const banner = /^snapshot\b/i.test(msg) ? msg : `Snapshot failed: ${msg}`;
@@ -3777,26 +3833,292 @@ $(function () {
         return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
     }
 
+    let _timelapseSnapshotCollections = [];
+    let _timelapseSelectedCollectionId = null;
+    let _timelapseSelectedFrameName = null;
+
+    function getTimelapseSnapshotCollection(id) {
+        return _timelapseSnapshotCollections.find(collection => collection.id === id) || null;
+    }
+
+    function clearTimelapseSnapshotPreview(message) {
+        const imageEl = document.getElementById("timelapse-snapshot-image");
+        const placeholder = document.getElementById("timelapse-snapshot-placeholder");
+        const placeholderText = document.getElementById("timelapse-snapshot-placeholder-text");
+        const titleEl = document.getElementById("timelapse-snapshot-title");
+        const subtitleEl = document.getElementById("timelapse-snapshot-subtitle");
+        const metaEl = document.getElementById("timelapse-snapshot-meta");
+        const downloadEl = document.getElementById("timelapse-snapshot-download");
+        const deleteBtn = document.getElementById("timelapse-snapshot-delete");
+
+        if (imageEl) {
+            imageEl.onload = null;
+            imageEl.onerror = null;
+            imageEl.removeAttribute("src");
+            imageEl.style.display = "none";
+        }
+        if (placeholderText && message) {
+            placeholderText.textContent = message;
+        }
+        if (placeholder) {
+            placeholder.style.display = "";
+        }
+        if (titleEl) titleEl.textContent = "Snapshot Viewer";
+        if (subtitleEl) {
+            subtitleEl.textContent = "Select a saved snapshot to preview.";
+            subtitleEl.style.display = "";
+        }
+        if (metaEl) {
+            metaEl.textContent = "";
+            metaEl.style.display = "none";
+        }
+        if (downloadEl) {
+            downloadEl.classList.add("disabled");
+            downloadEl.setAttribute("href", "#");
+            downloadEl.removeAttribute("download");
+        }
+        if (deleteBtn) {
+            deleteBtn.disabled = true;
+            deleteBtn.removeAttribute("data-collection");
+            deleteBtn.removeAttribute("data-file");
+        }
+    }
+
+    function getSnapshotCollectionStateSuffix(collection) {
+        if (!collection) return "";
+        if (collection.state === "capturing") return " (active)";
+        if (collection.state === "resume_pending") return " (paused)";
+        if (collection.state === "manual") return " (manual)";
+        return "";
+    }
+
+    function getSnapshotCollectionSubtitle(collection) {
+        if (!collection) return "";
+        if (collection.state === "manual") {
+            return collection.source_label
+                ? `Manual snapshot from ${collection.source_label}.`
+                : "Manual snapshot.";
+        }
+        if (collection.state === "capturing") {
+            return "Timelapse capture in progress.";
+        }
+        if (collection.state === "resume_pending") {
+            return "Timelapse capture is paused and still resumable.";
+        }
+        return collection.video_filename
+            ? `Saved from timelapse ${collection.video_filename}.`
+            : "Saved timelapse snapshot.";
+    }
+
+    function timelapseSelectSnapshot(collectionId, frameName) {
+        const collection = getTimelapseSnapshotCollection(collectionId);
+        const frame = collection ? (collection.frames || []).find(item => item.filename === frameName) : null;
+        const collectionSelect = document.getElementById("timelapse-snapshot-collection");
+        const frameSelect = document.getElementById("timelapse-snapshot-select");
+        const imageEl = document.getElementById("timelapse-snapshot-image");
+        const placeholder = document.getElementById("timelapse-snapshot-placeholder");
+        const titleEl = document.getElementById("timelapse-snapshot-title");
+        const subtitleEl = document.getElementById("timelapse-snapshot-subtitle");
+        const metaEl = document.getElementById("timelapse-snapshot-meta");
+        const statusEl = document.getElementById("timelapse-snapshot-status");
+        const downloadEl = document.getElementById("timelapse-snapshot-download");
+        const deleteBtn = document.getElementById("timelapse-snapshot-delete");
+
+        if (!collection || !frame) {
+            _timelapseSelectedCollectionId = null;
+            _timelapseSelectedFrameName = null;
+            clearTimelapseSnapshotPreview("Select a saved snapshot to preview");
+            if (statusEl && !_timelapseSnapshotCollections.length) {
+                statusEl.textContent = "Saved timelapse and manual snapshots will appear here.";
+            }
+            return;
+        }
+
+        _timelapseSelectedCollectionId = collection.id;
+        _timelapseSelectedFrameName = frame.filename;
+
+        if (collectionSelect) collectionSelect.value = collection.id;
+        if (frameSelect) frameSelect.value = frame.filename;
+
+        if (titleEl) titleEl.textContent = collection.label || collection.id;
+        if (subtitleEl) {
+            const subtitle = getSnapshotCollectionSubtitle(collection);
+            subtitleEl.textContent = subtitle;
+            subtitleEl.style.display = subtitle ? "" : "none";
+        }
+        if (metaEl) {
+            const created = frame.created_at ? new Date(frame.created_at).toLocaleString() : "-";
+            metaEl.textContent = `${frame.filename} · ${created} · ${formatSize(frame.size_bytes)}`;
+            metaEl.style.display = "";
+        }
+        if (statusEl) {
+            if (collection.state === "manual") {
+                statusEl.textContent = collection.source_label
+                    ? `Manual snapshot saved from ${collection.source_label}.`
+                    : "Manual snapshot saved.";
+            } else if (collection.allow_delete) {
+                statusEl.textContent = `${collection.frame_count} frame(s) available in this capture.`;
+            } else if (collection.state === "capturing") {
+                statusEl.textContent = "This capture is still running. Frames are view-only until the timelapse finishes.";
+            } else {
+                statusEl.textContent = "This capture is still resumable. Frames are view-only until the timelapse is finalized.";
+            }
+        }
+        if (imageEl) {
+            imageEl.onload = function () {
+                imageEl.style.display = "";
+                if (placeholder) {
+                    placeholder.style.display = "none";
+                }
+            };
+            imageEl.onerror = function () {
+                clearTimelapseSnapshotPreview("Unable to load snapshot preview");
+            };
+            imageEl.src = `/api/timelapse-snapshot/${encodeURIComponent(collection.id)}/${encodeURIComponent(frame.filename)}`;
+        }
+        if (downloadEl) {
+            downloadEl.classList.remove("disabled");
+            downloadEl.href = `/api/timelapse-snapshot/${encodeURIComponent(collection.id)}/${encodeURIComponent(frame.filename)}?download=1`;
+            downloadEl.setAttribute("download", frame.filename);
+        }
+        if (deleteBtn) {
+            deleteBtn.disabled = !collection.allow_delete;
+            deleteBtn.dataset.collection = collection.id;
+            deleteBtn.dataset.file = frame.filename;
+        }
+    }
+
+    function renderTimelapseSnapshots() {
+        const collectionSelect = document.getElementById("timelapse-snapshot-collection");
+        const frameSelect = document.getElementById("timelapse-snapshot-select");
+        const statusEl = document.getElementById("timelapse-snapshot-status");
+
+        if (!collectionSelect || !frameSelect) return;
+
+        collectionSelect.innerHTML = "";
+        frameSelect.innerHTML = "";
+
+        if (!_timelapseSnapshotCollections.length) {
+            collectionSelect.innerHTML = '<option value="" selected>No snapshots available</option>';
+            collectionSelect.disabled = true;
+            frameSelect.innerHTML = '<option value="" selected>No snapshots available</option>';
+            frameSelect.disabled = true;
+            if (statusEl) {
+                statusEl.textContent = "Saved timelapse and manual snapshots will appear here.";
+            }
+            clearTimelapseSnapshotPreview("Select a saved snapshot to preview");
+            return;
+        }
+
+        collectionSelect.disabled = false;
+        _timelapseSnapshotCollections.forEach(collection => {
+            const option = document.createElement("option");
+            option.value = collection.id;
+            const stateSuffix = getSnapshotCollectionStateSuffix(collection);
+            option.textContent = `${collection.label || collection.id} · ${collection.frame_count} frame(s)${stateSuffix}`;
+            collectionSelect.appendChild(option);
+        });
+
+        let selectedCollection = getTimelapseSnapshotCollection(_timelapseSelectedCollectionId);
+        if (!selectedCollection) {
+            selectedCollection = _timelapseSnapshotCollections[0];
+            _timelapseSelectedCollectionId = selectedCollection.id;
+        }
+        collectionSelect.value = selectedCollection.id;
+
+        const frames = Array.isArray(selectedCollection.frames) ? selectedCollection.frames : [];
+        if (!frames.length) {
+            frameSelect.innerHTML = '<option value="" selected>No snapshots available</option>';
+            frameSelect.disabled = true;
+            clearTimelapseSnapshotPreview("No snapshots available in this collection");
+            return;
+        }
+
+        frameSelect.disabled = false;
+        frames.forEach(frame => {
+            const option = document.createElement("option");
+            option.value = frame.filename;
+            const created = frame.created_at ? new Date(frame.created_at).toLocaleTimeString() : "-";
+            option.textContent = `${frame.filename} · ${created}`;
+            frameSelect.appendChild(option);
+        });
+
+        const selectedFrame = frames.find(frame => frame.filename === _timelapseSelectedFrameName) || frames[frames.length - 1];
+        timelapseSelectSnapshot(selectedCollection.id, selectedFrame.filename);
+    }
+
+    function loadTimelapseSnapshots() {
+        return fetch("/api/timelapse-snapshots")
+            .then(r => r.json())
+            .then(data => {
+                _timelapseSnapshotCollections = Array.isArray(data.collections) ? data.collections : [];
+                renderTimelapseSnapshots();
+            })
+            .catch(err => console.error("Timelapse snapshot load failed:", err));
+    }
+
+    function clearTimelapseVideoPreview(message) {
+        const headerEl = document.getElementById("timelapse-player-header");
+        const placeholderEl = document.getElementById("timelapse-player-placeholder");
+        const placeholderTextEl = document.getElementById("timelapse-player-placeholder-text");
+        const videoEl = document.getElementById("timelapse-player");
+        const titleEl = document.getElementById("timelapse-player-title");
+        const metaEl = document.getElementById("timelapse-player-meta");
+        const deleteBtn = document.getElementById("timelapse-player-delete");
+
+        if (videoEl) {
+            try {
+                videoEl.pause();
+            } catch (_err) {}
+            videoEl.removeAttribute("src");
+            videoEl.removeAttribute("data-file");
+            videoEl.style.display = "none";
+            videoEl.load();
+        }
+        if (headerEl) headerEl.style.display = "none";
+        if (titleEl) titleEl.textContent = "";
+        if (metaEl) {
+            metaEl.textContent = "";
+            metaEl.style.display = "none";
+        }
+        if (placeholderTextEl) {
+            placeholderTextEl.textContent = message || "Select a video to play";
+        }
+        if (placeholderEl) placeholderEl.style.display = "";
+        if (deleteBtn) deleteBtn.removeAttribute("data-file");
+
+        document.querySelectorAll("#timelapse-list .list-group-item").forEach(el => {
+            el.classList.remove("active");
+        });
+    }
+
     function timelapseSelectVideo(v) {
-        const card        = document.getElementById("timelapse-player-card");
-        const placeholder = document.getElementById("timelapse-player-placeholder");
-        const videoEl     = document.getElementById("timelapse-player");
-        const titleEl     = document.getElementById("timelapse-player-title");
-        const metaEl      = document.getElementById("timelapse-player-meta");
-        const deleteBtn   = document.getElementById("timelapse-player-delete");
-        if (!card || !videoEl) return;
+        const headerEl = document.getElementById("timelapse-player-header");
+        const placeholderEl = document.getElementById("timelapse-player-placeholder");
+        const videoEl = document.getElementById("timelapse-player");
+        const titleEl = document.getElementById("timelapse-player-title");
+        const metaEl = document.getElementById("timelapse-player-meta");
+        const deleteBtn = document.getElementById("timelapse-player-delete");
+        if (!videoEl) return;
 
         document.querySelectorAll("#timelapse-list .list-group-item").forEach(el => {
             el.classList.toggle("active", el.dataset.file === v.filename);
         });
 
-        titleEl.textContent = v.filename;
-        metaEl.textContent  = `${v.created_at ? new Date(v.created_at).toLocaleString() : "-"} · ${formatSize(v.size_bytes)}`;
-        videoEl.src         = `/api/timelapse/${encodeURIComponent(v.filename)}`;
-        videoEl.load();
+        if (titleEl) titleEl.textContent = v.filename;
+        if (metaEl) {
+            metaEl.textContent = `${v.created_at ? new Date(v.created_at).toLocaleString() : "-"} · ${formatSize(v.size_bytes)}`;
+            metaEl.style.display = "";
+        }
+
         if (deleteBtn) deleteBtn.dataset.file = v.filename;
-        card.style.display        = "";
-        placeholder.style.display = "none";
+        videoEl.dataset.file = v.filename;
+        videoEl.src = `/api/timelapse/${encodeURIComponent(v.filename)}`;
+        videoEl.style.display = "";
+        videoEl.load();
+
+        if (headerEl) headerEl.style.display = "";
+        if (placeholderEl) placeholderEl.style.display = "none";
     }
 
     function loadTimelapses() {
@@ -3804,23 +4126,30 @@ $(function () {
             .then(r => r.json())
             .then(data => {
                 const banner = document.getElementById("timelapse-disabled-banner");
-                if (banner) banner.style.display = data.enabled ? "none" : "";
-
                 const list = document.getElementById("timelapse-list");
+                const videoEl = document.getElementById("timelapse-player");
+                const currentFile = videoEl ? (videoEl.dataset.file || "") : "";
+
+                if (banner) banner.style.display = data.enabled ? "none" : "";
                 if (!list) return;
+
                 list.innerHTML = "";
 
-                if (data.videos.length === 0) {
+                if (!Array.isArray(data.videos) || data.videos.length === 0) {
                     list.innerHTML = '<div class="text-center text-muted py-4">No timelapse videos yet</div>';
+                    clearTimelapseVideoPreview("Select a video to play");
                     return;
                 }
+
+                let currentFileStillExists = false;
+
                 data.videos.forEach(v => {
-                    const created      = v.created_at ? new Date(v.created_at).toLocaleString() : "-";
+                    const created = v.created_at ? new Date(v.created_at).toLocaleString() : "-";
                     const safeFilename = escapeHtml(v.filename);
-                    const item         = document.createElement("div");
-                    item.className     = "list-group-item list-group-item-action d-flex justify-content-between align-items-center py-2 px-3";
-                    item.dataset.file  = v.filename;
-                    item.innerHTML     = `
+                    const item = document.createElement("div");
+                    item.className = "list-group-item list-group-item-action d-flex justify-content-between align-items-center py-2 px-3";
+                    item.dataset.file = v.filename;
+                    item.innerHTML = `
                         <div class="overflow-hidden me-2" style="cursor:pointer; flex:1; min-width:0;">
                             <div class="text-truncate fw-semibold small">${safeFilename}</div>
                             <div class="text-muted" style="font-size:0.75em;">${created} · ${formatSize(v.size_bytes)}</div>
@@ -3829,34 +4158,70 @@ $(function () {
                             <a href="/api/timelapse/${encodeURIComponent(v.filename)}" class="btn btn-sm btn-outline-secondary" download title="Download">
                                 <i class="bi bi-download"></i>
                             </a>
-                            <button type="button" class="btn btn-sm btn-outline-danger timelapse-delete" data-file="${safeFilename}" title="Delete">
+                            <button type="button" class="btn btn-sm btn-outline-danger timelapse-delete" title="Delete">
                                 <i class="bi bi-trash"></i>
                             </button>
                         </div>`;
+
+                    item.querySelector(".timelapse-delete").dataset.file = v.filename;
+
+                    if (currentFile && currentFile === v.filename) {
+                        item.classList.add("active");
+                        currentFileStillExists = true;
+                    }
+
                     item.querySelector(".overflow-hidden").addEventListener("click", () => timelapseSelectVideo(v));
                     list.appendChild(item);
                 });
+
+                if (currentFile && !currentFileStillExists) {
+                    clearTimelapseVideoPreview("Select a video to play");
+                }
             })
             .catch(err => console.error("Timelapse load failed:", err));
     }
 
     // Load on tab show; auto-refresh every 15 s while active.
     const timelapseTabBtn = document.querySelector('button[data-bs-target="#timelapse"]');
-    let _timelapseInterval = null;
+    let _timelapseVideoInterval = null;
     if (timelapseTabBtn) {
         timelapseTabBtn.addEventListener("shown.bs.tab", function () {
             loadPrinterRuntimeState().catch(function (err) {
                 console.warn("Failed to refresh timelapse runtime state", err);
             });
             loadTimelapses();
-            if (!_timelapseInterval) {
-                _timelapseInterval = setInterval(loadTimelapses, 15000);
+            if (!_timelapseVideoInterval) {
+                _timelapseVideoInterval = setInterval(function () {
+                    loadTimelapses();
+                }, 15000);
             }
         });
         timelapseTabBtn.addEventListener("hidden.bs.tab", function () {
-            if (_timelapseInterval) {
-                clearInterval(_timelapseInterval);
-                _timelapseInterval = null;
+            if (_timelapseVideoInterval) {
+                clearInterval(_timelapseVideoInterval);
+                _timelapseVideoInterval = null;
+            }
+        });
+    }
+
+    const snapshotsTabBtn = document.querySelector('button[data-bs-target="#snapshots"]');
+    let _timelapseSnapshotInterval = null;
+    if (snapshotsTabBtn) {
+        snapshotsTabBtn.addEventListener("shown.bs.tab", function () {
+            loadPrinterRuntimeState().catch(function (err) {
+                console.warn("Failed to refresh snapshot runtime state", err);
+            });
+            loadTimelapseSnapshots();
+            if (!_timelapseSnapshotInterval) {
+                _timelapseSnapshotInterval = setInterval(function () {
+                    loadTimelapseSnapshots();
+                }, 15000);
+            }
+        });
+        snapshotsTabBtn.addEventListener("hidden.bs.tab", function () {
+            if (_timelapseSnapshotInterval) {
+                clearInterval(_timelapseSnapshotInterval);
+                _timelapseSnapshotInterval = null;
             }
         });
     }
@@ -3867,8 +4232,62 @@ $(function () {
         btn.prop("disabled", true);
         try {
             await sendTimelapseCurrentAction("/api/timelapse/current/start", `Timelapse started for ${fileName}.`);
+            loadTimelapseSnapshots();
         } catch (err) {
             flash_message(`Timelapse start failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#timelapse-control-start").on("click", async function () {
+        const btn = $(this);
+        const fileName = String(_timelapseRuntime.promptFilename || "this print").trim() || "this print";
+        btn.prop("disabled", true);
+        try {
+            await sendTimelapseCurrentAction("/api/timelapse/current/start", `Timelapse started for ${fileName}.`);
+            loadTimelapseSnapshots();
+        } catch (err) {
+            flash_message(`Timelapse start failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#timelapse-control-pause").on("click", async function () {
+        const btn = $(this);
+        btn.prop("disabled", true);
+        try {
+            await sendTimelapseCurrentAction("/api/timelapse/current/pause", "Timelapse paused.");
+        } catch (err) {
+            flash_message(`Timelapse pause failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#timelapse-control-resume").on("click", async function () {
+        const btn = $(this);
+        btn.prop("disabled", true);
+        try {
+            await sendTimelapseCurrentAction("/api/timelapse/current/resume", "Timelapse resumed.");
+        } catch (err) {
+            flash_message(`Timelapse resume failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#timelapse-control-stop").on("click", async function () {
+        const btn = $(this);
+        if (!confirm("Stop timelapse capture for the current print?")) return;
+        btn.prop("disabled", true);
+        try {
+            await sendTimelapseCurrentAction("/api/timelapse/current/stop", "Timelapse stopped.");
+            loadTimelapseSnapshots();
+            loadTimelapses();
+        } catch (err) {
+            flash_message(`Timelapse stop failed: ${err.message || err}`, "danger", 6000);
         } finally {
             btn.prop("disabled", false);
         }
@@ -3879,8 +4298,48 @@ $(function () {
         btn.prop("disabled", true);
         try {
             await sendTimelapseCurrentAction("/api/timelapse/current/dismiss", "Pending timelapse capture dismissed.");
+            loadTimelapseSnapshots();
         } catch (err) {
             flash_message(`Dismiss failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#timelapse-snapshot-collection").on("change", function () {
+        _timelapseSelectedCollectionId = this.value || null;
+        _timelapseSelectedFrameName = null;
+        renderTimelapseSnapshots();
+    });
+
+    $("#timelapse-snapshot-select").on("change", function () {
+        if (!_timelapseSelectedCollectionId) return;
+        timelapseSelectSnapshot(_timelapseSelectedCollectionId, this.value || "");
+    });
+
+    $("#timelapse-snapshot-delete").on("click", async function () {
+        const btn = $(this);
+        const collectionId = btn.data("collection");
+        const filename = btn.data("file");
+        const collection = getTimelapseSnapshotCollection(collectionId);
+        if (!collectionId || !filename || !collection || !collection.allow_delete) {
+            return;
+        }
+        if (!confirm(`Delete snapshot ${filename}?`)) return;
+        btn.prop("disabled", true);
+        try {
+            const resp = await fetch(
+                `/api/timelapse-snapshot/${encodeURIComponent(collectionId)}/${encodeURIComponent(filename)}`,
+                { method: "DELETE" }
+            );
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            flash_message(`Deleted snapshot ${filename}.`, "success", 4000);
+            await loadTimelapseSnapshots();
+        } catch (err) {
+            flash_message(`Snapshot delete failed: ${err.message || err}`, "danger", 6000);
         } finally {
             btn.prop("disabled", false);
         }
@@ -3892,14 +4351,9 @@ $(function () {
         if (!confirm(`Delete timelapse ${file}?`)) return;
         fetch(`/api/timelapse/${encodeURIComponent(file)}`, { method: "DELETE" })
             .then(() => {
-                // If the deleted video is currently loaded in the player, clear it
-                const videoEl     = document.getElementById("timelapse-player");
-                const card        = document.getElementById("timelapse-player-card");
-                const placeholder = document.getElementById("timelapse-player-placeholder");
-                if (videoEl && videoEl.src.endsWith(encodeURIComponent(file))) {
-                    videoEl.src = "";
-                    if (card)        card.style.display        = "none";
-                    if (placeholder) placeholder.style.display = "";
+                const videoEl = document.getElementById("timelapse-player");
+                if (videoEl && (videoEl.dataset.file || "") === file) {
+                    clearTimelapseVideoPreview("Select a video to play");
                 }
                 loadTimelapses();
             });

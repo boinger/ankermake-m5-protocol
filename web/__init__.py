@@ -2896,6 +2896,19 @@ def app_api_snapshot():
     except OSError as err:
         return {"error": f"Snapshot could not run ffmpeg: {err}"}, 500
 
+    taken_at = datetime.now()
+    with borrow_mqtt() as mqtt:
+        timelapse = getattr(mqtt, "timelapse", None) if mqtt else None
+        if timelapse:
+            try:
+                timelapse.save_manual_snapshot(
+                    temp_path,
+                    camera_settings=camera_settings,
+                    taken_at=taken_at,
+                )
+            except OSError as err:
+                log.warning(f"Manual snapshot archive save failed: {err}")
+
     @after_this_request
     def _cleanup(response):
         try:
@@ -2904,7 +2917,7 @@ def app_api_snapshot():
             pass
         return response
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = taken_at.strftime("%Y%m%d_%H%M%S")
     return send_file(
         temp_path,
         mimetype="image/jpeg",
@@ -3415,6 +3428,15 @@ def app_api_timelapses():
     return {"videos": videos, "enabled": enabled}
 
 
+@app.get("/api/timelapse-snapshots")
+def app_api_timelapse_snapshots():
+    """List available timelapse snapshot collections and frames."""
+    with borrow_mqtt() as mqtt:
+        collections = mqtt.timelapse.list_snapshots()
+        enabled = mqtt.timelapse.enabled
+    return {"collections": collections, "enabled": enabled}
+
+
 @app.post("/api/timelapse/current/start")
 def app_api_timelapse_current_start():
     with borrow_mqtt() as mqtt:
@@ -3436,6 +3458,45 @@ def app_api_timelapse_current_dismiss():
         mqtt.dismiss_timelapse_start_offer()
         state = _build_runtime_state_payload(mqtt)
     return {"status": "ok", **state}
+
+
+@app.post("/api/timelapse/current/pause")
+def app_api_timelapse_current_pause():
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        try:
+            filename = mqtt.pause_timelapse_for_current_print()
+        except RuntimeError as exc:
+            return {"error": str(exc)}, 409
+        state = _build_runtime_state_payload(mqtt)
+    return {"status": "ok", "filename": filename, **state}
+
+
+@app.post("/api/timelapse/current/resume")
+def app_api_timelapse_current_resume():
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        try:
+            filename = mqtt.resume_timelapse_for_current_print()
+        except RuntimeError as exc:
+            return {"error": str(exc)}, 409
+        state = _build_runtime_state_payload(mqtt)
+    return {"status": "ok", "filename": filename, **state}
+
+
+@app.post("/api/timelapse/current/stop")
+def app_api_timelapse_current_stop():
+    with borrow_mqtt() as mqtt:
+        if not mqtt:
+            return {"error": "Service unavailable"}, 503
+        try:
+            filename = mqtt.stop_timelapse_for_current_print()
+        except RuntimeError as exc:
+            return {"error": str(exc)}, 409
+        state = _build_runtime_state_payload(mqtt)
+    return {"status": "ok", "filename": filename, **state}
 
 
 @app.get("/api/timelapse/<filename>")
@@ -3467,6 +3528,55 @@ def app_api_timelapse_delete(filename):
         deleted = mqtt.timelapse.delete_video(filename)
     if not deleted:
         return {"error": "Video not found"}, 404
+    return {"status": "ok"}
+
+
+@app.get("/api/timelapse-snapshot/<collection_id>/<filename>")
+def app_api_timelapse_snapshot_download(collection_id, filename):
+    """Return a timelapse snapshot JPG for preview or download."""
+    from flask import send_file
+
+    if (
+        "/" in collection_id or "\\" in collection_id or ".." in collection_id
+        or "/" in filename or "\\" in filename or ".." in filename
+    ):
+        return jsonify({"error": "invalid filename"}), 400
+
+    with borrow_mqtt() as mqtt:
+        path = mqtt.timelapse.get_snapshot_path(collection_id, filename)
+        captures_dir = os.path.realpath(mqtt.timelapse._captures_dir)
+
+    if not path:
+        return {"error": "Snapshot not found"}, 404
+    if not os.path.realpath(path).startswith(captures_dir + os.sep):
+        return jsonify({"error": "invalid filename"}), 400
+
+    download = request.args.get("download")
+    return send_file(
+        path,
+        mimetype="image/jpeg",
+        as_attachment=download in {"1", "true", "yes"},
+        download_name=filename,
+    )
+
+
+@app.delete("/api/timelapse-snapshot/<collection_id>/<filename>")
+def app_api_timelapse_snapshot_delete(collection_id, filename):
+    """Delete an archived timelapse snapshot JPG."""
+    if (
+        "/" in collection_id or "\\" in collection_id or ".." in collection_id
+        or "/" in filename or "\\" in filename or ".." in filename
+    ):
+        return jsonify({"error": "invalid filename"}), 400
+
+    with borrow_mqtt() as mqtt:
+        try:
+            deleted = mqtt.timelapse.delete_snapshot(collection_id, filename)
+        except RuntimeError as exc:
+            return {"error": str(exc)}, 409
+
+    if not deleted:
+        return {"error": "Snapshot not found"}, 404
     return {"status": "ok"}
 
 
@@ -3785,6 +3895,7 @@ _PROTECTED_GET_PATHS = {
     "/api/filaments/service/swap",
     "/api/history",
     "/api/timelapses",
+    "/api/timelapse-snapshots",
 }
 
 # POST endpoints needed for initial printer setup (config import / login)
@@ -3898,7 +4009,10 @@ def _check_api_key():
     # Allow read-only (GET/HEAD/OPTIONS) unless the path is explicitly protected.
     # Also protect any path under /api/debug/ (prefix match for dynamic segments).
     is_debug_path = request.path.startswith("/api/debug/")
-    is_timelapse_path = request.path.startswith("/api/timelapse/")
+    is_timelapse_path = (
+        request.path.startswith("/api/timelapse/")
+        or request.path.startswith("/api/timelapse-snapshot/")
+    )
     if request.method in ("GET", "HEAD", "OPTIONS") and request.path not in _PROTECTED_GET_PATHS and not is_debug_path and not is_timelapse_path:
         return None
 

@@ -616,13 +616,32 @@ def test_timelapse_routes_list_download_delete_and_reject_traversal(tmp_path):
     capture_dir.mkdir()
     video_path = capture_dir / "cube.mp4"
     video_path.write_bytes(b"fake-mp4")
+    snapshot_dir = capture_dir / "snapshots" / "cube_capture"
+    snapshot_dir.mkdir(parents=True)
+    snapshot_path = snapshot_dir / "frame_00000.jpg"
+    snapshot_path.write_bytes(b"fake-jpg")
 
     timelapse = SimpleNamespace(
         enabled=True,
         _captures_dir=str(capture_dir),
         list_videos=lambda: [{"filename": "cube.mp4", "size": 8}],
+        list_snapshots=lambda: [{
+            "id": "cube_capture",
+            "label": "cube.gcode",
+            "frame_count": 1,
+            "allow_delete": True,
+            "frames": [{"filename": "frame_00000.jpg", "size_bytes": 8}],
+        }],
         get_video_path=lambda filename: str(video_path) if filename == "cube.mp4" else None,
         delete_video=lambda filename: filename == "cube.mp4",
+        get_snapshot_path=lambda collection_id, filename: (
+            str(snapshot_path)
+            if collection_id == "cube_capture" and filename == "frame_00000.jpg"
+            else None
+        ),
+        delete_snapshot=lambda collection_id, filename: (
+            collection_id == "cube_capture" and filename == "frame_00000.jpg"
+        ),
     )
     mqtt = SimpleNamespace(timelapse=timelapse)
     client = app.test_client()
@@ -630,18 +649,28 @@ def test_timelapse_routes_list_download_delete_and_reject_traversal(tmp_path):
 
     try:
         listed = client.get("/api/timelapses", headers={"X-Api-Key": API_KEY})
+        listed_snapshots = client.get("/api/timelapse-snapshots", headers={"X-Api-Key": API_KEY})
         invalid = client.get("/api/timelapse/..\\\\passwd.mp4", headers={"X-Api-Key": API_KEY})
         downloaded = client.get("/api/timelapse/cube.mp4", headers={"X-Api-Key": API_KEY})
         deleted = client.delete("/api/timelapse/cube.mp4", headers={"X-Api-Key": API_KEY})
+        invalid_snapshot = client.get("/api/timelapse-snapshot/..\\\\bad/frame_00000.jpg", headers={"X-Api-Key": API_KEY})
+        snapshot_downloaded = client.get("/api/timelapse-snapshot/cube_capture/frame_00000.jpg", headers={"X-Api-Key": API_KEY})
+        snapshot_deleted = client.delete("/api/timelapse-snapshot/cube_capture/frame_00000.jpg", headers={"X-Api-Key": API_KEY})
     finally:
         _restore_app_state(old_values, old_svc)
 
     assert listed.status_code == 200
     assert listed.get_json()["enabled"] is True
+    assert listed_snapshots.status_code == 200
+    assert listed_snapshots.get_json()["collections"][0]["id"] == "cube_capture"
     assert invalid.status_code == 400
     assert downloaded.status_code == 200
     assert downloaded.data == b"fake-mp4"
     assert deleted.status_code == 200
+    assert invalid_snapshot.status_code == 400
+    assert snapshot_downloaded.status_code == 200
+    assert snapshot_downloaded.data == b"fake-jpg"
+    assert snapshot_deleted.status_code == 200
 
 
 def test_snapshot_route_reports_expected_error_paths(monkeypatch):
@@ -762,6 +791,58 @@ def test_snapshot_and_camera_frame_routes_support_external_camera(monkeypatch, t
     assert len(captures) == 2
     assert all(call["camera_settings"]["effective_source"] == "external" for call in captures)
     assert all(call["ffmpeg_path"] == "/usr/bin/ffmpeg" for call in captures)
+
+
+def test_snapshot_route_saves_manual_snapshot_into_timelapse_gallery(monkeypatch):
+    cfg = _base_config()
+    cfg.camera = {
+        "per_printer": {
+            "SN1": {
+                "source": "external",
+                "external": {
+                    "name": "Workbench Cam",
+                    "snapshot_url": "http://cam.local/snapshot.jpg",
+                    "stream_url": "",
+                    "refresh_sec": 2,
+                },
+            }
+        }
+    }
+
+    saved = []
+    timelapse = SimpleNamespace(
+        save_manual_snapshot=lambda path, camera_settings=None, taken_at=None: saved.append({
+            "path": path,
+            "camera_settings": camera_settings,
+            "taken_at": taken_at,
+        })
+    )
+    mqtt = SimpleNamespace(timelapse=timelapse)
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(
+        config=cfg,
+        mqtt=mqtt,
+        video_supported=False,
+        videoqueue=None,
+    )
+
+    monkeypatch.setattr("web._ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        "web.camera.capture_camera_snapshot_to_file",
+        lambda camera_settings, ffmpeg_path, output_path, **kwargs: Path(output_path).write_bytes(b"jpeg"),
+    )
+
+    try:
+        response = client.get("/api/snapshot", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert response.status_code == 200
+    assert response.mimetype == "image/jpeg"
+    assert len(saved) == 1
+    assert saved[0]["camera_settings"]["effective_source"] == "external"
+    assert saved[0]["camera_settings"]["external"]["name"] == "Workbench Cam"
+    assert isinstance(saved[0]["taken_at"], datetime)
 
 
 def test_unsupported_device_guard_blocks_printer_control_routes():

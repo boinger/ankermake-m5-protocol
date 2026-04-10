@@ -12,6 +12,7 @@ ankerctl{% if printer %} - {{ printer.name }}{% endif %}
 {% include "tabs/history.html" %}
 {% include "tabs/filaments.html" %}
 {% include "tabs/timelapse.html" %}
+{% include "tabs/snapshots.html" %}
 {% include "tabs/instructions.html" %}
 {% endif %}
 
@@ -42,6 +43,10 @@ ankerctl{% if printer %} - {{ printer.name }}{% endif %}
 
 {% call macro.menu_button(id="timelapse-tab", target="timelapse") %}
 {{ macro.bi_icon("camera-reels", "Timelapse") }}
+{% endcall %}
+
+{% call macro.menu_button(id="snapshots-tab", target="snapshots") %}
+{{ macro.bi_icon("images", "Snapshots") }}
 {% endcall %}
 
 {% call macro.menu_button(id="instructions-tab", target="instructions") %}

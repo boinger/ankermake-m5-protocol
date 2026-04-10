@@ -392,7 +392,7 @@
                                                 <i class="bi bi-clock-history"></i> Load Last
                                             </button>
                                             <button id="bed-level-save-btn" type="button" class="btn btn-sm btn-outline-secondary" disabled>
-                                                <i class="bi bi-camera"></i> Save Snapshot
+                                                <i class="bi bi-camera"></i> Save Bed Map
                                             </button>
                                         </div>
                                     </div>
@@ -473,7 +473,7 @@
                             </div>
                         </div>
 
-                        <!-- Lower: Compare Snapshots (full width, independent scroll) -->
+                        <!-- Lower: Compare Bed Maps (full width, independent scroll) -->
                         <div class="card">
                             <div class="card-header">
                                 <button class="btn btn-link text-decoration-none p-0 fw-semibold"
@@ -482,20 +482,23 @@
                                     data-bs-target="#bed-compare-body"
                                     aria-expanded="false"
                                     aria-controls="bed-compare-body">
-                                    <i class="bi bi-arrow-left-right"></i> Compare Snapshots
+                                    <i class="bi bi-arrow-left-right"></i> Compare Bed Maps
                                 </button>
                             </div>
                             <div class="collapse" id="bed-compare-body">
                                 <div class="card-body">
+                                    <div class="form-text mb-3">
+                                        This tool compares saved bed-level maps from the <code>Bed Level Map</code> card above. Camera snapshots downloaded from Home are separate files and will not appear here.
+                                    </div>
                                     <div class="row g-3 align-items-end mb-3">
                                         <div class="col-md-5">
-                                            <label class="form-label small" for="bed-snap-a-select">Snapshot A (Reference)</label>
+                                            <label class="form-label small" for="bed-snap-a-select">Bed Map A (Reference)</label>
                                             <select class="form-select form-select-sm" id="bed-snap-a-select">
-                                                <option value="" disabled selected>No snapshots saved yet</option>
+                                                <option value="" disabled selected>No bed maps saved yet</option>
                                             </select>
                                         </div>
                                         <div class="col-md-5">
-                                            <label class="form-label small" for="bed-snap-b-select">Snapshot B</label>
+                                            <label class="form-label small" for="bed-snap-b-select">Bed Map B</label>
                                             <select class="form-select form-select-sm" id="bed-snap-b-select">
                                                 <option value="live">Read live from printer</option>
                                             </select>
@@ -513,7 +516,7 @@
                                         <div class="bed-compare-scroll">
                                             <div class="bed-compare-grid">
                                                 <div class="card border-secondary">
-                                                    <div class="card-header small fw-semibold">Snapshot A</div>
+                                                    <div class="card-header small fw-semibold">Bed Map A</div>
                                                     <div class="card-body p-2">
                                                         <div id="bed-compare-a-wrap"></div>
                                                     </div>
@@ -526,7 +529,7 @@
                                                     </div>
                                                 </div>
                                                 <div class="card border-secondary">
-                                                    <div class="card-header small fw-semibold">Snapshot B</div>
+                                                    <div class="card-header small fw-semibold">Bed Map B</div>
                                                     <div class="card-body p-2">
                                                         <div id="bed-compare-b-wrap"></div>
                                                     </div>
@@ -536,9 +539,9 @@
                                     </div>
 
                                     <hr class="mt-4">
-                                    <h6 class="small fw-semibold text-muted mb-2">Saved Snapshots</h6>
+                                    <h6 class="small fw-semibold text-muted mb-2">Saved Bed Maps</h6>
                                     <div id="bed-snap-list" class="vstack gap-1">
-                                        <span class="text-muted small">No snapshots saved yet.</span>
+                                        <span class="text-muted small">No bed maps saved yet.</span>
                                     </div>
                                 </div>
                             </div>

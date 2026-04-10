@@ -51,6 +51,103 @@ def test_timelapse_meta_and_video_file_helpers(tmp_path):
     assert not video_a.exists()
 
 
+def test_timelapse_snapshot_helpers_list_download_and_delete(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+
+    active_dir = tmp_path / _IN_PROGRESS_SUBDIR / "cube_active"
+    active_dir.mkdir(parents=True)
+    (active_dir / "frame_00000.jpg").write_bytes(b"active")
+    svc._write_meta(active_dir, "cube.gcode", 1)
+    svc._current_dir = str(active_dir)
+
+    archived_dir = tmp_path / "snapshots" / "cube_video_20260410"
+    archived_dir.mkdir(parents=True)
+    (archived_dir / "frame_00000.jpg").write_bytes(b"frame-a")
+    (archived_dir / "frame_00001.jpg").write_bytes(b"frame-b")
+    svc._write_meta(
+        archived_dir,
+        "cube.gcode",
+        2,
+        video_filename="cube_video_20260410.mp4",
+        archived_at="2026-04-10T12:00:00",
+    )
+
+    collections = svc.list_snapshots()
+    assert [collection["id"] for collection in collections] == ["cube_active", "cube_video_20260410"]
+    assert collections[0]["allow_delete"] is False
+    assert collections[1]["allow_delete"] is True
+    assert collections[1]["video_filename"] == "cube_video_20260410.mp4"
+    assert svc.get_snapshot_path("cube_active", "frame_00000.jpg") == str(active_dir / "frame_00000.jpg")
+    assert svc.get_snapshot_path("cube_video_20260410", "frame_00001.jpg") == str(archived_dir / "frame_00001.jpg")
+
+    try:
+        svc.delete_snapshot("cube_active", "frame_00000.jpg")
+        assert False, "Expected delete_snapshot to reject active captures"
+    except RuntimeError:
+        pass
+
+    assert svc.delete_snapshot("cube_video_20260410", "frame_00000.jpg") is True
+    assert not (archived_dir / "frame_00000.jpg").exists()
+    assert svc._read_meta(archived_dir)["frame_count"] == 1
+    assert svc.delete_snapshot("cube_video_20260410", "frame_00001.jpg") is True
+    assert not archived_dir.exists()
+
+
+def test_timelapse_manual_snapshot_save_list_and_delete(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+
+    source = tmp_path / "manual-source.jpg"
+    source.write_bytes(b"manual-jpg")
+
+    saved = svc.save_manual_snapshot(
+        str(source),
+        camera_settings={
+            "effective_source": "external",
+            "external": {"name": "Workbench Cam"},
+        },
+    )
+
+    collections = svc.list_snapshots()
+    assert len(collections) == 1
+    assert collections[0]["id"] == saved["collection_id"]
+    assert collections[0]["state"] == "manual"
+    assert collections[0]["allow_delete"] is True
+    assert collections[0]["source_label"] == "External camera (Workbench Cam)"
+    assert collections[0]["frame_count"] == 1
+    assert collections[0]["frames"][0]["filename"] == saved["filename"]
+    assert svc.get_snapshot_path(saved["collection_id"], saved["filename"]).endswith(saved["filename"])
+
+    assert svc.delete_snapshot(saved["collection_id"], saved["filename"]) is True
+    assert svc.list_snapshots() == []
+
+
+def test_timelapse_manual_pause_coexists_with_automatic_pause(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+
+    svc.set_manual_pause(True)
+    state = svc.get_runtime_state()
+    assert state["paused"] is True
+    assert state["pause_reason"] == "manual"
+
+    svc.set_capture_paused(True, reason="filament_runout")
+    state = svc.get_runtime_state()
+    assert state["paused"] is True
+    assert state["pause_reason"] == "filament_runout"
+
+    svc.set_manual_pause(False)
+    state = svc.get_runtime_state()
+    assert state["paused"] is True
+    assert state["pause_reason"] == "filament_runout"
+
+    svc.set_capture_paused(False)
+    state = svc.get_runtime_state()
+    assert state["paused"] is False
+    assert state["pause_reason"] is None
+
+
 def test_timelapse_prunes_old_videos(tmp_path):
     cfg = FakeConfigManager(tmp_path)
     svc = TimelapseService(cfg, captures_dir=tmp_path)
