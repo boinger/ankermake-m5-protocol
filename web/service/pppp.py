@@ -13,7 +13,10 @@ from libflagship.ppppapi import AnkerPPPPAsyncApi, PPPPState
 
 import cli.pppp
 
-_CONNECT_DEADLINE_SEC = 4.0
+# Some printers take a few extra seconds to accept a fresh PPPP session after
+# a video/timelapse recovery. A slightly longer deadline avoids unnecessary
+# reconnect loops on otherwise healthy links.
+_CONNECT_DEADLINE_SEC = 8.0
 
 
 def probe_pppp(config, printer_index) -> bool:

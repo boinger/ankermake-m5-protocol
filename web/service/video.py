@@ -4,7 +4,8 @@ import time
 
 from queue import Empty
 
-_STALL_TIMEOUT = 5.0  # seconds without a frame before soft restart; 3 failures → ServiceRestartSignal
+_STALL_TIMEOUT = 5.0  # seconds without a frame after video is flowing before soft restart
+_INITIAL_FRAME_TIMEOUT = 12.0  # give a fresh START_LIVE longer to deliver its first frame
 _STALL_MAX_RETRIES = 3  # escalate to hard restart after this many consecutive soft-reset failures
 _LIVE_REFRESH_COOLDOWN = 4.0
 _EXTERNAL_RECOVERY_COOLDOWN = 3.0
@@ -560,7 +561,7 @@ class VideoQueue(Service):
                     return
             elif self._live_started_at is not None:
                 since_start = now - self._live_started_at
-                if since_start > _STALL_TIMEOUT:
+                if since_start > _INITIAL_FRAME_TIMEOUT:
                     if now - self._last_no_frame_log_at >= 10.0:
                         log.info(f"VideoQueue: No initial frame yet after {since_start:.1f}s; waiting")
                         self._last_no_frame_log_at = now

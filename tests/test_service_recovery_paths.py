@@ -12,7 +12,7 @@ from web import app
 from web.lib.service import RunState, ServiceRestartSignal
 from web.service.filetransfer import FileTransferService
 from web.service.pppp import PPPPService, probe_pppp
-from web.service.video import VideoQueue, _STALL_TIMEOUT
+from web.service.video import VideoQueue, _INITIAL_FRAME_TIMEOUT, _STALL_TIMEOUT
 
 
 def _config():
@@ -173,7 +173,11 @@ def test_video_queue_worker_run_detects_disconnect_api_swap_and_stall(monkeypatc
     commands = []
     queue.pppp.api_command = lambda command, data=None: commands.append((command, data))
     queue._live_auth_data = lambda: {"encryptkey": "secret", "accountId": "user-123456"}
-    times = iter([100.0 + _STALL_TIMEOUT + 1, 100.0 + _STALL_TIMEOUT + 1, 100.0 + _STALL_TIMEOUT + 1])
+    times = iter([
+        100.0 + _INITIAL_FRAME_TIMEOUT + 1,
+        100.0 + _INITIAL_FRAME_TIMEOUT + 1,
+        100.0 + _INITIAL_FRAME_TIMEOUT + 1,
+    ])
     monkeypatch.setattr("web.service.video.time.monotonic", lambda: next(times))
     queue.worker_run(timeout=0.1)
 
