@@ -307,6 +307,43 @@ def test_pppp_probe_helper_and_state_websocket_emit_status(monkeypatch):
     assert json.loads(sock.sent[0]) == {"status": "connected"}
 
 
+def test_pppp_probe_helper_skips_when_services_are_already_recovering(monkeypatch):
+    old_values, old_svc = _install_app_state(web_module)
+    calls = []
+    web_module.app.svc = FakeServices(
+        svcs={
+            web_module.pppp_service_name(0): SimpleNamespace(wanted=True),
+            web_module.video_service_name(0): SimpleNamespace(_awaiting_pppp_recycle=True),
+        }
+    )
+
+    with web_module.app.pppp_probe_lock:
+        web_module.app.pppp_probe = {
+            "result": None,
+            "last_time": 0.0,
+            "fail_count": 0,
+            "thread": None,
+            "client_count": 1,
+        }
+
+    monkeypatch.setattr("web.service.pppp.probe_pppp", lambda config, idx: calls.append((config, idx)) or True)
+
+    try:
+        web_module._maybe_start_pppp_probe("test", printer_index=0)
+    finally:
+        _restore_app_state(web_module, old_values, old_svc)
+        with web_module.app.pppp_probe_lock:
+            web_module.app.pppp_probe = {
+                "result": None,
+                "last_time": 0.0,
+                "fail_count": 0,
+                "thread": None,
+                "client_count": 0,
+            }
+
+    assert calls == []
+
+
 def test_dev_debug_routes_register_and_dispatch(monkeypatch):
     monkeypatch.setenv("ANKERCTL_DEV_MODE", "true")
     importlib.reload(web_module)

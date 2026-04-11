@@ -1375,6 +1375,17 @@ def _maybe_start_pppp_probe(reason="scheduled", printer_index=None):
 
     printer_index = _requested_printer_index() if printer_index is None else int(printer_index)
     probe = _get_pppp_probe_state(printer_index)
+
+    pppp_service = get_pppp_service(printer_index)
+    if pppp_service is not None and getattr(pppp_service, "wanted", False):
+        log.debug("Skipping PPPP probe because PPPP service is already reconnecting")
+        return
+
+    video_service = get_video_service(printer_index)
+    if video_service is not None and getattr(video_service, "_awaiting_pppp_recycle", False):
+        log.debug("Skipping PPPP probe because VideoQueue is recycling PPPP in place")
+        return
+
     with app.pppp_probe_lock:
         thread = probe["thread"]
         if thread is not None and thread.is_alive():

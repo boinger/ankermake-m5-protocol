@@ -202,6 +202,18 @@ def pppp_resolve_printer_ip(config, printer, printer_index, dumpfile=None, timeo
                 persist_printer_ip(config, printer.p2p_duid, ip_addr, printer_index=printer_index)
             return ip_addr
 
+    # Some networks intermittently drop the directed LAN-search probe even
+    # though a direct PPPP connection to the saved address still succeeds.
+    # Prefer trying the last known good IP over failing fast and forcing the
+    # service manager into a noisy reconnect loop.
+    if (printer.ip_addr or "").strip():
+        fallback_ip = (printer.ip_addr or "").strip()
+        log.warning(
+            f"PPPP IP validation failed and LAN search found no match; "
+            f"falling back to saved printer IP {fallback_ip}"
+        )
+        return fallback_ip
+
     return ""
 
 

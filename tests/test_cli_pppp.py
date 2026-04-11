@@ -82,3 +82,14 @@ def test_lan_search_retries_and_deduplicates_replies(monkeypatch):
         }
     ]
     assert persisted == [(str(_duid()), "10.0.0.25")]
+
+
+def test_pppp_resolve_printer_ip_falls_back_to_saved_ip_when_probe_and_search_miss(monkeypatch):
+    monkeypatch.setattr("cli.pppp.probe_printer_ip", lambda printer, ip_addr, timeout=2.0: False)
+    monkeypatch.setattr("cli.pppp.lan_search", lambda config, timeout=2.0, dumpfile=None: [])
+
+    printer = SimpleNamespace(p2p_duid=str(_duid()), ip_addr="10.0.0.25")
+
+    resolved = cli.pppp.pppp_resolve_printer_ip(object(), printer, printer_index=0, timeout=0.5)
+
+    assert resolved == "10.0.0.25"
