@@ -10,45 +10,55 @@ The `ankerctl` program uses [`libflagship`](documentation/developer-docs/libflag
 
 ![Screenshot of ankerctl](/documentation/web-interface.png "Screenshot of ankerctl web interface")
 
-## Features
-
-### Current Features
+## Current Features
 
 - Print directly from slicers such as PrusaSlicer, SuperSlicer, Bambu Studio, OrcaSlicer, and others.
-
-- Connect to AnkerMake M5 printers and AnkerMake APIs without relying on closed-source Anker software.
-
+  
+- Connect to AnkerMake M5 printers and AnkerMake cloud APIs without relying on closed-source Anker software.
+  
+- Multi-printer support, with per-printer status, controls, history, timelapse handling, and media views.
+  
 - Send raw G-code commands to the printer and view responses in real time.
-
-- Low-level access to MQTT, PPPP, and HTTPS APIs.
-
-- Upload print jobs (G-code files) to the printer, or print from the printer’s internal storage or USB drive.
-
+  
+- Low-level access to MQTT, PPPP, and HTTPS APIs for debugging and advanced integrations.
+  
+- Upload print jobs (G-code files) to the printer, or start prints from the printer’s internal storage or USB drive.
+  
+- Archive uploaded G-code automatically so compatible jobs can be reprinted later directly from Print History.
+  
+- View printer storage, USB storage, and print history with thumbnail previews when available.
+  
+- Monitor live print status, temperatures, progress, layers, and time remaining.
+  
+- Automatic print history with an SQLite-backed log of every print, including start time, duration, result, thumbnails, and reprint availability.
+  
+- Delete selected print history entries or clear history entirely.
+  
+- Automatic timelapse capture during prints, assembled into MP4 video at the end. Timelapse pauses automatically during filament break/change events and supports start, pause, resume, and stop controls. (Requires `ffmpeg`).
+  
+- Dedicated Snapshots page for timelapse frames and manual snapshots, with preview, download, delete, and paused-capture discard support.
+  
 - Stream the built-in printer camera to your computer, with support for optional external camera feeds and a camera setup page.
-
-- Monitor live print status with ease.
-
-- Automatic **print history** with an SQLite-backed log of every print, including start time, duration, result, and reprint status.
-
-- Automatic **timelapse** capture during prints, assembled into an MP4 video at the end. Timelapse pauses automatically during filament break/change events. Full control buttons. (requires `ffmpeg`).
-
-- Snapshot page to view Timelaps shots, along with manual takin snapshots. View, download and delete options.
-
-- Live Ankerctl console view directly on the home page.
-
-- Filament indicator in printer stats.
-
-- **Push notifications** via [Apprise](https://github.com/caronc/apprise) for print start, finish, failure, and progress, with optional live camera snapshots attached.
-
-- **Home Assistant MQTT Discovery** integration for printer state, temperatures, progress, and light control.
-
-- Optional **API key authentication** for all write operations.
-
-- **Debug tab** (enable with `ANKERCTL_DEV_MODE=true`) with a state inspector, service health panel, event simulation, and log viewer.
-
-- **Bed Level Map** (Setup tab → Tools) reads the 7×7 bilinear compensation grid from the printer via `M420 V`, renders it as a color-coded heatmap, and supports before/after snapshot comparison to evaluate leveling results.
-
-- Includes a downloadable launcher (Windows only).
+  
+- Manual snapshot capture from the Home page, with snapshots saved into the Snapshots gallery.
+  
+- Live ankerctl console viewer directly on the Home page, with recent history and live updates.
+  
+- Filament status indicator in printer stats, including filament runout and filament-change pause handling.
+  
+- Sticky printer alerts and notifications, including support for events from printers other than the currently selected one.
+  
+- Push notifications via Apprise for print start, finish, failure, and progress, with optional live camera snapshots attached.
+  
+- Home Assistant MQTT Discovery integration for printer state, temperatures, progress, and light control.
+  
+- Optional API key authentication for write operations and sensitive API endpoints.
+  
+- Debug tab (enable with `ANKERCTL_DEV_MODE=true`) with a state inspector, service health panel, event simulation, and log viewer.
+  
+- Bed Level Map (Setup tab -> Tools) reads the 7x7 bilinear compensation grid from the printer via `M420 V`, renders it as a color-coded heatmap, and supports before/after snapshot comparison to evaluate leveling results.
+  
+- Includes a downloadable Windows launcher.
 
 Let us know what you want to see; Pull requests always welcome!
 
