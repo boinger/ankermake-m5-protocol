@@ -13,6 +13,8 @@ from libflagship.ppppapi import AnkerPPPPAsyncApi, PPPPState
 
 import cli.pppp
 
+_CONNECT_DEADLINE_SEC = 4.0
+
 
 def probe_pppp(config, printer_index) -> bool:
     """Try a PPPP LAN connection. Returns True if handshake succeeds, False otherwise.
@@ -36,10 +38,15 @@ def probe_pppp(config, printer_index) -> bool:
 
 class PPPPService(Service):
 
-    def __init__(self):
+    def __init__(self, printer_index=0):
+        self.printer_index = 0 if printer_index is None else int(printer_index)
         self.xzyh_handlers = []
         self._handler_lock = threading.Lock()
         super().__init__()
+
+    @property
+    def name(self):
+        return f"PPPPService[{self.printer_index}]"
 
     def _force_close_api(self):
         if not hasattr(self, "_api"):
@@ -78,13 +85,14 @@ class PPPPService(Service):
             self._force_close_api()
 
     def api_command(self, commandType, **kwargs):
-        if not hasattr(self, "_api"):
+        api = getattr(self, "_api", None)
+        if api is None or getattr(api, "state", None) != PPPPState.Connected:
             raise ConnectionError("No pppp connection")
         cmd = {
             "commandType": commandType,
             **kwargs
         }
-        return self._api.send_xzyh(
+        return api.send_xzyh(
             json.dumps(cmd).encode(),
             cmd=P2PCmdType.P2P_JSON_CMD,
             block=False
@@ -92,18 +100,19 @@ class PPPPService(Service):
 
     def worker_start(self):
         config = app.config["config"]
+        printer_index = getattr(self, "printer_index", app.config.get("printer_index", 0))
 
-        deadline = datetime.now() + timedelta(seconds=2)
+        deadline = datetime.now() + timedelta(seconds=_CONNECT_DEADLINE_SEC)
 
         with config.open() as cfg:
             if not cfg:
                 raise ServiceStoppedError("No config available")
-            printer = cfg.printers[app.config["printer_index"]]
+            printer = cfg.printers[printer_index]
 
         ip_addr = cli.pppp.pppp_resolve_printer_ip(
             config,
             printer,
-            app.config["printer_index"],
+            printer_index,
             dumpfile=app.config.get("pppp_dump"),
         )
         if not ip_addr:
@@ -134,13 +143,14 @@ class PPPPService(Service):
         self._api = api
 
     def _drain_xzyh(self, chan):
-        if not hasattr(self, "_api") or not hasattr(self._api, "chans"):
+        api = getattr(self, "_api", None)
+        if api is None or not hasattr(api, "chans"):
             return
 
-        if chan < 0 or chan >= len(self._api.chans):
+        if chan < 0 or chan >= len(api.chans):
             return
 
-        fd = self._api.chans[chan]
+        fd = api.chans[chan]
 
         while True:
             with fd.lock:
@@ -193,7 +203,8 @@ class PPPPService(Service):
         return aabb, data
 
     def worker_run(self, timeout):
-        if not hasattr(self, "_api"):
+        api = getattr(self, "_api", None)
+        if api is None:
             if getattr(self, "wanted", True):
                 raise ServiceRestartSignal("PPPP API missing while service is wanted")
             return
@@ -201,31 +212,32 @@ class PPPPService(Service):
         # A stale/disconnected API object after video recovery is not a usable
         # running PPPP session. Force an internal restart instead of idling
         # forever in a wanted-but-disconnected state.
-        if getattr(self._api, "state", PPPPState.Connected) != PPPPState.Connected:
+        if getattr(api, "state", PPPPState.Connected) != PPPPState.Connected:
             if getattr(self, "wanted", True):
                 raise ServiceRestartSignal("PPPP API exists but is not connected while service is wanted")
             return
 
         try:
-            msg = self._api.poll(timeout=timeout)
+            msg = api.poll(timeout=timeout)
         except (ConnectionResetError, OSError):
             if not getattr(self, "wanted", True):
                 return
             raise ServiceRestartSignal()
 
-        if not hasattr(self, "_api"):
+        api = getattr(self, "_api", None)
+        if api is None:
             if getattr(self, "wanted", True):
                 raise ServiceRestartSignal("PPPP API disappeared during worker loop")
             return
 
-        if getattr(self._api, "state", PPPPState.Connected) != PPPPState.Connected:
+        if getattr(api, "state", PPPPState.Connected) != PPPPState.Connected:
             if getattr(self, "wanted", True):
                 raise ServiceRestartSignal("PPPP API disconnected during worker loop")
             return
 
-        chans = getattr(self._api, "chans", [])
+        chans = getattr(api, "chans", [])
         if len(chans) > 1 and hasattr(chans[1], "skip_rx_gap"):
-            if chans[1].skip_rx_gap(max_queued=12):
+            if chans[1].skip_rx_gap(max_queued=8):
                 self._drain_xzyh(chan=1)
 
         self._drain_xzyh(chan=1)
@@ -233,7 +245,7 @@ class PPPPService(Service):
         if not msg or msg.type != Type.DRW:
             return
 
-        ch = self._api.chans[msg.chan]
+        ch = api.chans[msg.chan]
 
         drain_xzyh = False
         with ch.lock:
@@ -275,6 +287,7 @@ class PPPPService(Service):
 
     @property
     def connected(self):
-        if not hasattr(self, "_api"):
+        api = getattr(self, "_api", None)
+        if api is None:
             return False
-        return self._api.state == PPPPState.Connected
+        return getattr(api, "state", None) == PPPPState.Connected

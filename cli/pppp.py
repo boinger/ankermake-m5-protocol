@@ -13,6 +13,11 @@ from libflagship.pktdump import PacketWriter
 from libflagship.pppp import Duid, P2PCmdType, FileTransfer, PktClose, PktLanSearch, PktPunchPkt
 from libflagship.ppppapi import AnkerPPPPApi, AnkerPPPPAsyncApi, PPPPState
 
+_PPPP_PROBE_ATTEMPTS = 2
+_PPPP_LAN_SEARCH_RETRIES = 3
+_PPPP_LAN_SEARCH_MIN_WINDOW = 0.35
+_PPPP_LAN_SEARCH_RETRY_GAP = 0.15
+
 
 def _pppp_dumpfile(api, dumpfile):
     if dumpfile:
@@ -58,7 +63,7 @@ def pppp_open_broadcast(dumpfile=None):
     return api
 
 
-def probe_printer_ip(printer, ip_addr, timeout=2.0):
+def probe_printer_ip(printer, ip_addr, timeout=2.0, attempts=_PPPP_PROBE_ATTEMPTS):
     """Check if a printer is reachable at a specific IP via a lightweight LAN search.
 
     Sends a directed PktLanSearch and waits for a PktPunchPkt response.
@@ -70,12 +75,25 @@ def probe_printer_ip(printer, ip_addr, timeout=2.0):
 
     api = AnkerPPPPAsyncApi.open_lan(Duid.from_string(printer.p2p_duid), host=ip_addr)
     try:
-        api.connect_lan_search()
-        try:
-            msg = api.recv(timeout=timeout)
-        except (TimeoutError, ConnectionResetError, StopIteration):
-            return False
-        return isinstance(msg, PktPunchPkt)
+        total_timeout = max(float(timeout or 0.0), 0.1)
+        max_attempts = max(1, int(attempts or 1))
+        per_attempt_timeout = max(total_timeout / max_attempts, _PPPP_LAN_SEARCH_MIN_WINDOW)
+        deadline = time.monotonic() + total_timeout
+
+        for _ in range(max_attempts):
+            api.connect_lan_search()
+            attempt_deadline = min(deadline, time.monotonic() + per_attempt_timeout)
+            while time.monotonic() < attempt_deadline:
+                remaining = max(0.05, attempt_deadline - time.monotonic())
+                try:
+                    msg = api.recv(timeout=remaining)
+                except (TimeoutError, ConnectionResetError, StopIteration):
+                    break
+                if isinstance(msg, PktPunchPkt):
+                    return True
+            if time.monotonic() >= deadline:
+                break
+        return False
     finally:
         try:
             api.sock.close()
@@ -83,33 +101,45 @@ def probe_printer_ip(printer, ip_addr, timeout=2.0):
             log.debug(f"PPPP socket close failed: {exc}")
 
 
-def lan_search(config, timeout=1.0, dumpfile=None):
+def lan_search(config, timeout=1.0, dumpfile=None, retries=_PPPP_LAN_SEARCH_RETRIES):
     discovered = []
     api = pppp_open_broadcast(dumpfile=dumpfile)
     try:
-        api.send(PktLanSearch())
-        deadline = datetime.now() + timedelta(seconds=timeout)
+        total_timeout = max(float(timeout or 0.0), _PPPP_LAN_SEARCH_MIN_WINDOW)
+        max_attempts = max(1, int(retries or 1))
+        per_attempt_timeout = max(total_timeout / max_attempts, _PPPP_LAN_SEARCH_MIN_WINDOW)
+        deadline = time.monotonic() + total_timeout
         seen = set()
-        while datetime.now() < deadline:
-            try:
-                resp = api.recv(timeout=(deadline - datetime.now()).total_seconds())
-            except TimeoutError:
+        for attempt in range(max_attempts):
+            api.send(PktLanSearch())
+            attempt_deadline = min(deadline, time.monotonic() + per_attempt_timeout)
+            while time.monotonic() < attempt_deadline:
+                remaining = max(0.05, attempt_deadline - time.monotonic())
+                try:
+                    resp = api.recv(timeout=remaining)
+                except TimeoutError:
+                    break
+
+                if not isinstance(resp, PktPunchPkt):
+                    continue
+
+                duid = str(resp.duid)
+                ip_addr = str(api.addr[0])
+                if (duid, ip_addr) in seen:
+                    continue
+
+                seen.add((duid, ip_addr))
+                discovered.append({
+                    "duid": duid,
+                    "ip_addr": ip_addr,
+                    "persisted": persist_printer_ip(config, duid, ip_addr),
+                })
+
+            if time.monotonic() >= deadline:
                 break
 
-            if not isinstance(resp, PktPunchPkt):
-                continue
-
-            duid = str(resp.duid)
-            ip_addr = str(api.addr[0])
-            if (duid, ip_addr) in seen:
-                continue
-
-            seen.add((duid, ip_addr))
-            discovered.append({
-                "duid": duid,
-                "ip_addr": ip_addr,
-                "persisted": persist_printer_ip(config, duid, ip_addr),
-            })
+            if attempt + 1 < max_attempts:
+                time.sleep(min(_PPPP_LAN_SEARCH_RETRY_GAP, max(0.0, deadline - time.monotonic())))
     finally:
         try:
             api.sock.close()

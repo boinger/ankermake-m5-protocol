@@ -247,7 +247,7 @@ class _PrinterAlertBuffer:
 
 
 from secrets import token_urlsafe as token
-from flask import Flask, flash, request, render_template, Response, session, url_for, jsonify
+from flask import Flask, flash, request, render_template, Response, session, url_for, jsonify, has_request_context
 from flask_sock import Sock
 from simple_websocket.errors import ConnectionClosed
 from user_agents import parse as user_agent_parse
@@ -287,12 +287,20 @@ app.svc = ServiceManager()
 app.filament_swap_lock = threading.Lock()
 app.filament_swap_state = None
 app.pppp_probe_lock = threading.Lock()
+
+
+def _default_pppp_probe_state():
+    return {
+        "result": None,          # None=never probed, True=reachable, False=unreachable
+        "last_time": 0.0,        # time.time() of last completed probe
+        "fail_count": 0,         # consecutive failures since last success
+        "thread": None,          # current probe Thread or None
+        "client_count": 0,       # active WS clients watching pppp-state
+    }
+
+
 app.pppp_probe = {
-    "result": None,          # None=never probed, True=reachable, False=unreachable
-    "last_time": 0.0,        # time.time() of last completed probe
-    "fail_count": 0,         # consecutive failures since last success
-    "thread": None,          # current probe Thread or None
-    "client_count": 0,       # active WS clients watching pppp-state
+    "per_printer": {},
 }
 
 
@@ -393,6 +401,63 @@ def _resolve_camera_settings(cfg=None, printer_index=None):
 def _camera_feature_available(cfg=None, printer_index=None):
     camera_settings = _resolve_camera_settings(cfg, printer_index=printer_index)
     return bool(camera_settings.get("feature_available"))
+
+
+def _requested_printer_index(default=None):
+    fallback = app.config.get("printer_index", 0) if default is None else default
+    if not has_request_context():
+        return fallback
+    raw = request.args.get("printer_index", default=fallback, type=int)
+    try:
+        printer_index = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+
+    config = app.config.get("config")
+    if not config:
+        return printer_index
+
+    try:
+        with config.open() as cfg:
+            printers = getattr(cfg, "printers", []) or []
+            if 0 <= printer_index < len(printers):
+                return printer_index
+    except Exception:
+        pass
+    return fallback
+
+
+def _printer_video_supported(cfg=None, printer_index=None):
+    active_index = app.config.get("printer_index", 0)
+    if cfg is None and (printer_index is None or printer_index == active_index):
+        override = app.config.get("video_supported")
+        if override is not None:
+            return bool(override)
+    camera_settings = _resolve_camera_settings(cfg, printer_index=printer_index)
+    return bool(camera_settings.get("printer_supported"))
+
+
+def _get_pppp_probe_state(printer_index=None, create=True):
+    printer_index = 0 if printer_index is None else int(printer_index)
+    probe = getattr(app, "pppp_probe", None)
+    if not isinstance(probe, dict):
+        probe = {}
+        app.pppp_probe = probe
+
+    # Backward compatibility for older flat probe dicts used in lightweight tests.
+    if "per_printer" not in probe:
+        if printer_index == 0:
+            for key, value in _default_pppp_probe_state().items():
+                probe.setdefault(key, value)
+            return probe
+        per_printer = {0: probe}
+        app.pppp_probe = {"per_printer": per_printer}
+        probe = app.pppp_probe
+
+    per_printer = probe.setdefault("per_printer", {})
+    if printer_index not in per_printer and create:
+        per_printer[printer_index] = _default_pppp_probe_state()
+    return per_printer.get(printer_index)
 
 
 def _build_runtime_state_payload(mqtt, cfg=None, printer_index=None):
@@ -524,6 +589,10 @@ UNSUPPORTED_PRINTERS = ["V8260"]
 
 MQTT_SERVICE_PREFIX = "mqttqueue:"
 LEGACY_MQTT_SERVICE_NAME = "mqttqueue"
+VIDEO_SERVICE_PREFIX = "videoqueue:"
+LEGACY_VIDEO_SERVICE_NAME = "videoqueue"
+PPPP_SERVICE_PREFIX = "pppp:"
+LEGACY_PPPP_SERVICE_NAME = "pppp"
 
 
 def mqtt_service_name(printer_index=None):
@@ -537,16 +606,77 @@ def mqtt_service_name(printer_index=None):
 def _mqtt_service_candidates(printer_index=None):
     current = mqtt_service_name(printer_index)
     candidates = [current]
+    use_legacy_fallback = printer_index in (None, 0)
 
     svcs = getattr(app.svc, "svcs", None)
     if isinstance(svcs, dict):
-        if LEGACY_MQTT_SERVICE_NAME in svcs and LEGACY_MQTT_SERVICE_NAME not in candidates:
+        if (
+            use_legacy_fallback
+            and LEGACY_MQTT_SERVICE_NAME in svcs
+            and LEGACY_MQTT_SERVICE_NAME not in candidates
+        ):
             candidates.insert(0, LEGACY_MQTT_SERVICE_NAME)
         return candidates
 
     # Minimal test doubles often expose a single legacy mqttqueue service.
-    if current == f"{MQTT_SERVICE_PREFIX}0":
+    if use_legacy_fallback and current == f"{MQTT_SERVICE_PREFIX}0":
         candidates.insert(0, LEGACY_MQTT_SERVICE_NAME)
+    return candidates
+
+
+def video_service_name(printer_index=None):
+    if printer_index is None:
+        printer_index = app.config.get("printer_index", 0)
+    if printer_index is None:
+        printer_index = 0
+    return f"{VIDEO_SERVICE_PREFIX}{printer_index}"
+
+
+def _video_service_candidates(printer_index=None):
+    current = video_service_name(printer_index)
+    candidates = [current]
+    use_legacy_fallback = printer_index in (None, 0)
+
+    svcs = getattr(app.svc, "svcs", None)
+    if isinstance(svcs, dict):
+        if (
+            use_legacy_fallback
+            and LEGACY_VIDEO_SERVICE_NAME in svcs
+            and LEGACY_VIDEO_SERVICE_NAME not in candidates
+        ):
+            candidates.append(LEGACY_VIDEO_SERVICE_NAME)
+        return candidates
+
+    if use_legacy_fallback and current == f"{VIDEO_SERVICE_PREFIX}0":
+        candidates.append(LEGACY_VIDEO_SERVICE_NAME)
+    return candidates
+
+
+def pppp_service_name(printer_index=None):
+    if printer_index is None:
+        printer_index = app.config.get("printer_index", 0)
+    if printer_index is None:
+        printer_index = 0
+    return f"{PPPP_SERVICE_PREFIX}{printer_index}"
+
+
+def _pppp_service_candidates(printer_index=None):
+    current = pppp_service_name(printer_index)
+    candidates = [current]
+    use_legacy_fallback = printer_index in (None, 0)
+
+    svcs = getattr(app.svc, "svcs", None)
+    if isinstance(svcs, dict):
+        if (
+            use_legacy_fallback
+            and LEGACY_PPPP_SERVICE_NAME in svcs
+            and LEGACY_PPPP_SERVICE_NAME not in candidates
+        ):
+            candidates.append(LEGACY_PPPP_SERVICE_NAME)
+        return candidates
+
+    if use_legacy_fallback and current == f"{PPPP_SERVICE_PREFIX}0":
+        candidates.append(LEGACY_PPPP_SERVICE_NAME)
     return candidates
 
 
@@ -590,6 +720,86 @@ def get_mqtt_service(printer_index=None):
     return getattr(app.svc, "_mqtt", None)
 
 
+@contextmanager
+def borrow_videoqueue(printer_index=None):
+    last_error = None
+    for name in _video_service_candidates(printer_index):
+        try:
+            with app.svc.borrow(name) as videoqueue:
+                if videoqueue is None:
+                    continue
+                yield videoqueue
+                return
+        except (AssertionError, KeyError, AttributeError) as err:
+            last_error = err
+            continue
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("No videoqueue service candidates available")
+
+
+def stream_videoqueue(printer_index=None, maxsize=0):
+    ordered_names = [resolve_video_service_name(printer_index)]
+    ordered_names.extend(
+        name for name in _video_service_candidates(printer_index)
+        if name not in ordered_names
+    )
+    last_error = None
+    for name in ordered_names:
+        try:
+            return app.svc.stream(name, maxsize=maxsize)
+        except (AssertionError, KeyError, AttributeError) as err:
+            last_error = err
+            continue
+    if last_error is not None:
+        raise last_error
+    return iter(())
+
+
+def get_video_service(printer_index=None):
+    svcs = getattr(app.svc, "svcs", None)
+    if isinstance(svcs, dict):
+        for name in _video_service_candidates(printer_index):
+            if name in svcs:
+                return svcs.get(name)
+        return None
+    return getattr(app.svc, "_videoqueue", None)
+
+
+def get_pppp_service(printer_index=None):
+    svcs = getattr(app.svc, "svcs", None)
+    if isinstance(svcs, dict):
+        for name in _pppp_service_candidates(printer_index):
+            if name in svcs:
+                return svcs.get(name)
+        return None
+    return getattr(app.svc, "_pppp", None)
+
+
+def resolve_video_service_name(printer_index=None):
+    svcs = getattr(app.svc, "svcs", None)
+    candidates = _video_service_candidates(printer_index)
+    if isinstance(svcs, dict):
+        for name in candidates:
+            if name in svcs:
+                return name
+    if printer_index in (None, 0):
+        return LEGACY_VIDEO_SERVICE_NAME
+    return candidates[0]
+
+
+def resolve_pppp_service_name(printer_index=None):
+    svcs = getattr(app.svc, "svcs", None)
+    candidates = _pppp_service_candidates(printer_index)
+    if isinstance(svcs, dict):
+        for name in candidates:
+            if name in svcs:
+                return name
+    if printer_index in (None, 0):
+        return LEGACY_PPPP_SERVICE_NAME
+    return candidates[0]
+
+
 def iter_mqtt_services():
     svcs = getattr(app.svc, "svcs", None)
     if isinstance(svcs, dict):
@@ -605,7 +815,7 @@ def iter_mqtt_services():
 
 
 def _stop_switchable_services():
-    vq = app.svc.svcs.get("videoqueue")
+    vq = get_video_service()
     if vq:
         vq.set_video_enabled(False)
         vq.stop()
@@ -614,7 +824,7 @@ def _stop_switchable_services():
         except Exception as exc:
             log.debug(f"VideoQueue stop wait failed: {exc}")
 
-    pppp = app.svc.svcs.get("pppp")
+    pppp = get_pppp_service()
     if pppp:
         pppp.stop()
         try:
@@ -622,7 +832,10 @@ def _stop_switchable_services():
         except Exception as exc:
             log.debug(f"PPPPService stop wait failed: {exc}")
         try:
-            app.svc.unregister("pppp")
+            for name in _pppp_service_candidates():
+                if getattr(app.svc, "svcs", None) and name in app.svc.svcs:
+                    app.svc.unregister(name)
+                    break
         except Exception as exc:
             log.debug(f"PPPPService unregister failed: {exc}")
 
@@ -1097,8 +1310,9 @@ def mqtt(sock):
     if not _validate_ws_auth(sock):
         return
 
+    printer_index = _requested_printer_index()
     try:
-        for data in stream_mqtt():
+        for data in stream_mqtt(printer_index):
             log.debug(f"MQTT message: {data}")
             sock.send(json.dumps(data))
     except ConnectionClosed:
@@ -1124,13 +1338,14 @@ def video(sock):
     if not _validate_ws_auth(sock):
         return
 
-    vq = app.svc.svcs.get("videoqueue")
+    printer_index = _requested_printer_index()
+    vq = get_video_service(printer_index)
     if not vq:
         return
 
     vq.viewer_connected()
     try:
-        for msg in app.svc.stream("videoqueue", maxsize=VIDEO_STREAM_QUEUE_MAX):
+        for msg in stream_videoqueue(printer_index, maxsize=VIDEO_STREAM_QUEUE_MAX):
             payload = getattr(msg, "data", None)
             if not payload:
                 continue
@@ -1154,11 +1369,12 @@ def video(sock):
             log.debug(f"/ws/video cleanup failed: {exc}")
 
 
-def _maybe_start_pppp_probe(reason="scheduled"):
+def _maybe_start_pppp_probe(reason="scheduled", printer_index=None):
     """Spawn a shared probe thread if one isn't already running and clients are watching."""
     import web.service.pppp as pppp_svc
 
-    probe = app.pppp_probe
+    printer_index = _requested_printer_index() if printer_index is None else int(printer_index)
+    probe = _get_pppp_probe_state(printer_index)
     with app.pppp_probe_lock:
         thread = probe["thread"]
         if thread is not None and thread.is_alive():
@@ -1167,7 +1383,7 @@ def _maybe_start_pppp_probe(reason="scheduled"):
             return  # no clients watching, don't probe
 
         config = app.config["config"]
-        idx = app.config["printer_index"]
+        idx = printer_index
 
         def _run():
             result = pppp_svc.probe_pppp(config, idx)
@@ -1211,6 +1427,7 @@ def pppp_state(sock):
     if not _validate_ws_auth(sock):
         return
 
+    printer_index = _requested_printer_index()
     log.info("Starting PPPP state websocket handler")
 
     last_status = None
@@ -1225,29 +1442,31 @@ def pppp_state(sock):
     MAX_RETRIES = 2          # retries after first failure before switching to PROBE_INTERVAL
 
     # Register this client and kick off an immediate probe if we're the first.
+    probe = _get_pppp_probe_state(printer_index)
     with app.pppp_probe_lock:
-        app.pppp_probe["client_count"] += 1
-        is_first = app.pppp_probe["client_count"] == 1
+        probe["client_count"] += 1
+        is_first = probe["client_count"] == 1
 
     if is_first:
-        _maybe_start_pppp_probe("first client")
+        _maybe_start_pppp_probe("first client", printer_index=printer_index)
 
     try:
         while True:
             now = time.time()
 
             # Passive read — no ref-count increment, never starts the service.
-            pppp = app.svc.svcs.get("pppp")
+            probe = _get_pppp_probe_state(printer_index)
+            pppp = get_pppp_service(printer_index)
 
             if pppp is not None and bool(getattr(pppp, "connected", False)):
                 current_status = "connected"
                 pppp_was_connected = True
                 with app.pppp_probe_lock:
-                    app.pppp_probe["result"] = None
-                    app.pppp_probe["fail_count"] = 0
+                    probe["result"] = None
+                    probe["fail_count"] = 0
             else:
                 # Check MQTT staleness and detect recovery transition
-                mqtt_svc = get_mqtt_service()
+                mqtt_svc = get_mqtt_service(printer_index)
                 mqtt_last = getattr(mqtt_svc, "last_message_time", 0.0) if mqtt_svc else 0.0
                 mqtt_stale = mqtt_last > 0 and (now - mqtt_last) > MQTT_STALE_AFTER
 
@@ -1255,15 +1474,15 @@ def pppp_state(sock):
                 if mqtt_recovered:
                     log.info("MQTT recovered — resetting PPPP probe state")
                     with app.pppp_probe_lock:
-                        app.pppp_probe["result"] = None
-                        app.pppp_probe["fail_count"] = 0
+                        probe["result"] = None
+                        probe["fail_count"] = 0
                 mqtt_was_stale = mqtt_stale
 
                 # Snapshot shared probe state under lock
                 with app.pppp_probe_lock:
-                    probe_result = app.pppp_probe["result"]
-                    last_probe_time = app.pppp_probe["last_time"]
-                    probe_fail_count = app.pppp_probe["fail_count"]
+                    probe_result = probe["result"]
+                    last_probe_time = probe["last_time"]
+                    probe_fail_count = probe["fail_count"]
 
                 # Short retries for first MAX_RETRIES failures; long back-off once the printer is clearly offline
                 next_interval = RETRY_INTERVAL if probe_fail_count <= MAX_RETRIES else PROBE_INTERVAL
@@ -1281,7 +1500,7 @@ def pppp_state(sock):
                               else "MQTT recovered" if mqtt_recovered
                               else "MQTT stale" if mqtt_stale
                               else "retry after fail")
-                    _maybe_start_pppp_probe(reason)
+                    _maybe_start_pppp_probe(reason, printer_index=printer_index)
 
                 if probe_result is True:
                     current_status = "connected"
@@ -1310,8 +1529,9 @@ def pppp_state(sock):
         log.info("Stack trace:", exc_info=True)
     finally:
         try:
+            probe = _get_pppp_probe_state(printer_index)
             with app.pppp_probe_lock:
-                app.pppp_probe["client_count"] -= 1
+                probe["client_count"] = max(0, int(probe["client_count"]) - 1)
         except Exception as exc:
             log.debug(f"PPPP state cleanup failed: {exc}")
         log.debug("PPPP state websocket handler ending")
@@ -1351,7 +1571,8 @@ def ctrl(sock):
 
     # send a response on connect, to let the client know the connection is ready
     sock.send(json.dumps({"ankerctl": 1}))
-    vq = app.svc.svcs.get("videoqueue")
+    printer_index = _requested_printer_index()
+    vq = get_video_service(printer_index)
     if vq:
         profile_id = getattr(vq, "saved_video_profile_id", None)
         if profile_id is None:
@@ -1372,20 +1593,20 @@ def ctrl(sock):
 
         if "light" in msg:
             if isinstance(msg["light"], bool):
-                with app.svc.borrow("videoqueue") as vq:
+                with borrow_videoqueue(printer_index) as vq:
                     vq.api_light_state(msg["light"])
             else:
                 log.warning(f"Invalid 'light' value (expected bool): {msg['light']!r}")
 
         if "video_profile" in msg:
             if isinstance(msg["video_profile"], str):
-                with app.svc.borrow("videoqueue") as vq:
+                with borrow_videoqueue(printer_index) as vq:
                     vq.api_video_profile(msg["video_profile"])
             else:
                 log.warning(f"Invalid 'video_profile' value (expected str): {msg['video_profile']!r}")
         elif "quality" in msg:
             if isinstance(msg["quality"], int):
-                with app.svc.borrow("videoqueue") as vq:
+                with borrow_videoqueue(printer_index) as vq:
                     vq.api_video_mode(msg["quality"])
             else:
                 log.warning(f"Invalid 'quality' value (expected int): {msg['quality']!r}")
@@ -1394,7 +1615,7 @@ def ctrl(sock):
             if not isinstance(msg["video_enabled"], bool):
                 log.warning(f"Invalid 'video_enabled' value (expected bool): {msg['video_enabled']!r}")
                 continue
-            vq = app.svc.svcs.get("videoqueue")
+            vq = get_video_service(printer_index)
             if vq:
                 vq.set_video_enabled(msg["video_enabled"])
 
@@ -1421,11 +1642,12 @@ def video_download():
             return Response("Unauthorized", 401)
 
     for_timelapse = request.args.get("for_timelapse") == "1"
+    printer_index = request.args.get("printer_index", default=app.config.get("printer_index", 0), type=int)
 
     def generate():
-        if not app.config["login"] or not app.config.get("video_supported"):
+        if not app.config["login"] or not _printer_video_supported(printer_index=printer_index):
             return
-        vq = app.svc.svcs.get("videoqueue")
+        vq = get_video_service(printer_index)
         if vq:
             if not for_timelapse and not getattr(vq, "video_enabled", False):
                 return
@@ -1435,7 +1657,7 @@ def video_download():
                     vq.await_ready()
                 except ServiceStoppedError:
                     return
-        for msg in app.svc.stream("videoqueue", maxsize=VIDEO_STREAM_QUEUE_MAX):
+        for msg in stream_videoqueue(printer_index, maxsize=VIDEO_STREAM_QUEUE_MAX):
             yield msg.data
 
     return Response(generate(), mimetype="video/mp4")
@@ -1631,13 +1853,8 @@ def app_api_set_active_printer():
         and hasattr(app.svc, "unregister")
     )
     if rich_service_manager:
-        # Stop and fully tear down the old PPPP/video services first so that
-        # register_services() can create fresh instances for the new printer.
-        try:
-            _stop_switchable_services()
-        except Exception as err:
-            log.warning(f"Service reset after printer switch raised: {err}")
-
+        # Per-printer video/PPPP services stay attached to their own printer so
+        # background timelapses can continue even when the UI switches printers.
         register_services(app)
     else:
         restart_all = getattr(app.svc, "restart_all", None)
@@ -2790,13 +3007,14 @@ def _validate_selected_printer_camera(camera_settings, *, stream_state=True):
     if camera_settings.get("effective_source") != web.camera.CAMERA_SOURCE_PRINTER:
         return None
 
-    if not app.config.get("video_supported", False):
+    printer_index = camera_settings.get("printer_index", app.config.get("printer_index", 0))
+    if not _printer_video_supported(printer_index=printer_index):
         return {"error": "Printer camera is not supported for the selected printer"}, 400
 
     if not stream_state:
         return None
 
-    vq = app.svc.svcs.get("videoqueue")
+    vq = get_video_service(printer_index)
     if not vq:
         return {"error": "Video service not available"}, 503
     if not getattr(vq, "video_enabled", False):
@@ -2842,7 +3060,7 @@ def app_api_camera_frame():
     """Return a current frame from the selected camera as an inline JPEG."""
     from flask import after_this_request, send_file
 
-    camera_settings = _resolve_camera_settings()
+    camera_settings = _resolve_camera_settings(printer_index=_requested_printer_index())
     if not camera_settings.get("effective_source"):
         return {"error": camera_settings.get("detail") or "No camera source is available"}, 400
 
@@ -2878,7 +3096,8 @@ def app_api_snapshot():
     from datetime import datetime
     from flask import after_this_request, send_file
 
-    camera_settings = _resolve_camera_settings()
+    printer_index = _requested_printer_index()
+    camera_settings = _resolve_camera_settings(printer_index=printer_index)
     if not camera_settings.get("effective_source"):
         return {"error": camera_settings.get("detail") or "No camera source is available"}, 400
 
@@ -2897,7 +3116,7 @@ def app_api_snapshot():
         return {"error": f"Snapshot could not run ffmpeg: {err}"}, 500
 
     taken_at = datetime.now()
-    with borrow_mqtt() as mqtt:
+    with borrow_mqtt(printer_index) as mqtt:
         timelapse = getattr(mqtt, "timelapse", None) if mqtt else None
         if timelapse:
             try:
@@ -3590,15 +3809,17 @@ def register_services(app):
             return
 
         supported_indexes = []
-        any_camera_supported = False
+        camera_supported_indexes = []
         for index, printer in enumerate(getattr(cfg, "printers", [])):
             if printer.model in UNSUPPORTED_PRINTERS:
                 continue
             supported_indexes.append(index)
             if printer.model not in PRINTERS_WITHOUT_CAMERA:
-                any_camera_supported = True
+                camera_supported_indexes.append(index)
 
     wanted_mqtt_services = {mqtt_service_name(index) for index in supported_indexes}
+    wanted_video_services = {video_service_name(index) for index in camera_supported_indexes}
+    wanted_pppp_services = {pppp_service_name(index) for index in camera_supported_indexes}
     for name, svc in list(iter_mqtt_services()):
         if name in wanted_mqtt_services:
             continue
@@ -3614,15 +3835,42 @@ def register_services(app):
             log.debug(f"Service {name} stop wait failed: {exc}")
         app.svc.unregister(name)
 
+    for prefix, legacy_name, wanted_names, label in (
+        (VIDEO_SERVICE_PREFIX, LEGACY_VIDEO_SERVICE_NAME, wanted_video_services, "video"),
+        (PPPP_SERVICE_PREFIX, LEGACY_PPPP_SERVICE_NAME, wanted_pppp_services, "PPPP"),
+    ):
+        for name, svc in list(getattr(app.svc, "svcs", {}).items()):
+            if not (name.startswith(prefix) or name == legacy_name):
+                continue
+            if name in wanted_names:
+                continue
+            if app.svc.refs.get(name, 0) > 0:
+                log.warning(
+                    f"Skipping stop of {label} service {name!r}: "
+                    f"{app.svc.refs[name]} active reference(s); will retry on next reload"
+                )
+                continue
+            svc.stop()
+            try:
+                svc.await_stopped()
+            except Exception as exc:
+                log.debug(f"Service {name} stop wait failed: {exc}")
+            app.svc.unregister(name)
+
     if not supported_indexes:
         return
 
-    if "pppp" not in app.svc:
-        app.svc.register("pppp", web.service.pppp.PPPPService())
-    if any_camera_supported and "videoqueue" not in app.svc:
-        app.svc.register("videoqueue", web.service.video.VideoQueue())
     if "filetransfer" not in app.svc:
         app.svc.register("filetransfer", web.service.filetransfer.FileTransferService())
+
+    for printer_index in camera_supported_indexes:
+        pppp_name = pppp_service_name(printer_index)
+        if pppp_name not in app.svc:
+            app.svc.register(pppp_name, web.service.pppp.PPPPService(printer_index=printer_index))
+
+        video_name = video_service_name(printer_index)
+        if video_name not in app.svc:
+            app.svc.register(video_name, web.service.video.VideoQueue(printer_index=printer_index))
 
     for printer_index in supported_indexes:
         name = mqtt_service_name(printer_index)
@@ -3814,13 +4062,18 @@ if os.getenv("ANKERCTL_DEV_MODE", "false").lower() == "true":
 
     @app.post("/api/debug/services/<name>/test")
     def app_api_debug_service_test(name):
-        """Run a quick connectivity probe for a service. Currently only 'pppp' is supported."""
-        if name != "pppp":
+        """Run a quick connectivity probe for a PPPP service."""
+        if name != LEGACY_PPPP_SERVICE_NAME and not name.startswith(PPPP_SERVICE_PREFIX):
             return {"error": f"Test not supported for service '{name}'"}, 400
 
         import web.service.pppp as pppp_svc
         config = app.config["config"]
         idx = app.config["printer_index"]
+        if name.startswith(PPPP_SERVICE_PREFIX):
+            try:
+                idx = int(name.split(":", 1)[1])
+            except (TypeError, ValueError):
+                return {"error": f"Invalid PPPP service name '{name}'"}, 400
 
         if not config:
             return {"error": "No printer configured"}, 503

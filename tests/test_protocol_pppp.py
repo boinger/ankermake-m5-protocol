@@ -1,3 +1,5 @@
+import socket
+
 from socket import AF_INET
 
 from libflagship.cyclic import CyclicU16
@@ -16,7 +18,7 @@ from libflagship.pppp import (
     Version,
     Xzyh,
 )
-from libflagship.ppppapi import Channel, FileUploadInfo
+from libflagship.ppppapi import AnkerPPPPBaseApi, Channel, FileUploadInfo, PPPP_SOCKET_RCVBUF, PPPP_SOCKET_SNDBUF
 
 
 def _host(addr="192.168.1.25", port=32108):
@@ -174,3 +176,28 @@ def test_channel_can_skip_stale_receive_gap_for_realtime_streams():
     assert chan.skip_rx_gap(max_queued=2) is True
     assert chan.read(9, timeout=0.0) == b"middleend"
     assert chan.rx_ctr == CyclicU16(3)
+
+
+def test_pppp_open_configures_udp_socket_buffers(monkeypatch):
+    created = []
+
+    class FakeSocket:
+        def __init__(self):
+            self.calls = []
+
+        def setsockopt(self, level, optname, value):
+            self.calls.append((level, optname, value))
+
+    monkeypatch.setattr(
+        "libflagship.ppppapi.socket.socket",
+        lambda family, kind: created.append(FakeSocket()) or created[-1],
+    )
+
+    lan_api = AnkerPPPPBaseApi.open(duid=None, host="127.0.0.1", port=32108)
+    broadcast_api = AnkerPPPPBaseApi.open_broadcast()
+
+    assert lan_api.addr == ("127.0.0.1", 32108)
+    assert broadcast_api.addr == ("255.255.255.255", 32108)
+    assert (socket.SOL_SOCKET, socket.SO_RCVBUF, PPPP_SOCKET_RCVBUF) in created[0].calls
+    assert (socket.SOL_SOCKET, socket.SO_SNDBUF, PPPP_SOCKET_SNDBUF) in created[0].calls
+    assert (socket.SOL_SOCKET, socket.SO_BROADCAST, 1) in created[1].calls

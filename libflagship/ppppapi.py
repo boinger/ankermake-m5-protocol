@@ -21,6 +21,31 @@ from libflagship.pppp import Type, \
 
 PPPP_LAN_PORT = 32108
 PPPP_WAN_PORT = 32100
+PPPP_SOCKET_RCVBUF = 1024 * 1024
+PPPP_SOCKET_SNDBUF = 256 * 1024
+
+
+def _configure_udp_socket(sock, *, broadcast=False):
+    for opt_name, value in (
+        ("SO_RCVBUF", PPPP_SOCKET_RCVBUF),
+        ("SO_SNDBUF", PPPP_SOCKET_SNDBUF),
+        ("SO_REUSEADDR", 1),
+    ):
+        opt = getattr(socket, opt_name, None)
+        if opt is None:
+            continue
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, opt, value)
+        except OSError:
+            pass
+
+    if broadcast:
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except OSError:
+            pass
+
+    return sock
 
 
 class PPPPError(Exception):
@@ -309,7 +334,7 @@ class AnkerPPPPBaseApi(Thread):
 
     @classmethod
     def open(cls, duid, host, port):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock = _configure_udp_socket(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
         return cls(sock, duid, addr=(host, port))
 
     @classmethod
@@ -322,8 +347,10 @@ class AnkerPPPPBaseApi(Thread):
 
     @classmethod
     def open_broadcast(cls):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock = _configure_udp_socket(
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM),
+            broadcast=True,
+        )
         addr = ("255.255.255.255", PPPP_LAN_PORT)
         return cls(sock, duid=None, addr=addr)
 
@@ -417,7 +444,7 @@ class AnkerPPPPBaseApi(Thread):
         prev_timeout = self.sock.gettimeout()
         self.sock.settimeout(timeout)
         try:
-            data, self.addr = self.sock.recvfrom(4096)
+            data, self.addr = self.sock.recvfrom(65535)
         except BlockingIOError as e:
             raise TimeoutError("recv would block") from e
         finally:

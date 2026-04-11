@@ -259,10 +259,10 @@ class ServiceManager:
         self.dump()
 
         stop_order = [
-            "videoqueue",
+            *(name for name in self.svcs if name == "videoqueue" or name.startswith("videoqueue:")),
             "filetransfer",
             *(name for name in self.svcs if name.startswith("mqttqueue")),
-            "pppp",
+            *(name for name in self.svcs if name == "pppp" or name.startswith("pppp:")),
         ]
         seen = set()
         ordered_names = []

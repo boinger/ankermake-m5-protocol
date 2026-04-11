@@ -750,7 +750,7 @@ $(function () {
                 }
                 scheduleExternalCameraPreview(refreshMs);
             };
-            img.src = `/api/camera/frame?ts=${Date.now()}`;
+            img.src = `/api/camera/frame?printer_index=${encodeURIComponent(getActivePrinterIndex())}&ts=${Date.now()}`;
         }, Math.max(0, delayMs || 0));
     }
 
@@ -1368,17 +1368,18 @@ $(function () {
      */
     sockets.video = new AutoWebSocket({
         name: "Video socket",
-        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/video`,
+        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/video?printer_index=${encodeURIComponent(getActivePrinterIndex())}`,
         badge: "#badge-video",
         binary: true,
         reconnect: 2000,
 
         open: function () {
             this.videoQueue = [];
-            this.videoBufferMinPackets = 4;
-            this.videoBufferDelayMs = 300;
-            this.videoBufferMaxPackets = 300;
-            this.videoPumpMaxPacketsPerTick = 12;
+            this.videoBufferMinPackets = 2;
+            this.videoBufferDelayMs = 120;
+            this.videoBufferMaxPackets = 120;
+            this.videoBufferCatchupPackets = 24;
+            this.videoPumpMaxPacketsPerTick = 24;
             this.videoBuffering = true;
             this.jmuxer = new JMuxer({
                 node: "player",
@@ -1443,7 +1444,8 @@ $(function () {
                 receivedAt: now,
             });
             if (this.videoQueue.length > this.videoBufferMaxPackets) {
-                this.videoQueue.splice(0, this.videoQueue.length - this.videoBufferMaxPackets);
+                const keepPackets = Math.max(this.videoBufferCatchupPackets, this.videoBufferMinPackets);
+                this.videoQueue.splice(0, this.videoQueue.length - keepPackets);
                 this.videoBuffering = true;
             }
         },
@@ -1520,7 +1522,7 @@ $(function () {
 
     sockets.ctrl = new AutoWebSocket({
         name: "Control socket",
-        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/ctrl`,
+        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/ctrl?printer_index=${encodeURIComponent(getActivePrinterIndex())}`,
         badge: "#badge-ctrl",
         opened: flushCtrlMessages,
         message: function (event) {
@@ -1539,7 +1541,7 @@ $(function () {
 
     sockets.pppp_state = new AutoWebSocket({
         name: "PPPP socket",
-        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/pppp-state`,
+        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/pppp-state?printer_index=${encodeURIComponent(getActivePrinterIndex())}`,
         badge: "#badge-pppp",
         reconnect: 5000,
 
@@ -2868,7 +2870,7 @@ $(function () {
         const btn = $(this);
         btn.prop("disabled", true);
         try {
-            const resp = await fetch("/api/snapshot");
+            const resp = await fetch(`/api/snapshot?printer_index=${encodeURIComponent(getActivePrinterIndex())}`);
             if (!resp.ok) {
                 const data = await resp.json().catch(() => ({}));
                 const msg = data.error || `HTTP ${resp.status}`;

@@ -220,10 +220,11 @@ class TimelapseService:
 
     def _enable_video_for_timelapse(self):
         """Start video streaming for timelapse capture if not already active."""
+        import web
         from web import app
         from web.lib.service import RunState, ServiceStoppedError
 
-        vq = app.svc.svcs.get("videoqueue")
+        vq = web.get_video_service(self._printer_index)
         if not vq:
             log.warning("Timelapse: videoqueue service not available, snapshots will be skipped")
             return
@@ -265,8 +266,9 @@ class TimelapseService:
 
     def _disable_video_for_timelapse(self):
         """Disable video streaming if timelapse enabled it."""
-        from web import app
-        vq = app.svc.svcs.get("videoqueue")
+        import web
+
+        vq = web.get_video_service(self._printer_index)
 
         if self._light_mode == "session" and vq and self._light_was_on is not True:
             restore = self._light_was_on if self._light_was_on is not None else False
@@ -284,8 +286,9 @@ class TimelapseService:
 
     def _await_video_frame(self, timeout=2.5, max_age=1.5):
         """Wait until a recent video frame has been received from the camera."""
-        from web import app
-        vq = app.svc.svcs.get("videoqueue")
+        import web
+
+        vq = web.get_video_service(self._printer_index)
         if not vq or not hasattr(vq, "last_frame_at"):
             self._set_recovery_state(False)
             return True
@@ -323,9 +326,9 @@ class TimelapseService:
         return (now - last_frame) <= max_age
 
     def _request_video_recovery(self, reason, force_pppp_recycle=False):
-        from web import app
+        import web
 
-        vq = app.svc.svcs.get("videoqueue")
+        vq = web.get_video_service(self._printer_index)
         if not vq:
             return False
 
@@ -675,6 +678,7 @@ class TimelapseService:
 
     def _take_snapshot(self):
         """Capture a single frame using ffmpeg."""
+        import web
         from web import app  # Lazy import to avoid circular deps
         ffmpeg_path = _resolve_ffmpeg_path()
         if not ffmpeg_path:
@@ -695,7 +699,7 @@ class TimelapseService:
 
         # Per-snapshot light control: turn on, wait for camera to adjust, then shoot
         vq = (
-            app.svc.svcs.get("videoqueue")
+            web.get_video_service(self._printer_index)
             if self._light_mode == "snapshot" and effective_source == web.camera.CAMERA_SOURCE_PRINTER
             else None
         )

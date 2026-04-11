@@ -111,7 +111,7 @@ class MqttQueue(Service):
         return f"MqttQueue[{self.printer_index}]"
 
     def worker_init(self):
-        self._notifier = AppriseNotifier(app.config["config"])
+        self._notifier = AppriseNotifier(app.config["config"], printer_index=self.printer_index)
         config_root = str(app.config["config"].config_root)
         self._history = PrintHistory(db_path=f"{config_root}/history.db")
         self._timelapse = TimelapseService(app.config["config"], printer_index=self.printer_index)
@@ -129,7 +129,12 @@ class MqttQueue(Service):
                 printer = cfg.printers[self.printer_index]
                 printer_sn = getattr(printer, "sn", None)
                 printer_name = getattr(printer, "name", None) or "AnkerMake M5"
-        self._ha = HomeAssistantService(app.config["config"], printer_sn=printer_sn, printer_name=printer_name)
+        self._ha = HomeAssistantService(
+            app.config["config"],
+            printer_sn=printer_sn,
+            printer_name=printer_name,
+            printer_index=self.printer_index,
+        )
         self._ha.start()
         self._printer_name = printer_name or "AnkerMake M5"
         self._printer_sn = printer_sn

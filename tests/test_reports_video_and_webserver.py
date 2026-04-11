@@ -10,6 +10,7 @@ from web import (
     _read_printer_report,
     _read_printer_settings_summary,
     app,
+    register_services,
     webserver,
 )
 from web.lib.service import RunState
@@ -70,6 +71,48 @@ class FakeVideoServices:
         assert name == "videoqueue"
         for payload in self._payloads:
             yield SimpleNamespace(data=payload)
+
+
+class FakeManagedService:
+    def __init__(self, label):
+        self.label = label
+        self.state = RunState.Stopped
+        self.wanted = False
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.await_stopped_calls = 0
+
+    def start(self):
+        self.start_calls += 1
+        self.state = RunState.Running
+        self.wanted = True
+
+    def stop(self):
+        self.stop_calls += 1
+        self.state = RunState.Stopped
+        self.wanted = False
+
+    def await_stopped(self):
+        self.await_stopped_calls += 1
+        self.state = RunState.Stopped
+        return True
+
+
+class FakeServiceManager:
+    def __init__(self, svcs=None, refs=None):
+        self.svcs = svcs or {}
+        self.refs = refs or {name: 0 for name in self.svcs}
+
+    def __contains__(self, name):
+        return name in self.svcs
+
+    def register(self, name, svc):
+        self.svcs[name] = svc
+        self.refs[name] = 0
+
+    def unregister(self, name):
+        del self.svcs[name]
+        del self.refs[name]
 
 
 def _base_config(model="V8111", active_index=0):
@@ -317,3 +360,48 @@ def test_webserver_bootstraps_secret_key_and_skips_services_for_unsupported_devi
     assert register_calls == []
     assert run_calls == [("0.0.0.0", 9000)]
     assert unsupported_flag is True
+
+
+def test_register_services_replaces_legacy_video_and_pppp_entries_for_multi_printer_setup(monkeypatch):
+    cfg = Config(
+        account=Account(
+            auth_token="token",
+            region="eu",
+            user_id="user-1",
+            email="user@example.com",
+        ),
+        printers=[_printer("SN1", "Printer 1"), _printer("SN2", "Printer 2")],
+    )
+    manager = FakeConfigManager(cfg)
+    legacy_video = FakeManagedService("legacy-video")
+    legacy_pppp = FakeManagedService("legacy-pppp")
+    fake_manager = FakeServiceManager(
+        svcs={
+            "videoqueue": legacy_video,
+            "pppp": legacy_pppp,
+        },
+        refs={
+            "videoqueue": 0,
+            "pppp": 0,
+        },
+    )
+    old_values, old_svc = _install_app_state(config=manager, svc=fake_manager)
+
+    monkeypatch.setattr("web.service.filetransfer.FileTransferService", lambda: FakeManagedService("filetransfer"))
+    monkeypatch.setattr("web.service.pppp.PPPPService", lambda printer_index=0: FakeManagedService(f"pppp-{printer_index}"))
+    monkeypatch.setattr("web.service.video.VideoQueue", lambda printer_index=0: FakeManagedService(f"video-{printer_index}"))
+    monkeypatch.setattr("web.service.mqtt.MqttQueue", lambda printer_index=0: FakeManagedService(f"mqtt-{printer_index}"))
+
+    try:
+        register_services(app)
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert "videoqueue" not in fake_manager.svcs
+    assert "pppp" not in fake_manager.svcs
+    assert fake_manager.svcs["videoqueue:0"].label == "video-0"
+    assert fake_manager.svcs["videoqueue:1"].label == "video-1"
+    assert fake_manager.svcs["pppp:0"].label == "pppp-0"
+    assert fake_manager.svcs["pppp:1"].label == "pppp-1"
+    assert fake_manager.svcs["mqttqueue:0"].start_calls == 1
+    assert fake_manager.svcs["mqttqueue:1"].start_calls == 1

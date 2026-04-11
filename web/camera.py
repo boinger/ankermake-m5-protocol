@@ -171,11 +171,13 @@ def create_temp_snapshot_file():
     return temp_path
 
 
-def build_printer_video_url(host, port, api_key=None, *, for_timelapse=False):
+def build_printer_video_url(host, port, api_key=None, *, for_timelapse=False, printer_index=None):
     url = f"http://{host}:{port}/video"
     query = []
     if for_timelapse:
         query.append("for_timelapse=1")
+    if printer_index is not None:
+        query.append(f"printer_index={int(printer_index)}")
     if api_key:
         query.append(f"apikey={quote(api_key, safe='')}")
     if query:
@@ -246,7 +248,13 @@ def capture_camera_snapshot_to_file(
 ):
     effective_source = (camera_settings or {}).get("effective_source")
     if effective_source == CAMERA_SOURCE_PRINTER:
-        input_url = build_printer_video_url(host, port, api_key, for_timelapse=for_timelapse)
+        input_url = build_printer_video_url(
+            host,
+            port,
+            api_key,
+            for_timelapse=for_timelapse,
+            printer_index=(camera_settings or {}).get("printer_index"),
+        )
         _run_ffmpeg_snapshot(
             ffmpeg_path,
             input_url,

@@ -83,10 +83,11 @@ def format_bytes(num_bytes):
 
 
 class AppriseNotifier:
-    def __init__(self, config_manager, reload_interval=5.0, settings=None):
+    def __init__(self, config_manager, reload_interval=5.0, settings=None, printer_index=None):
         self._config_manager = config_manager
         self._reload_interval = reload_interval
         self._explicit_settings = settings
+        self._printer_index = 0 if printer_index is None else int(printer_index)
         self._last_load = 0.0
         self._client = None
         self._settings = None
@@ -298,13 +299,16 @@ class AppriseNotifier:
         if not enabled_by_notifier:
             return
 
-        vq = app.svc.svcs.get("videoqueue")
+        vq = web.get_video_service(self._printer_index)
         if not vq:
             with self._snapshot_timer_lock:
                 self._snapshot_enabled_by_notifier = False
             return
 
-        refs = getattr(app.svc, "refs", {}).get("videoqueue", 0)
+        refs = getattr(app.svc, "refs", {}).get(
+            web.resolve_video_service_name(self._printer_index),
+            0,
+        )
         if refs:
             with self._snapshot_timer_lock:
                 self._snapshot_hold_until = time.monotonic() + _SNAPSHOT_KEEPALIVE
@@ -320,7 +324,7 @@ class AppriseNotifier:
             self._snapshot_enabled_by_notifier = False
 
     def _capture_live_snapshot(self):
-        camera_settings = web._resolve_camera_settings()
+        camera_settings = web._resolve_camera_settings(printer_index=self._printer_index)
         if not camera_settings.get("effective_source"):
             return None
 
@@ -330,7 +334,7 @@ class AppriseNotifier:
             return None
 
         using_printer_camera = camera_settings.get("effective_source") == web.camera.CAMERA_SOURCE_PRINTER
-        vq = app.svc.svcs.get("videoqueue") if using_printer_camera else None
+        vq = web.get_video_service(self._printer_index) if using_printer_camera else None
         if using_printer_camera and not vq:
             return None
 
