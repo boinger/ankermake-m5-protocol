@@ -81,14 +81,39 @@ $(function () {
     }
 
     /**
+     * Normalize a time value in seconds for display.
+     * @param {number|string|null|undefined} value
+     * @returns {number|null} Whole seconds, or null when the input is not usable
+     */
+    function normalizeTimeSeconds(value) {
+        if (typeof(value) === "number") {
+            return Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
+        }
+        if (typeof(value) === "string") {
+            const trimmed = value.trim();
+            if (!trimmed) {
+                return null;
+            }
+            const parsed = Number(trimmed);
+            return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : null;
+        }
+        return null;
+    }
+
+    /**
      * Convert time in seconds to hours, minutes, and seconds format
      * @param {number} totalseconds
-     * @returns {string} Formatted time string
+     * @returns {string|null} Formatted time string, or null when the input is invalid
      */
     function getTime(totalseconds) {
-        const hours = Math.floor(totalseconds / 3600);
-        const minutes = Math.floor((totalseconds % 3600) / 60);
-        const seconds = totalseconds % 60;
+        const total = normalizeTimeSeconds(totalseconds);
+        if (total === null) {
+            return null;
+        }
+
+        const hours = Math.floor(total / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        const seconds = total % 60;
 
         const timeString =
             `${hours.toString().padStart(2, "0")}:` +
@@ -1248,9 +1273,15 @@ $(function () {
                 }
             } else if (data.commandType == 1001) {
                 // ZZ_MQTT_CMD_PRINT_SCHEDULE: time=remaining, totalTime=elapsed, progress=0-10000
-                $("#time-remain").text(getTime(data.time));
+                const remainingText = getTime(data.time);
+                if (remainingText !== null) {
+                    $("#time-remain").text(remainingText);
+                }
                 if (data.totalTime !== undefined) {
-                    $("#time-elapsed").text(getTime(data.totalTime));
+                    const elapsedText = getTime(data.totalTime);
+                    if (elapsedText !== null) {
+                        $("#time-elapsed").text(elapsedText);
+                    }
                 }
                 if (data.progress !== undefined) {
                     const progress = Math.min(100, Math.round(data.progress / 100));

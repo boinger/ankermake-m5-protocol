@@ -425,10 +425,29 @@ class MqttQueue(Service):
             return None
         expected_name = os.path.basename(str(archive_info.get("filename") or ""))
         target_name = os.path.basename(str(filename or ""))
-        if expected_name and target_name and expected_name != target_name:
+        if (
+            expected_name
+            and target_name
+            and expected_name != target_name
+            and self._normalize_pending_archive_filename(expected_name)
+            != self._normalize_pending_archive_filename(target_name)
+        ):
             return None
         self._pending_archive_info = None
         return archive_info
+
+    @staticmethod
+    def _normalize_pending_archive_filename(filename):
+        cleaned = []
+        for char in os.path.basename(str(filename or "")):
+            if char.isalnum() or char in "._-":
+                cleaned.append(char)
+            else:
+                cleaned.append("_")
+        normalized = "".join(cleaned).lstrip(".")
+        while ".." in normalized:
+            normalized = normalized.replace("..", ".")
+        return normalized.lower()
 
     def _clear_recent_completion(self):
         self._recent_completion_filename = None

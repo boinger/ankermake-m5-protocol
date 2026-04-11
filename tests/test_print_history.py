@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 
 from web.service.history import PrintHistory
 
@@ -160,6 +161,39 @@ def test_archive_upload_and_reprint_flags(tmp_path):
     assert entry["thumbnail_available"] is True
     assert history.get_archive_path(row_id) is not None
     assert history.get_thumbnail_path(row_id) is not None
+
+
+def test_history_entry_can_fallback_to_archive_from_same_task_id(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+
+    archive_info = history.archive_upload("cube.gcode", b"G28\nM104 S200\n")
+    original_id = history.record_start(
+        "cube.gcode",
+        task_id="task-archive-fallback",
+        archive_relpath=archive_info["archive_relpath"],
+        archive_size=archive_info["archive_size"],
+    )
+    history.record_finish(task_id="task-archive-fallback", progress=100)
+
+    started_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    finished_at = started_at
+    with history._connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO print_history "
+            "(filename, status, started_at, finished_at, duration_sec, progress, task_id) "
+            "VALUES (?, 'finished', ?, ?, ?, ?, ?)",
+            ("cube.gcode", started_at, finished_at, 10, 100, "task-archive-fallback"),
+        )
+        duplicate_id = cursor.lastrowid
+        conn.commit()
+
+    duplicate_entry = history.get_entry(duplicate_id)
+
+    assert original_id != duplicate_id
+    assert duplicate_entry["archive_relpath"] == archive_info["archive_relpath"]
+    assert duplicate_entry["archive_available"] is True
+    assert duplicate_entry["can_reprint"] is True
+    assert history.get_archive_path(duplicate_id) is not None
 
 
 def test_history_clear_removes_archived_gcode_files(tmp_path):

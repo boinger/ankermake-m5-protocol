@@ -236,8 +236,43 @@ class PrintHistory:
     def _thumbnail_abspath(self, thumbnail_relpath):
         return self._archive_abspath(thumbnail_relpath)
 
-    def _decorate_entry(self, row):
+    def _find_archive_fallback(self, conn, entry):
+        if entry.get("archive_relpath"):
+            return None
+
+        task_id = str(entry.get("task_id") or "").strip()
+        if not task_id:
+            return None
+
+        printer_index = entry.get("printer_index")
+        params = [task_id]
+        sql = (
+            "SELECT archive_relpath, archive_size "
+            "FROM print_history "
+            "WHERE task_id=? AND archive_relpath IS NOT NULL AND archive_relpath != ''"
+        )
+        if printer_index is not None:
+            sql += " AND (printer_index=? OR printer_index IS NULL)"
+            params.append(printer_index)
+        if entry.get("id") is not None:
+            sql += " AND id != ?"
+            params.append(entry["id"])
+
+        if printer_index is not None:
+            sql += " ORDER BY CASE WHEN printer_index IS NULL THEN 1 ELSE 0 END, id DESC LIMIT 1"
+        else:
+            sql += " ORDER BY id DESC LIMIT 1"
+
+        return conn.execute(sql, tuple(params)).fetchone()
+
+    def _decorate_entry(self, row, conn=None):
         entry = dict(row)
+        if conn is not None:
+            fallback = self._find_archive_fallback(conn, entry)
+            if fallback:
+                entry["archive_relpath"] = fallback["archive_relpath"]
+                if entry.get("archive_size") is None:
+                    entry["archive_size"] = fallback["archive_size"]
         archive_path = self._archive_abspath(entry.get("archive_relpath"))
         thumbnail_path = self._thumbnail_abspath(self._thumbnail_relpath(entry.get("archive_relpath")))
         entry["archive_available"] = bool(archive_path and os.path.exists(archive_path))
@@ -514,7 +549,7 @@ class PrintHistory:
                     "SELECT * FROM print_history ORDER BY id DESC LIMIT ? OFFSET ?",
                     (limit, offset)
                 ).fetchall()
-                return [self._decorate_entry(r) for r in rows]
+                return [self._decorate_entry(r, conn=conn) for r in rows]
 
     def get_entry(self, entry_id):
         with self._lock:
@@ -525,7 +560,7 @@ class PrintHistory:
                 ).fetchone()
                 if not row:
                     return None
-                return self._decorate_entry(row)
+                return self._decorate_entry(row, conn=conn)
 
     def get_archive_path(self, entry_id):
         entry = self.get_entry(entry_id)
