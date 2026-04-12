@@ -51,6 +51,10 @@ def test_filament_store_requires_name(tmp_path):
     with pytest.raises(ValueError, match="name is required"):
         store.create({"material": "PLA"})
 
+    created = store.create({"name": "Test PLA"})
+    with pytest.raises(ValueError, match="name is required"):
+        store.update(created["id"], {"name": "   "})
+
 
 def test_filament_store_migrates_legacy_columns(tmp_path):
     db_path = tmp_path / "legacy_filaments.db"

@@ -148,6 +148,45 @@ def test_filament_crud_and_apply_routes(tmp_path):
     assert sent == ["M104 S215\nM140 S65"]
 
 
+def test_filament_apply_route_blocks_while_printing(tmp_path):
+    sent = []
+    mqtt = SimpleNamespace(is_printing=True, send_gcode=lambda gcode: sent.append(gcode), nozzle_temp=220)
+    client = app.test_client()
+    old_values, old_svc, old_filaments, old_swap = _install_state(tmp_path, mqtt)
+
+    try:
+        profile = app.filaments.create({"name": "PLA Busy", "nozzle_temp": 215, "bed_temp": 60})
+        applied = client.post(
+            f"/api/filaments/{profile['id']}/apply",
+            headers={"X-Api-Key": API_KEY},
+        )
+    finally:
+        _restore_state(old_values, old_svc, old_filaments, old_swap)
+
+    assert applied.status_code == 409
+    assert applied.get_json()["error"] == "Filament service commands are blocked while a print is active"
+    assert sent == []
+
+
+def test_filament_update_route_rejects_blank_name(tmp_path):
+    mqtt = SimpleNamespace(is_printing=False, send_gcode=lambda gcode: None, nozzle_temp=220)
+    client = app.test_client()
+    old_values, old_svc, old_filaments, old_swap = _install_state(tmp_path, mqtt)
+
+    try:
+        profile = app.filaments.create({"name": "PLA Keep"})
+        updated = client.put(
+            f"/api/filaments/{profile['id']}",
+            json={"name": "   "},
+            headers={"X-Api-Key": API_KEY},
+        )
+    finally:
+        _restore_state(old_values, old_svc, old_filaments, old_swap)
+
+    assert updated.status_code == 400
+    assert updated.get_json()["error"] == "name is required"
+
+
 def test_filament_service_preheat_and_move_routes(tmp_path):
     sent = []
     mqtt = SimpleNamespace(

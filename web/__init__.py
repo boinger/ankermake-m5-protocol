@@ -3427,7 +3427,10 @@ def app_api_filaments_update(profile_id):
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return {"error": "Invalid JSON payload"}, 400
-    profile = app.filaments.update(profile_id, data)
+    try:
+        profile = app.filaments.update(profile_id, data)
+    except ValueError as exc:
+        return {"error": str(exc)}, 400
     if profile is None:
         return {"error": "Profile not found"}, 404
     return profile
@@ -3456,8 +3459,14 @@ def app_api_filaments_apply(profile_id):
     except (TypeError, ValueError):
         return {"error": "Invalid temperature values in filament profile"}, 422
     gcode = f"M104 S{nozzle}\nM140 S{bed}"
-    with borrow_mqtt() as mqtt:
-        mqtt.send_gcode(gcode)
+    try:
+        with borrow_mqtt() as mqtt:
+            _assert_filament_service_ready(mqtt)
+            mqtt.send_gcode(gcode)
+    except RuntimeError as exc:
+        return {"error": str(exc)}, 409
+    except ConnectionError as exc:
+        return {"error": str(exc)}, 503
     return {"status": "ok", "gcode": gcode}
 
 

@@ -25,6 +25,16 @@ def _sanitize_text(value):
     return value
 
 
+def _normalize_required_name(value):
+    """Normalize a required filament profile name and reject blank values."""
+    value = _sanitize_text(value)
+    if isinstance(value, str):
+        value = value.strip()
+    if not value:
+        raise ValueError("name is required")
+    return value
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS filaments (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -387,8 +397,7 @@ class FilamentStore:
         for field in _TEXT_FIELDS:
             if field in safe:
                 safe[field] = _sanitize_text(safe[field])
-        if "name" not in safe or not safe["name"]:
-            raise ValueError("name is required")
+        safe["name"] = _normalize_required_name(safe.get("name"))
         cols = ", ".join(safe.keys())
         placeholders = ", ".join("?" for _ in safe)
         with self._lock:
@@ -410,6 +419,8 @@ class FilamentStore:
         for field in _TEXT_FIELDS:
             if field in safe:
                 safe[field] = _sanitize_text(safe[field])
+        if "name" in safe:
+            safe["name"] = _normalize_required_name(safe["name"])
         if not safe:
             return self.get(profile_id)
         assignments = ", ".join(f"{k} = ?" for k in safe)

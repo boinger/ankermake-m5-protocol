@@ -5393,6 +5393,28 @@ $(function () {
         el.textContent = message || "";
     }
 
+    function filamentSetTableMessage(message, tone = "muted") {
+        const tbody = document.getElementById("filaments-tbody");
+        if (!tbody) return;
+        const textClass = tone === "danger" ? "text-danger" : "text-muted";
+        tbody.innerHTML = `<tr><td colspan="8" class="text-center ${textClass} py-4">${escapeHtml(message)}</td></tr>`;
+    }
+
+    function filamentSetSwapStateMessage(message) {
+        const stateEl = document.getElementById("filament-swap-state");
+        if (!stateEl) return;
+        stateEl.textContent = message || "";
+    }
+
+    async function filamentJsonRequest(url, options = {}, fallbackMessage = "Request failed") {
+        const resp = await fetch(url, options);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            throw new Error(data.error || `${fallbackMessage} (HTTP ${resp.status})`);
+        }
+        return data;
+    }
+
     function filamentPopulateSelect(selectId, selectedValue = "") {
         const select = document.getElementById(selectId);
         if (!select) return;
@@ -5520,29 +5542,22 @@ $(function () {
 
     async function filamentRefreshSwapState() {
         try {
-            const resp = await fetch("/api/filaments/service/swap");
-            const data = await resp.json();
-            if (!resp.ok) {
-                filamentSetServiceStatus(data.error || `Failed to load swap state (HTTP ${resp.status})`, "danger");
-                return;
-            }
+            const data = await filamentJsonRequest("/api/filaments/service/swap", {}, "Failed to load swap state");
             filamentUpdateSwapState(data);
         } catch (err) {
-                filamentSetServiceStatus(`Failed to load swap state: ${err}`, "danger");
+            console.warn("Filament swap state refresh failed:", err);
+            if (_filamentSwapToken) {
+                filamentSetSwapStateMessage(`Swap status refresh failed: ${err.message}. The last known state may be stale.`);
+            }
         }
     }
 
     async function filamentServiceRequest(url, payload) {
-        const resp = await fetch(url, {
+        return filamentJsonRequest(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload || {}),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) {
-            throw new Error(data.error || `HTTP ${resp.status}`);
-        }
-        return data;
+        }, "Filament service request failed");
     }
 
     function _renderFilaments() {
@@ -5562,7 +5577,7 @@ $(function () {
             return _filamentSortAsc ? cmp : -cmp;
         });
         if (profiles.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-4">No filament profiles found</td></tr>';
+            filamentSetTableMessage("No filament profiles found.");
             return;
         }
         tbody.innerHTML = "";
@@ -5599,46 +5614,60 @@ $(function () {
                             </div>
                         </td>`;
                     tr.querySelector(".filament-edit").addEventListener("click", () => filamentOpenEdit(p));
-                    tr.querySelector(".filament-duplicate").addEventListener("click", () => {
-                        fetch(`/api/filaments/${safeId}/duplicate`, { method: "POST" })
-                            .then(r => r.json())
-                            .then(() => loadFilaments())
-                            .catch(err => console.error("Duplicate failed:", err));
+                    tr.querySelector(".filament-duplicate").addEventListener("click", async () => {
+                        try {
+                            await filamentJsonRequest(`/api/filaments/${safeId}/duplicate`, { method: "POST" }, "Failed to duplicate filament profile");
+                            await loadFilaments();
+                            flash_message(`Created a copy of "${p.name}".`, "success");
+                        } catch (err) {
+                            flash_message(`Duplicate failed: ${err.message}`, "danger");
+                        }
                     });
-                    tr.querySelector(".filament-preheat").addEventListener("click", () => {
+                    tr.querySelector(".filament-preheat").addEventListener("click", async () => {
                         const nozzle = p.nozzle_temp_first_layer ?? p.nozzle_temp_other_layer ?? p.nozzle_temp ?? "?";
                         const bed    = p.bed_temp_first_layer ?? p.bed_temp_other_layer ?? p.bed_temp ?? "?";
                         if (!confirm(`Preheat printer for ${p.name}?\nNozzle: ${nozzle}°C, Bed: ${bed}°C`)) return;
-                        fetch(`/api/filaments/${safeId}/apply`, { method: "POST" })
-                            .then(r => r.json())
-                            .then(res => {
-                                if (res.error) { alert("Error: " + res.error); return; }
-                                console.log("Preheat sent:", res.gcode);
-                            })
-                            .catch(err => console.error("Preheat failed:", err));
+                        try {
+                            await filamentJsonRequest(`/api/filaments/${safeId}/apply`, { method: "POST" }, "Failed to preheat filament profile");
+                            filamentSetServiceStatus(`Preheating ${p.name}: nozzle ${nozzle}\u00B0C, bed ${bed}\u00B0C.`, "warning");
+                        } catch (err) {
+                            filamentSetServiceStatus(`Preheat failed: ${err.message}`, "danger");
+                            flash_message(`Preheat failed: ${err.message}`, "danger");
+                        }
                     });
-                    tr.querySelector(".filament-delete").addEventListener("click", () => {
+                    tr.querySelector(".filament-delete").addEventListener("click", async () => {
                         if (!confirm(`Delete filament profile "${p.name}"?`)) return;
-                        fetch(`/api/filaments/${safeId}`, { method: "DELETE" })
-                            .then(() => loadFilaments())
-                            .catch(err => console.error("Delete failed:", err));
+                        try {
+                            await filamentJsonRequest(`/api/filaments/${safeId}`, { method: "DELETE" }, "Failed to delete filament profile");
+                            await loadFilaments();
+                            flash_message(`Deleted filament profile "${p.name}".`, "success");
+                        } catch (err) {
+                            flash_message(`Delete failed: ${err.message}`, "danger");
+                        }
                     });
                     tbody.appendChild(tr);
                 });
     }
 
-    function loadFilaments() {
-        fetch("/api/filaments")
-            .then(r => r.json())
-            .then(data => {
-                _filamentAllProfiles = data.filaments || [];
-                filamentPopulateSelect("filament-service-profile");
-                filamentPopulateSelect("filament-swap-unload-profile");
-                filamentPopulateSelect("filament-swap-load-profile");
-                filamentSyncQuickServiceTemp();
-                _renderFilaments();
-            })
-            .catch(err => console.error("Filaments load failed:", err));
+    async function loadFilaments() {
+        filamentSetTableMessage("Loading filament profiles...");
+        try {
+            const data = await filamentJsonRequest("/api/filaments", {}, "Failed to load filament profiles");
+            _filamentAllProfiles = data.filaments || [];
+            filamentPopulateSelect("filament-service-profile");
+            filamentPopulateSelect("filament-swap-unload-profile");
+            filamentPopulateSelect("filament-swap-load-profile");
+            filamentSyncQuickServiceTemp();
+            _renderFilaments();
+        } catch (err) {
+            _filamentAllProfiles = [];
+            filamentPopulateSelect("filament-service-profile");
+            filamentPopulateSelect("filament-swap-unload-profile");
+            filamentPopulateSelect("filament-swap-load-profile");
+            filamentSyncQuickServiceTemp();
+            filamentSetTableMessage(`Failed to load filament profiles. ${err.message}`, "danger");
+            flash_message(`Failed to load filament profiles: ${err.message}`, "danger");
+        }
     }
 
     // Sort button
@@ -5859,11 +5888,13 @@ $(function () {
     // Save button: create or update
     const filamentSaveBtn = document.getElementById("filament-save-btn");
     if (filamentSaveBtn) {
-        filamentSaveBtn.addEventListener("click", function () {
+        filamentSaveBtn.addEventListener("click", async function () {
             const profileId = document.getElementById("filament-id").value;
             const payload   = filamentReadForm();
+            payload.name = String(payload.name || "").trim();
             if (!payload.name) {
                 document.getElementById("filament-name").classList.add("is-invalid");
+                flash_message("Filament profile name is required.", "warning");
                 return;
             }
             document.getElementById("filament-name").classList.remove("is-invalid");
@@ -5871,19 +5902,21 @@ $(function () {
             const isNew  = !profileId;
             const url    = isNew ? "/api/filaments" : `/api/filaments/${profileId}`;
             const method = isNew ? "POST" : "PUT";
-
-            fetch(url, {
-                method: method,
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload),
-            })
-                .then(r => r.json())
-                .then(res => {
-                    if (res.error) { alert("Error: " + res.error); return; }
-                    if (bsFilamentModal) bsFilamentModal.hide();
-                    loadFilaments();
-                })
-                .catch(err => console.error("Save failed:", err));
+            try {
+                await filamentJsonRequest(url, {
+                    method: method,
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                }, "Failed to save filament profile");
+                if (bsFilamentModal) bsFilamentModal.hide();
+                await loadFilaments();
+                flash_message(
+                    isNew ? `Created filament profile "${payload.name}".` : `Saved filament profile "${payload.name}".`,
+                    "success"
+                );
+            } catch (err) {
+                flash_message(`Save failed: ${err.message}`, "danger");
+            }
         });
     }
 
