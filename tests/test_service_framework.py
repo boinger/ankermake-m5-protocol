@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from web.lib.service import RunState, ServiceError, ServiceManager, ServiceStoppedError
+from web.lib.service import RunState, Service, ServiceError, ServiceManager, ServiceStoppedError
 
 
 class FakeManagedService:
@@ -49,6 +49,20 @@ class FakeManagedService:
         handler({"status": "frame"})
         Timer(0.01, lambda: setattr(self, "state", RunState.Stopped)).start()
         yield self
+
+
+class DummyService(Service):
+    def worker_init(self):
+        pass
+
+    def worker_start(self):
+        pass
+
+    def worker_run(self, timeout):
+        pass
+
+    def worker_stop(self):
+        pass
 
 
 def test_service_manager_register_get_put_and_unregister():
@@ -127,3 +141,44 @@ def test_service_stream_bounded_queue_drops_oldest_items():
 
     assert q.get_nowait() == "two"
     assert q.get_nowait() == "three"
+
+
+def test_service_start_failure_logging_suppresses_duplicate_tracebacks(monkeypatch):
+    svc = object.__new__(DummyService)
+    svc._reset_start_failure_tracking()
+
+    records = []
+
+    monkeypatch.setattr(
+        "web.lib.service.log.exception",
+        lambda message: records.append(("exception", message)),
+    )
+    monkeypatch.setattr(
+        "web.lib.service.log.error",
+        lambda message: records.append(("error", message)),
+    )
+    monkeypatch.setattr(
+        "web.lib.service.log.warning",
+        lambda message, *args: records.append(("warning", message % args if args else message)),
+    )
+
+    times = iter([0.0, 1.0, 2.0, 3.0, 4.0])
+    monkeypatch.setattr("web.lib.service.time.monotonic", lambda: next(times))
+
+    exc = ConnectionRefusedError("No printer IP found")
+    for _ in range(5):
+        svc._log_start_failure(exc, retrying=True)
+
+    assert records[0] == (
+        "exception",
+        "DummyService: Failed to start worker: No printer IP found. Retrying in 1 second.",
+    )
+    assert records[1] == (
+        "warning",
+        "DummyService: Start failure is repeating (No printer IP found). Suppressing duplicate start-failure logs while retrying",
+    )
+    assert records[2] == (
+        "warning",
+        "DummyService: Failed to start worker: No printer IP found. Retrying in 1 second. (seen 5 times)",
+    )
+    assert len(records) == 3

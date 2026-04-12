@@ -103,7 +103,7 @@ def config_import(login_file: object, config: object):
     try:
         cache = libflagship.logincache.load(login_file.stream.read())
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as err:
-        raise ConfigImportError(f"Failed to parse login file: {err}")
+        raise ConfigImportError(f"Failed to parse login file or slicer cache: {err}")
 
     if not isinstance(cache, dict) or "data" not in cache:
         raise ConfigImportError("Invalid login file: missing 'data' field")
@@ -122,6 +122,11 @@ def config_login(email: str, password: str, country: str, captcha_id: str, captc
     """
     Loads the login information and then the configuration from the API.
     """
+    email = (email or "").strip()
+    country = (country or "").strip().upper()
+    captcha_id = (captcha_id or "").strip()
+    captcha_answer = (captcha_answer or "").strip()
+
     region = libflagship.logincache.guess_region(country)
 
     try:

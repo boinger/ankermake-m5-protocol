@@ -33,10 +33,11 @@ _AVAILABILITY_TIMEOUT = 60  # seconds between availability pings
 class HomeAssistantService:
     """Bridges ankerctl printer data to Home Assistant via MQTT Discovery."""
 
-    def __init__(self, config_manager, printer_sn=None, printer_name=None):
+    def __init__(self, config_manager, printer_sn=None, printer_name=None, printer_index=None):
         self._config_manager = config_manager
         self._printer_sn = printer_sn or "ankerctl"
         self._printer_name = printer_name or "AnkerMake M5"
+        self._printer_index = 0 if printer_index is None else int(printer_index)
         self._node_id = f"ankerctl_{self._printer_sn}"
 
         self._client = None
@@ -244,8 +245,9 @@ class HomeAssistantService:
     def _handle_light_command(self, payload):
         """Forward light on/off command to the printer via the web service."""
         try:
-            from web import app
-            vq = app.svc.svcs.get("videoqueue")
+            import web
+
+            vq = web.get_video_service(self._printer_index)
             if vq:
                 turn_on = payload.upper() == "ON"
                 vq.api_light_state(turn_on)

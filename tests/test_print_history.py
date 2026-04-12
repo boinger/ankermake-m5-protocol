@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timezone
 
 from web.service.history import PrintHistory
 
@@ -25,6 +26,39 @@ def test_record_start_reuses_same_task_id_and_interrupts_orphans(tmp_path):
     assert entries[1]["filename"] == "part-a.gcode"
     assert entries[1]["status"] == "interrupted"
     assert entries[1]["duration_sec"] >= 0
+
+
+def test_record_start_does_not_interrupt_active_jobs_from_other_printers(tmp_path):
+    db_path = tmp_path / "history.db"
+    history0 = PrintHistory(db_path=db_path, printer_index=0)
+    history1 = PrintHistory(db_path=db_path, printer_index=1)
+
+    first_id = history0.record_start("thing1-part.gcode", task_id="thing1-task")
+    second_id = history1.record_start("thing2-part.gcode", task_id="thing2-task")
+
+    entries = history0.get_history(limit=10)
+    by_id = {entry["id"]: entry for entry in entries}
+
+    assert by_id[first_id]["status"] == "started"
+    assert by_id[first_id]["printer_index"] == 0
+    assert by_id[second_id]["status"] == "started"
+    assert by_id[second_id]["printer_index"] == 1
+
+
+def test_printer_scoped_history_claims_legacy_active_task_row(tmp_path):
+    db_path = tmp_path / "history.db"
+    legacy_history = PrintHistory(db_path=db_path)
+    row_id = legacy_history.record_start("legacy.gcode", task_id="legacy-task")
+
+    printer_history = PrintHistory(db_path=db_path, printer_index=1)
+    resumed_id = printer_history.record_start("legacy.gcode", task_id="legacy-task")
+    printer_history.record_finish(task_id="legacy-task", progress=100)
+
+    entry = printer_history.get_entry(row_id)
+
+    assert resumed_id == row_id
+    assert entry["status"] == "finished"
+    assert entry["printer_index"] == 1
 
 
 def test_record_finish_and_fail_update_active_entries(tmp_path):
@@ -127,6 +161,73 @@ def test_archive_upload_and_reprint_flags(tmp_path):
     assert entry["thumbnail_available"] is True
     assert history.get_archive_path(row_id) is not None
     assert history.get_thumbnail_path(row_id) is not None
+
+
+def test_history_entry_can_fallback_to_archive_from_same_task_id(tmp_path):
+    history = PrintHistory(db_path=tmp_path / "history.db")
+
+    archive_info = history.archive_upload("cube.gcode", b"G28\nM104 S200\n")
+    original_id = history.record_start(
+        "cube.gcode",
+        task_id="task-archive-fallback",
+        archive_relpath=archive_info["archive_relpath"],
+        archive_size=archive_info["archive_size"],
+    )
+    history.record_finish(task_id="task-archive-fallback", progress=100)
+
+    started_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+    finished_at = started_at
+    with history._connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO print_history "
+            "(filename, status, started_at, finished_at, duration_sec, progress, task_id) "
+            "VALUES (?, 'finished', ?, ?, ?, ?, ?)",
+            ("cube.gcode", started_at, finished_at, 10, 100, "task-archive-fallback"),
+        )
+        duplicate_id = cursor.lastrowid
+        conn.commit()
+
+    duplicate_entry = history.get_entry(duplicate_id)
+
+    assert original_id != duplicate_id
+    assert duplicate_entry["archive_relpath"] == archive_info["archive_relpath"]
+    assert duplicate_entry["archive_available"] is True
+    assert duplicate_entry["can_reprint"] is True
+    assert history.get_archive_path(duplicate_id) is not None
+
+
+def test_recent_unclaimed_archive_survives_other_printer_prune(tmp_path):
+    db_path = tmp_path / "history.db"
+    history0 = PrintHistory(db_path=db_path, printer_index=0)
+    history1 = PrintHistory(db_path=db_path, printer_index=1)
+
+    archive0 = history0.archive_upload("thing1.gcode", b"G28\nM104 S200\n")
+    archive1 = history1.archive_upload("thing2.gcode", b"G28\nM104 S210\n")
+
+    archive0_path = history0._archive_abspath(archive0["archive_relpath"])
+    assert archive0_path is not None
+    assert os.path.exists(archive0_path)
+
+    history1.record_start(
+        "thing2.gcode",
+        task_id="thing2-task",
+        archive_relpath=archive1["archive_relpath"],
+        archive_size=archive1["archive_size"],
+    )
+
+    assert os.path.exists(archive0_path)
+
+    row0_id = history0.record_start(
+        "thing1.gcode",
+        task_id="thing1-task",
+        archive_relpath=archive0["archive_relpath"],
+        archive_size=archive0["archive_size"],
+    )
+    entry0 = history0.get_entry(row0_id)
+
+    assert entry0["archive_available"] is True
+    assert entry0["can_reprint"] is True
+    assert history0.get_archive_path(row0_id) is not None
 
 
 def test_history_clear_removes_archived_gcode_files(tmp_path):

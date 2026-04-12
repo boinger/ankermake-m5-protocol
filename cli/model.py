@@ -81,6 +81,12 @@ def default_filament_service_config():
     }
 
 
+def default_camera_config():
+    return {
+        "per_printer": {},
+    }
+
+
 def merge_dict_defaults(data, defaults):
     if not isinstance(data, dict):
         return defaults
@@ -207,6 +213,7 @@ class Config(Serialize):
     timelapse: dict = field(default_factory=default_timelapse_config)
     home_assistant: dict = field(default_factory=default_home_assistant_config)
     filament_service: dict = field(default_factory=default_filament_service_config)
+    camera: dict = field(default_factory=default_camera_config)
     active_printer_index: int = field(default=0)
 
     @classmethod
@@ -239,6 +246,10 @@ class Config(Serialize):
             "filament_service": merge_dict_defaults(
                 data.get("filament_service"),
                 default_filament_service_config(),
+            ),
+            "camera": merge_dict_defaults(
+                data.get("camera"),
+                default_camera_config(),
             ),
         }
         return super().from_dict(data)

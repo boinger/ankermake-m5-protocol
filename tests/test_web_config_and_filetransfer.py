@@ -1,6 +1,7 @@
 import io
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ from libflagship.httpapi import APIError
 from web import app
 from web.config import ConfigImportError, config_import, config_login, config_show
 from web.service.filetransfer import FileTransferService
+import web.platform as web_platform
 
 
 def _config():
@@ -65,6 +67,7 @@ def test_config_import_handles_invalid_login_and_api_errors(monkeypatch):
 
 def test_config_login_handles_captcha_and_success(monkeypatch):
     imported = []
+    fetch_calls = []
 
     def fake_import(config, login, insecure):
         imported.append((config, login, insecure))
@@ -82,10 +85,59 @@ def test_config_login_handles_captcha_and_success(monkeypatch):
 
     assert excinfo.value.captcha == {"id": "cap-1", "img": "img-data"}
 
-    monkeypatch.setattr("web.config.cli.config.fetch_config_by_login", lambda *args, **kwargs: {"auth_token": "abc", "ab_code": "DE"})
-    config_login("user@example.com", "pw", "DE", None, None, object())
+    def fake_fetch(email, password, region, insecure, captcha_id=None, captcha_answer=None):
+        fetch_calls.append((email, password, region, captcha_id, captcha_answer))
+        return {"auth_token": "abc", "ab_code": "DE"}
+
+    monkeypatch.setattr("web.config.cli.config.fetch_config_by_login", fake_fetch)
+    config_login(" user@example.com ", "pw", " de ", None, " 1234 ", object())
 
     assert imported and imported[0][1]["auth_token"] == "abc"
+    assert fetch_calls == [("user@example.com", "pw", "eu", "", "1234")]
+
+
+def test_web_platform_autodetect_prefers_vms_userinfo_cache(tmp_path, monkeypatch):
+    leveldb_dir = tmp_path / "leveldb"
+    leveldb_dir.mkdir()
+    wrong = leveldb_dir / "000001.ldb"
+    wrong.write_bytes(b"no session here")
+    right = leveldb_dir / "000005.ldb"
+    right.write_bytes(b"prefix vms-userinfo data")
+
+    monkeypatch.setattr("web.platform.current_platform", lambda: "windows")
+    monkeypatch.setattr(
+        "web.platform.os.path.expandvars",
+        lambda value: str(leveldb_dir) if "Local Storage\\leveldb" in value else str(tmp_path / "missing"),
+    )
+    monkeypatch.setattr("web.platform.os.path.isdir", lambda value: Path(value) == leveldb_dir)
+    monkeypatch.setattr("web.platform.os.path.isfile", lambda value: Path(value) in {wrong, right})
+    monkeypatch.setattr("web.platform.os.listdir", lambda value: ["000001.ldb", "000005.ldb"] if Path(value) == leveldb_dir else [])
+
+    detected = web_platform.autodetect_login_path()
+
+    assert detected == str(right)
+
+
+def test_web_platform_autodetect_prefers_newer_userinfo_cache(tmp_path, monkeypatch):
+    leveldb_dir = tmp_path / "leveldb"
+    leveldb_dir.mkdir()
+    older = leveldb_dir / "000005.ldb"
+    older.write_bytes(b"prefix vms-userinfo data")
+    newer = leveldb_dir / "000123.ldb"
+    newer.write_bytes(b"prefix userinfo data")
+
+    monkeypatch.setattr("web.platform.current_platform", lambda: "windows")
+    monkeypatch.setattr(
+        "web.platform.os.path.expandvars",
+        lambda value: str(leveldb_dir) if "Local Storage\\leveldb" in value else str(tmp_path / "missing"),
+    )
+    monkeypatch.setattr("web.platform.os.path.isdir", lambda value: Path(value) == leveldb_dir)
+    monkeypatch.setattr("web.platform.os.path.isfile", lambda value: Path(value) in {older, newer})
+    monkeypatch.setattr("web.platform.os.listdir", lambda value: ["000005.ldb", "000123.ldb"] if Path(value) == leveldb_dir else [])
+
+    detected = web_platform.autodetect_login_path()
+
+    assert detected == str(newer)
 
 
 class FakeConfigManager:

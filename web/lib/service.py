@@ -1,12 +1,16 @@
 import atexit
 import logging as log
 import contextlib
+import time
 
 from enum import Enum
 from threading import Thread, Event
 from datetime import datetime, timedelta
 import queue
 from queue import Queue
+
+_START_FAILURE_REPEAT_NOTICE_SECONDS = 10.0
+_START_FAILURE_REPEAT_NOTICE_COUNT = 5
 
 
 class Holdoff:
@@ -60,6 +64,10 @@ class Service(Thread):
         self._event = Event()
         self.handlers = []
         self._holdoff = Holdoff()
+        self._start_failure_signature = None
+        self._start_failure_count = 0
+        self._start_failure_last_notice_at = 0.0
+        self._start_failure_suppressed = False
         self.daemon = True
         super().start()
 
@@ -103,24 +111,75 @@ class Service(Thread):
         if self._event.wait(timeout=timeout):
             self._event.clear()
 
+    def _reset_start_failure_tracking(self):
+        self._start_failure_signature = None
+        self._start_failure_count = 0
+        self._start_failure_last_notice_at = 0.0
+        self._start_failure_suppressed = False
+
+    def _log_start_failure(self, exc, *, retrying):
+        if isinstance(exc, TimeoutError):
+            return
+        if (not retrying) and isinstance(exc, ServiceStoppedError):
+            return
+
+        signature = (type(exc), str(exc), bool(retrying))
+        now = time.monotonic()
+        action = "Retrying in 1 second." if retrying else "Shutting down service."
+
+        if signature != self._start_failure_signature:
+            self._start_failure_signature = signature
+            self._start_failure_count = 1
+            self._start_failure_last_notice_at = now
+            self._start_failure_suppressed = False
+            if retrying and not isinstance(exc, ServiceStoppedError):
+                log.exception(f"{self.name}: Failed to start worker: {exc}. {action}")
+            else:
+                log.error(f"{self.name}: Failed to start worker: {exc}. {action}")
+            return
+
+        self._start_failure_count += 1
+        count = self._start_failure_count
+
+        if not self._start_failure_suppressed:
+            self._start_failure_suppressed = True
+            self._start_failure_last_notice_at = now
+            log.warning(
+                "%s: Start failure is repeating (%s). Suppressing duplicate start-failure logs while %s",
+                self.name,
+                exc,
+                "retrying" if retrying else "stopping",
+            )
+            return
+
+        if (
+            (now - self._start_failure_last_notice_at) < _START_FAILURE_REPEAT_NOTICE_SECONDS
+            and (count % _START_FAILURE_REPEAT_NOTICE_COUNT) != 0
+        ):
+            return
+
+        self._start_failure_last_notice_at = now
+        log.warning(
+            "%s: Failed to start worker: %s. %s (seen %s times)",
+            self.name,
+            exc,
+            action,
+            count,
+        )
+
     def _attempt_start(self):
         try:
             log.debug(f"{self.name} worker starting..")
             self.worker_start()
         except Exception as E:
             if self.wanted:
-                if isinstance(E, TimeoutError):
-                    pass
-                elif isinstance(E, ServiceStoppedError):
-                    log.error(f"{self.name}: Failed to start worker: {E}. Retrying in 1 second.")
-                else:
-                    log.exception(f"{self.name}: Failed to start worker: {E}. Retrying in 1 second.")
+                self._log_start_failure(E, retrying=True)
                 self._holdoff.reset(delay=1)
             else:
-                if not isinstance(E, (TimeoutError, ServiceStoppedError)):
-                    log.error(f"{self.name}: Failed to start worker: {E}. Shutting down service.")
+                self._log_start_failure(E, retrying=False)
                 self.state = RunState.Stopped
         else:
+            self._reset_start_failure_tracking()
             log.info(f"{self.name}: Worker started")
             self.state = RunState.Running
 
@@ -259,10 +318,10 @@ class ServiceManager:
         self.dump()
 
         stop_order = [
-            "videoqueue",
+            *(name for name in self.svcs if name == "videoqueue" or name.startswith("videoqueue:")),
             "filetransfer",
             *(name for name in self.svcs if name.startswith("mqttqueue")),
-            "pppp",
+            *(name for name in self.svcs if name == "pppp" or name.startswith("pppp:")),
         ]
         seen = set()
         ordered_names = []

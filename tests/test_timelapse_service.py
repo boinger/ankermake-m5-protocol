@@ -12,6 +12,7 @@ class FakeConfigManager:
     def __init__(self, root, enabled=True):
         self.config_root = root
         self._cfg = SimpleNamespace(
+            printers=[SimpleNamespace(sn="SN1", name="Printer", model="V8111")],
             timelapse={
                 "enabled": enabled,
                 "interval": 5,
@@ -42,12 +43,146 @@ def test_timelapse_meta_and_video_file_helpers(tmp_path):
     time.sleep(0.01)
     video_b.write_bytes(b"bb")
 
+    snapshot_dir = tmp_path / "snapshots" / "a"
+    snapshot_dir.mkdir(parents=True)
+    (snapshot_dir / "frame_00000.jpg").write_bytes(b"frame")
+    svc._write_meta(
+        snapshot_dir,
+        "cube.gcode",
+        1,
+        video_filename="a.mp4",
+        archived_at="2026-04-10T12:00:00",
+        status="archived",
+    )
+
     videos = svc.list_videos()
     assert [video["filename"] for video in videos] == ["b.mp4", "a.mp4"]
     assert svc.get_video_path("a.mp4") == str(video_a)
     assert svc.get_video_path("../a.mp4") is None
     assert svc.delete_video("a.mp4") is True
     assert not video_a.exists()
+    assert not snapshot_dir.exists()
+
+
+def test_timelapse_snapshot_helpers_list_download_and_delete(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+
+    active_dir = tmp_path / _IN_PROGRESS_SUBDIR / "cube_active"
+    active_dir.mkdir(parents=True)
+    (active_dir / "frame_00000.jpg").write_bytes(b"active")
+    svc._write_meta(active_dir, "cube.gcode", 1)
+    svc._current_dir = str(active_dir)
+
+    archived_dir = tmp_path / "snapshots" / "cube_video_20260410"
+    archived_dir.mkdir(parents=True)
+    (archived_dir / "frame_00000.jpg").write_bytes(b"frame-a")
+    (archived_dir / "frame_00001.jpg").write_bytes(b"frame-b")
+    svc._write_meta(
+        archived_dir,
+        "cube.gcode",
+        2,
+        video_filename="cube_video_20260410.mp4",
+        archived_at="2026-04-10T12:00:00",
+    )
+
+    collections = svc.list_snapshots()
+    assert [collection["id"] for collection in collections] == ["cube_active", "cube_video_20260410"]
+    assert collections[0]["allow_delete"] is False
+    assert collections[1]["allow_delete"] is True
+    assert collections[1]["video_filename"] == "cube_video_20260410.mp4"
+    assert svc.get_snapshot_path("cube_active", "frame_00000.jpg") == str(active_dir / "frame_00000.jpg")
+    assert svc.get_snapshot_path("cube_video_20260410", "frame_00001.jpg") == str(archived_dir / "frame_00001.jpg")
+
+    try:
+        svc.delete_snapshot("cube_active", "frame_00000.jpg")
+        assert False, "Expected delete_snapshot to reject active captures"
+    except RuntimeError:
+        pass
+
+    assert svc.delete_snapshot("cube_video_20260410", "frame_00000.jpg") is True
+    assert not (archived_dir / "frame_00000.jpg").exists()
+    assert svc._read_meta(archived_dir)["frame_count"] == 1
+    assert svc.delete_snapshot("cube_video_20260410", "frame_00001.jpg") is True
+    assert not archived_dir.exists()
+
+
+def test_timelapse_can_discard_resume_pending_snapshot_collection(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+
+    resume_dir = tmp_path / _IN_PROGRESS_SUBDIR / "cube_resume"
+    resume_dir.mkdir(parents=True)
+    (resume_dir / "frame_00000.jpg").write_bytes(b"resume")
+    svc._write_meta(resume_dir, "cube.gcode", 1)
+    svc._resume_dir = str(resume_dir)
+    svc._resume_filename = "cube.gcode"
+    svc._resume_frame_count = 1
+
+    collections = svc.list_snapshots()
+    assert collections[0]["id"] == "cube_resume"
+    assert collections[0]["state"] == "resume_pending"
+    assert collections[0]["allow_delete"] is False
+
+    assert svc.delete_snapshot_collection("cube_resume") is True
+    assert not resume_dir.exists()
+    assert svc._resume_dir is None
+    assert svc._resume_filename is None
+    assert svc._resume_frame_count == 0
+
+
+def test_timelapse_manual_snapshot_save_list_and_delete(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+
+    source = tmp_path / "manual-source.jpg"
+    source.write_bytes(b"manual-jpg")
+
+    saved = svc.save_manual_snapshot(
+        str(source),
+        camera_settings={
+            "effective_source": "external",
+            "external": {"name": "Workbench Cam"},
+        },
+    )
+
+    collections = svc.list_snapshots()
+    assert len(collections) == 1
+    assert collections[0]["id"] == saved["collection_id"]
+    assert collections[0]["state"] == "manual"
+    assert collections[0]["allow_delete"] is True
+    assert collections[0]["source_label"] == "External camera (Workbench Cam)"
+    assert collections[0]["frame_count"] == 1
+    assert collections[0]["frames"][0]["filename"] == saved["filename"]
+    assert svc.get_snapshot_path(saved["collection_id"], saved["filename"]).endswith(saved["filename"])
+
+    assert svc.delete_snapshot(saved["collection_id"], saved["filename"]) is True
+    assert svc.list_snapshots() == []
+
+
+def test_timelapse_manual_pause_coexists_with_automatic_pause(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+
+    svc.set_manual_pause(True)
+    state = svc.get_runtime_state()
+    assert state["paused"] is True
+    assert state["pause_reason"] == "manual"
+
+    svc.set_capture_paused(True, reason="filament_runout")
+    state = svc.get_runtime_state()
+    assert state["paused"] is True
+    assert state["pause_reason"] == "filament_runout"
+
+    svc.set_manual_pause(False)
+    state = svc.get_runtime_state()
+    assert state["paused"] is True
+    assert state["pause_reason"] == "filament_runout"
+
+    svc.set_capture_paused(False)
+    state = svc.get_runtime_state()
+    assert state["paused"] is False
+    assert state["pause_reason"] is None
 
 
 def test_timelapse_prunes_old_videos(tmp_path):
@@ -192,6 +327,90 @@ def test_timelapse_start_capture_resumes_pending_session(monkeypatch, tmp_path):
     assert calls == ["stop-thread", "cancel-finalize", "enable-video", "thread-start"]
 
 
+def test_timelapse_start_capture_same_active_file_keeps_existing_session(monkeypatch, tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+    active_dir = str(tmp_path / _IN_PROGRESS_SUBDIR / "active_same")
+    os.makedirs(active_dir, exist_ok=True)
+    svc._current_dir = active_dir
+    svc._current_filename = "cube.gcode"
+    svc._frame_count = 7
+
+    calls = []
+
+    class AliveThread:
+        def is_alive(self):
+            return True
+
+    class UnexpectedThread:
+        def __init__(self, *args, **kwargs):
+            calls.append("new-thread")
+
+        def start(self):
+            calls.append("thread-start")
+
+    svc._capture_thread = AliveThread()
+
+    monkeypatch.setattr("web.service.timelapse._resolve_ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        TimelapseService,
+        "_resolve_capture_camera",
+        lambda self: {"effective_source": web.camera.CAMERA_SOURCE_PRINTER},
+    )
+    monkeypatch.setattr(TimelapseService, "_enable_video_for_timelapse", lambda self: calls.append("enable-video"))
+    monkeypatch.setattr(TimelapseService, "_stop_capture_thread", lambda self: calls.append("stop-thread"))
+    monkeypatch.setattr("web.service.timelapse.threading.Thread", UnexpectedThread)
+
+    svc.start_capture("cube.gcode")
+
+    assert svc._current_dir == active_dir
+    assert svc._current_filename == "cube.gcode"
+    assert svc._frame_count == 7
+    assert calls == ["enable-video"]
+
+
+def test_timelapse_start_capture_same_active_file_restarts_dead_thread(monkeypatch, tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+    active_dir = str(tmp_path / _IN_PROGRESS_SUBDIR / "active_restart")
+    os.makedirs(active_dir, exist_ok=True)
+    svc._current_dir = active_dir
+    svc._current_filename = "cube.gcode"
+    svc._frame_count = 5
+
+    calls = []
+
+    class DeadThread:
+        def is_alive(self):
+            return False
+
+    class FakeThread:
+        def __init__(self, target=None, daemon=None, name=None):
+            self.target = target
+
+        def start(self):
+            calls.append("thread-start")
+
+    svc._capture_thread = DeadThread()
+
+    monkeypatch.setattr("web.service.timelapse._resolve_ffmpeg_path", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        TimelapseService,
+        "_resolve_capture_camera",
+        lambda self: {"effective_source": web.camera.CAMERA_SOURCE_PRINTER},
+    )
+    monkeypatch.setattr(TimelapseService, "_enable_video_for_timelapse", lambda self: calls.append("enable-video"))
+    monkeypatch.setattr(TimelapseService, "_stop_capture_thread", lambda self: calls.append("stop-thread"))
+    monkeypatch.setattr("web.service.timelapse.threading.Thread", FakeThread)
+
+    svc.start_capture("cube.gcode")
+
+    assert svc._current_dir == active_dir
+    assert svc._current_filename == "cube.gcode"
+    assert svc._frame_count == 5
+    assert calls == ["enable-video", "thread-start"]
+
+
 def test_timelapse_discard_pending_resume(tmp_path):
     cfg = FakeConfigManager(tmp_path)
     svc = TimelapseService(cfg, captures_dir=tmp_path)
@@ -227,31 +446,33 @@ def test_timelapse_take_snapshot_retries_and_restores_light(monkeypatch, tmp_pat
     __import__("web").app.svc = SimpleNamespace(svcs={"videoqueue": videoqueue})
     __import__("web").app.config["api_key"] = "secret-key"
 
-    runs = []
+    captures = []
 
-    def fake_run(cmd, stdout=None, stderr=None, timeout=None):
-        runs.append(cmd)
-        frame_path = cmd[-1]
-        if len(runs) == 2:
-            with open(frame_path, "wb") as fh:
-                fh.write(b"jpg")
-            return SimpleNamespace(returncode=0)
-        return SimpleNamespace(returncode=1)
+    def fake_capture(camera_settings, ffmpeg_path, frame_path, **kwargs):
+        captures.append({
+            "camera_settings": camera_settings,
+            "ffmpeg_path": ffmpeg_path,
+            "frame_path": frame_path,
+            **kwargs,
+        })
+        with open(frame_path, "wb") as fh:
+            fh.write(b"jpg")
 
     try:
         monkeypatch.setattr("web.service.timelapse._resolve_ffmpeg_path", lambda: "resolved-ffmpeg")
         monkeypatch.setattr(TimelapseService, "_await_video_frame", lambda self: True)
-        monkeypatch.setattr("web.service.timelapse.subprocess.run", fake_run)
+        monkeypatch.setattr("web.camera.capture_camera_snapshot_to_file", fake_capture)
         monkeypatch.setattr("web.service.timelapse.time.sleep", lambda seconds: None)
         svc._take_snapshot()
     finally:
         __import__("web").app.svc = old_svc
         __import__("web").app.config["api_key"] = old_api_key
 
-    assert len(runs) == 2
-    assert runs[0][0] == "resolved-ffmpeg"
-    assert runs[1][0] == "resolved-ffmpeg"
-    assert any("apikey=secret-key" in part for part in runs[0] if isinstance(part, str))
+    assert len(captures) == 1
+    assert captures[0]["ffmpeg_path"] == "resolved-ffmpeg"
+    assert captures[0]["api_key"] == "secret-key"
+    assert captures[0]["for_timelapse"] is True
+    assert captures[0]["camera_settings"]["effective_source"] == "printer"
     assert light_calls == [True, False]
     assert svc._frame_count == 1
     assert os.path.exists(os.path.join(svc._current_dir, "frame_00000.jpg"))
@@ -394,13 +615,13 @@ def test_snapshot_timeout_requests_video_recovery(monkeypatch, tmp_path):
     web.app.svc = SimpleNamespace(svcs={"videoqueue": videoqueue})
     web.app.config["api_key"] = None
 
-    def fake_run(*args, **kwargs):
+    def fake_capture(*args, **kwargs):
         raise __import__("subprocess").TimeoutExpired(cmd="ffmpeg", timeout=10)
 
     try:
         monkeypatch.setattr("web.service.timelapse._resolve_ffmpeg_path", lambda: "resolved-ffmpeg")
         monkeypatch.setattr(TimelapseService, "_await_video_frame", lambda self: True)
-        monkeypatch.setattr("web.service.timelapse.subprocess.run", fake_run)
+        monkeypatch.setattr("web.camera.capture_camera_snapshot_to_file", fake_capture)
         monkeypatch.setattr("web.service.timelapse.time.sleep", lambda seconds: None)
         svc._take_snapshot()
     finally:
@@ -410,6 +631,93 @@ def test_snapshot_timeout_requests_video_recovery(monkeypatch, tmp_path):
     assert len(requests) == 1
     assert requests[0]["reason"] == "timelapse snapshot timed out waiting for a camera frame"
     assert requests[0]["force_pppp_recycle"] is True
+
+
+def test_timelapse_external_camera_snapshot_skips_printer_video_wait(monkeypatch, tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    cfg._cfg.camera = {
+        "per_printer": {
+            "SN1": {
+                "source": "external",
+                "external": {
+                    "name": "Workbench Cam",
+                    "snapshot_url": "http://cam.local/snapshot.jpg",
+                    "stream_url": "",
+                    "refresh_sec": 2,
+                },
+            }
+        }
+    }
+    svc = TimelapseService(cfg, captures_dir=tmp_path)
+    svc._current_dir = str(tmp_path / "capture")
+    svc._current_filename = "cube.gcode"
+    svc._frame_count = 0
+    os.makedirs(svc._current_dir, exist_ok=True)
+
+    captures = []
+    old_svc = web.app.svc
+    old_api_key = web.app.config.get("api_key")
+    web.app.svc = SimpleNamespace(svcs={})
+    web.app.config["api_key"] = "secret-key"
+
+    def fail_if_called(self):
+        raise AssertionError("_await_video_frame should not be called for external cameras")
+
+    def fake_capture(camera_settings, ffmpeg_path, frame_path, **kwargs):
+        captures.append({
+            "camera_settings": camera_settings,
+            "ffmpeg_path": ffmpeg_path,
+            **kwargs,
+        })
+        with open(frame_path, "wb") as fh:
+            fh.write(b"jpg")
+
+    try:
+        monkeypatch.setattr("web.service.timelapse._resolve_ffmpeg_path", lambda: "resolved-ffmpeg")
+        monkeypatch.setattr(TimelapseService, "_await_video_frame", fail_if_called)
+        monkeypatch.setattr("web.camera.capture_camera_snapshot_to_file", fake_capture)
+        svc._take_snapshot()
+    finally:
+        web.app.svc = old_svc
+        web.app.config["api_key"] = old_api_key
+
+    assert len(captures) == 1
+
+
+def test_timelapse_service_uses_per_printer_settings_when_present(tmp_path):
+    cfg = FakeConfigManager(tmp_path, enabled=False)
+    cfg._cfg.printers.append(SimpleNamespace(sn="SN2", name="Printer 2", model="V8111"))
+    cfg._cfg.timelapse = {
+        "enabled": False,
+        "interval": 5,
+        "max_videos": 2,
+        "save_persistent": True,
+        "light": None,
+        "per_printer": {
+            "SN2": {
+                "enabled": True,
+                "interval": 11,
+                "max_videos": 4,
+                "save_persistent": False,
+                "light": "snapshot",
+            }
+        },
+    }
+
+    svc0 = TimelapseService(cfg, captures_dir=tmp_path / "captures0", printer_index=0)
+    svc1 = TimelapseService(cfg, captures_dir=tmp_path / "captures1", printer_index=1)
+
+    assert svc0.enabled is False
+    assert svc0._interval == 5
+    assert svc0._max_videos == 2
+    assert svc0._save_persistent is True
+    assert svc0._light_mode is None
+
+    assert svc1.enabled is True
+    assert svc1._interval == 11
+    assert svc1._max_videos == 4
+    assert svc1._save_persistent is False
+    assert svc1._light_mode == "snapshot"
 
 
 def test_timelapse_runtime_state_reports_recovery(tmp_path):

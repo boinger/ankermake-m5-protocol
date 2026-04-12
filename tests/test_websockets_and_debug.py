@@ -88,7 +88,7 @@ def _base_config():
             user_id="user-1",
             email="user@example.com",
         ),
-        printers=[_printer()],
+        printers=[_printer("SN1", "Printer 1"), _printer("SN2", "Printer 2")],
     )
 
 
@@ -201,6 +201,66 @@ def test_video_websocket_toggles_streaming_and_ctrl_dispatches_commands():
     assert quality_calls == [2]
 
 
+def test_nonzero_printer_services_do_not_fallback_to_legacy_instances():
+    viewer_events = []
+    printer_two_video = SimpleNamespace(
+        saved_video_profile_id="hd",
+        viewer_connected=lambda: viewer_events.append("connect"),
+        viewer_disconnected=lambda: viewer_events.append("disconnect"),
+    )
+    mqtt_sock = None
+    video_sock = None
+    services = FakeServices(
+        streams={
+            "mqttqueue": [{"hello": "legacy-mqtt"}],
+            web_module.mqtt_service_name(1): [{"hello": "mqtt-1"}],
+            "videoqueue": [SimpleNamespace(data=b"legacy-frame")],
+            web_module.video_service_name(1): [SimpleNamespace(data=b"printer-two-frame")],
+        },
+        borrowed={
+            "videoqueue": SimpleNamespace(saved_video_profile_id="legacy"),
+            web_module.video_service_name(1): printer_two_video,
+        },
+        svcs={
+            "mqttqueue": SimpleNamespace(name="legacy-mqtt"),
+            web_module.mqtt_service_name(1): SimpleNamespace(name="mqtt-1"),
+            "pppp": SimpleNamespace(name="legacy-pppp", connected=True, wanted=True),
+            web_module.pppp_service_name(1): SimpleNamespace(name="pppp-1", connected=True, wanted=True),
+            "videoqueue": SimpleNamespace(name="legacy-video"),
+            web_module.video_service_name(1): printer_two_video,
+        },
+        refs={
+            "videoqueue": 0,
+            web_module.video_service_name(1): 0,
+        },
+    )
+    old_values, old_svc = _install_app_state(web_module, svc=services)
+
+    try:
+        with web_module.app.test_request_context("/ws/mqtt?printer_index=1"):
+            mqtt_sock = FakeSock(close_after_sends=1)
+            _ws_handler(web_module, "mqtt")(mqtt_sock)
+        with web_module.app.test_request_context("/ws/video?printer_index=1"):
+            video_sock = FakeSock(close_after_sends=1)
+            _ws_handler(web_module, "video")(video_sock)
+        mqtt_name = web_module.get_mqtt_service(1).name
+        pppp_name = web_module.get_pppp_service(1).name
+        resolved_video = web_module.get_video_service(1)
+        resolved_video_name = web_module.resolve_video_service_name(1)
+        resolved_pppp_name = web_module.resolve_pppp_service_name(1)
+    finally:
+        _restore_app_state(web_module, old_values, old_svc)
+
+    assert mqtt_sock.sent == [json.dumps({"hello": "mqtt-1"})]
+    assert video_sock.sent == [b"printer-two-frame"]
+    assert viewer_events == ["connect", "disconnect"]
+    assert mqtt_name == "mqtt-1"
+    assert pppp_name == "pppp-1"
+    assert resolved_video is printer_two_video
+    assert resolved_video_name == web_module.video_service_name(1)
+    assert resolved_pppp_name == web_module.pppp_service_name(1)
+
+
 def test_pppp_probe_helper_and_state_websocket_emit_status(monkeypatch):
     with web_module.app.pppp_probe_lock:
         web_module.app.pppp_probe = {
@@ -245,6 +305,43 @@ def test_pppp_probe_helper_and_state_websocket_emit_status(monkeypatch):
             }
 
     assert json.loads(sock.sent[0]) == {"status": "connected"}
+
+
+def test_pppp_probe_helper_skips_when_services_are_already_recovering(monkeypatch):
+    old_values, old_svc = _install_app_state(web_module)
+    calls = []
+    web_module.app.svc = FakeServices(
+        svcs={
+            web_module.pppp_service_name(0): SimpleNamespace(wanted=True),
+            web_module.video_service_name(0): SimpleNamespace(_awaiting_pppp_recycle=True),
+        }
+    )
+
+    with web_module.app.pppp_probe_lock:
+        web_module.app.pppp_probe = {
+            "result": None,
+            "last_time": 0.0,
+            "fail_count": 0,
+            "thread": None,
+            "client_count": 1,
+        }
+
+    monkeypatch.setattr("web.service.pppp.probe_pppp", lambda config, idx: calls.append((config, idx)) or True)
+
+    try:
+        web_module._maybe_start_pppp_probe("test", printer_index=0)
+    finally:
+        _restore_app_state(web_module, old_values, old_svc)
+        with web_module.app.pppp_probe_lock:
+            web_module.app.pppp_probe = {
+                "result": None,
+                "last_time": 0.0,
+                "fail_count": 0,
+                "thread": None,
+                "client_count": 0,
+            }
+
+    assert calls == []
 
 
 def test_dev_debug_routes_register_and_dispatch(monkeypatch):

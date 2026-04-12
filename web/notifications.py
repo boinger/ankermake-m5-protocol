@@ -8,6 +8,9 @@ import time
 
 log = logging.getLogger(__name__)
 
+import web
+import web.camera
+
 from libflagship.notifications import AppriseClient
 
 from web import app
@@ -80,10 +83,11 @@ def format_bytes(num_bytes):
 
 
 class AppriseNotifier:
-    def __init__(self, config_manager, reload_interval=5.0, settings=None):
+    def __init__(self, config_manager, reload_interval=5.0, settings=None, printer_index=None):
         self._config_manager = config_manager
         self._reload_interval = reload_interval
         self._explicit_settings = settings
+        self._printer_index = 0 if printer_index is None else int(printer_index)
         self._last_load = 0.0
         self._client = None
         self._settings = None
@@ -295,13 +299,16 @@ class AppriseNotifier:
         if not enabled_by_notifier:
             return
 
-        vq = app.svc.svcs.get("videoqueue")
+        vq = web.get_video_service(self._printer_index)
         if not vq:
             with self._snapshot_timer_lock:
                 self._snapshot_enabled_by_notifier = False
             return
 
-        refs = getattr(app.svc, "refs", {}).get("videoqueue", 0)
+        refs = getattr(app.svc, "refs", {}).get(
+            web.resolve_video_service_name(self._printer_index),
+            0,
+        )
         if refs:
             with self._snapshot_timer_lock:
                 self._snapshot_hold_until = time.monotonic() + _SNAPSHOT_KEEPALIVE
@@ -317,41 +324,28 @@ class AppriseNotifier:
             self._snapshot_enabled_by_notifier = False
 
     def _capture_live_snapshot(self):
-        if not app.config.get("video_supported"):
+        camera_settings = web._resolve_camera_settings(printer_index=self._printer_index)
+        if not camera_settings.get("effective_source"):
             return None
-        if not shutil.which("ffmpeg"):
+
+        ffmpeg_path = web._ffmpeg_path()
+        if not ffmpeg_path:
             log.warning("Apprise snapshot skipped: ffmpeg not available")
             return None
 
-        vq = app.svc.svcs.get("videoqueue")
-        if not vq:
+        using_printer_camera = camera_settings.get("effective_source") == web.camera.CAMERA_SOURCE_PRINTER
+        vq = web.get_video_service(self._printer_index) if using_printer_camera else None
+        if using_printer_camera and not vq:
             return None
-
-        host = os.getenv("FLASK_HOST") or "127.0.0.1"
-        if host in {"0.0.0.0", "::"}:
-            host = "127.0.0.1"
-        port = os.getenv("FLASK_PORT") or "4470"
-        url = f"http://{host}:{port}/video"
-        # Pass API key as query parameter so the internal /video call is authenticated
-        # when a key is configured.  The URL is loopback-only and never sent to clients.
-        notif_api_key = app.config.get("api_key")
-        if notif_api_key:
-            from urllib.parse import quote as _quote
-            url += f"?apikey={_quote(notif_api_key, safe='')}"
 
         quality = self.snapshot_quality()
         width, height = _SNAPSHOT_SIZES.get(quality, _SNAPSHOT_SIZES[_DEFAULT_SNAPSHOT_QUALITY])
-        scale_filter = (
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
-        )
 
-        was_enabled = vq.video_enabled
         temp_path = None
 
         with self._snapshot_lock:
-            use_light = self.snapshot_light()
-            original_light_state = getattr(vq, "saved_light_state", None)
+            use_light = using_printer_camera and self.snapshot_light()
+            original_light_state = getattr(vq, "saved_light_state", None) if vq else None
             light_changed = False
 
             try:
@@ -362,80 +356,46 @@ class AppriseNotifier:
                     # Give it a moment to actually turn on and for the camera to adjust exposure
                     time.sleep(1.5)
 
-                if not was_enabled:
-                    vq.set_video_enabled(True)
-                self._schedule_snapshot_disable(was_enabled)
-                if not vq.wanted:
-                    vq.start()
-                if vq.state != RunState.Running:
-                    vq.await_ready()
-                self._await_video_frame(vq)
+                if using_printer_camera:
+                    was_enabled = vq.video_enabled
+                    if not was_enabled:
+                        vq.set_video_enabled(True)
+                    self._schedule_snapshot_disable(was_enabled)
+                    if not vq.wanted:
+                        vq.start()
+                    if vq.state != RunState.Running:
+                        vq.await_ready()
+                    self._await_video_frame(vq)
 
                 temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
                 temp_path = temp_file.name
                 temp_file.close()
 
-                def run_ffmpeg(extra_args=None):
-                    cmd = [
-                        "ffmpeg",
-                        "-loglevel",
-                        "error",
-                        "-nostdin",
-                        "-y",
-                    ]
-                    if extra_args:
-                        cmd.extend(extra_args)
-                    cmd.extend([
-                        "-i",
-                        url,
-                        "-frames:v",
-                        "1",
-                        "-vf",
-                        scale_filter,
-                        temp_path,
-                    ])
-                    return subprocess.run(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=_SNAPSHOT_TIMEOUT,
-                    )
-
-                attempts = 2
-                last_result = None
-                for attempt in range(attempts):
-                    if attempt:
-                        # If the previous attempt failed, and we are responsible for the video
-                        # (i.e. it wasn't already running for a user), try restarting the feed.
-                        if self._snapshot_enabled_by_notifier and last_result and last_result.returncode != 0:
-                            log.info("Apprise snapshot: Restarting video feed after failure")
-                            vq.set_video_enabled(False)
-                            # Give it a moment to stop
-                            time.sleep(0.5)
-                            vq.set_video_enabled(True)
-                            if not vq.wanted:
-                                vq.start()
-                            vq.await_ready()
-
-                        time.sleep(0.4)
-                        self._await_video_frame(vq)
-                    result = run_ffmpeg(["-f", "h264"])
-                    if result.returncode != 0:
-                        result = run_ffmpeg()
-                    last_result = result
-                    if result.returncode == 0 and os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
-                        return temp_path
-
-                if last_result and last_result.returncode != 0:
-                    stderr = last_result.stderr.decode(errors="ignore").strip()
-                    if stderr:
-                        log.warning(f"Apprise snapshot failed: {stderr}")
+                host, port = web._local_web_host_port()
+                web.camera.capture_camera_snapshot_to_file(
+                    camera_settings,
+                    ffmpeg_path,
+                    temp_path,
+                    host=host,
+                    port=port,
+                    api_key=app.config.get("api_key"),
+                    timeout=_SNAPSHOT_TIMEOUT,
+                    scale=(width, height),
+                )
+                if os.path.exists(temp_path) and os.path.getsize(temp_path) > 0:
+                    return temp_path
                 try:
                     os.remove(temp_path)
                 except OSError:
                     pass
                 return None
-            except (OSError, subprocess.SubprocessError, ServiceStoppedError, subprocess.TimeoutExpired) as err:
+            except (
+                OSError,
+                subprocess.SubprocessError,
+                ServiceStoppedError,
+                subprocess.TimeoutExpired,
+                web.camera.CameraCaptureError,
+            ) as err:
                 log.warning(f"Apprise snapshot failed: {err}")
                 if temp_path:
                     try:

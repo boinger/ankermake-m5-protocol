@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import click
+import os
 from click.testing import CliRunner
 
 import ankerctl
@@ -52,24 +53,49 @@ def test_config_decode_and_import_cli(monkeypatch, tmp_path):
 
 def test_find_login_file_detects_darwin_and_windows_locations(tmp_path, monkeypatch):
     darwin_file = tmp_path / "login.json"
-    darwin_file.write_text("darwin")
+    darwin_file.write_bytes(b"darwin")
     monkeypatch.setattr("ankerctl.platform.system", lambda: "Darwin")
     monkeypatch.setattr("ankerctl.path.expanduser", lambda value: str(darwin_file))
 
     with ankerctl._find_login_file() as fh:
-        assert fh.read() == "darwin"
+        assert fh.read() == b"darwin"
 
-    windows_file = tmp_path / "user_info"
-    windows_file.write_text("windows")
+    windows_dir = tmp_path / "leveldb"
+    windows_dir.mkdir()
+    windows_file = windows_dir / "000005.ldb"
+    windows_file.write_bytes(b"prefix vms-userinfo windows")
     monkeypatch.setattr("ankerctl.platform.system", lambda: "Windows")
     monkeypatch.setattr(
         "ankerctl.path.expandvars",
-        lambda value: str(windows_file) if "user_info" in value else str(tmp_path / "missing"),
+        lambda value: str(windows_dir) if "Local Storage\\leveldb" in value else str(tmp_path / "missing"),
     )
+    monkeypatch.setattr("ankerctl.path.isdir", lambda value: Path(value) == windows_dir)
     monkeypatch.setattr("ankerctl.path.isfile", lambda value: Path(value) == windows_file)
+    monkeypatch.setattr(os, "listdir", lambda value: ["000005.ldb"] if Path(value) == windows_dir else [])
 
     with ankerctl._find_login_file() as fh:
-        assert fh.read() == "windows"
+        assert b"windows" in fh.read()
+
+
+def test_find_login_file_prefers_newer_userinfo_cache(tmp_path, monkeypatch):
+    windows_dir = tmp_path / "leveldb"
+    windows_dir.mkdir()
+    older = windows_dir / "000005.ldb"
+    older.write_bytes(b"prefix vms-userinfo windows")
+    newer = windows_dir / "000123.ldb"
+    newer.write_bytes(b"prefix userinfo windows")
+
+    monkeypatch.setattr("ankerctl.platform.system", lambda: "Windows")
+    monkeypatch.setattr(
+        "ankerctl.path.expandvars",
+        lambda value: str(windows_dir) if "Local Storage\\leveldb" in value else str(tmp_path / "missing"),
+    )
+    monkeypatch.setattr("ankerctl.path.isdir", lambda value: Path(value) == windows_dir)
+    monkeypatch.setattr("ankerctl.path.isfile", lambda value: Path(value) in {older, newer})
+    monkeypatch.setattr(os, "listdir", lambda value: ["000005.ldb", "000123.ldb"] if Path(value) == windows_dir else [])
+
+    with ankerctl._find_login_file() as fh:
+        assert b"userinfo" in fh.read()
 
 
 def test_config_login_retries_with_captcha_and_imports(monkeypatch):

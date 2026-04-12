@@ -1,3 +1,6 @@
+import base64
+import json
+import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime
 from types import SimpleNamespace
@@ -6,12 +9,14 @@ import pytest
 
 from cli.config import (
     AnkerConfigManager,
+    import_config_from_server,
     merge_config_preferences,
     resolve_api_key,
     update_empty_printer_ips,
     validate_api_key,
 )
 from cli.model import Account, Config, Printer
+from libflagship import logincache
 
 
 def _sample_printer(sn="SN-1", ip_addr=""):
@@ -119,3 +124,76 @@ def test_config_manager_round_trips_serialized_config(tmp_path):
     assert isinstance(loaded, Config)
     assert loaded.account.email == "printer@example.com"
     assert loaded.printers[0].mqtt_key == b"\x01\x02"
+
+
+def test_logincache_load_parses_eufymake_webview_blob():
+    token = "f88b0074484d9fd9dfcda327ef2b4dd28b4511235c0514df"
+    token_fragment = base64.b64encode(f"{token}%".encode()).decode().rstrip("=")
+    region_fragment = base64.b64encode(b"%22ab_code%22%3A%22US%22").decode().rstrip("=")
+    blob = (
+        b"noise-before"
+        b"vms-userinfo"
+        b"\x00"
+        + b"2"
+        + token_fragment.encode()
+        + b"\x00"
+        + region_fragment.encode()
+        + b"\x00noise-after"
+    )
+
+    parsed = logincache.load(blob)
+
+    assert parsed["data"]["auth_token"] == token
+    assert parsed["data"]["ab_code"] == "US"
+
+
+def test_logincache_load_parses_eufymake_webview_userinfo_blob():
+    payload = {
+        "user_id": "user-123",
+        "email": "printer@example.com",
+        "auth_token": "a932208fb65ff1fab8296b2a099cc8d2b74e910ff85e7378",
+        "ab_code": "US",
+    }
+    encoded = base64.b64encode(urllib.parse.quote(json.dumps(payload, separators=(",", ":"))).encode()).decode()
+    blob = b"prefix userinfo\x01" + encoded.encode() + b"\x00noise-after"
+
+    parsed = logincache.load(blob)
+
+    assert parsed["data"]["auth_token"] == payload["auth_token"]
+    assert parsed["data"]["ab_code"] == "US"
+    assert parsed["data"]["email"] == "printer@example.com"
+
+
+def test_import_config_recovers_truncated_webview_auth_token(monkeypatch):
+    short_token = "88b0074484d9fd9dfcda327ef2b4dd28b4511235c0514df"
+    expected_token = f"f{short_token}"
+    cfg = _sample_config()
+    load_calls = []
+    saved = []
+
+    manager = SimpleNamespace(
+        load=lambda name, default=None: None,
+        save=lambda name, value: saved.append((name, value)),
+    )
+
+    monkeypatch.setattr(
+        "cli.config.load_config_from_api",
+        lambda auth_token, region, insecure: (
+            load_calls.append((auth_token, region, insecure)),
+            cfg if auth_token == expected_token else (_ for _ in ()).throw(Exception("bad token"))
+        )[1],
+    )
+    monkeypatch.setattr("cli.config.get_printer_ips", lambda config: {})
+    monkeypatch.setattr("cli.config.merge_config_preferences", lambda existing, new_config: new_config)
+    monkeypatch.setattr("cli.config.update_empty_printer_ips", lambda config, printer_ips: None)
+
+    import_config_from_server(
+        manager,
+        {"auth_token": short_token, "ab_code": "US"},
+        False,
+    )
+
+    assert load_calls[0][0] == short_token
+    assert load_calls[-1][0] == expected_token
+    assert saved and saved[0][0] == "default"
+    assert saved[0][1].account.auth_token == expected_token

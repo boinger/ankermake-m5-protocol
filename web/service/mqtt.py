@@ -111,10 +111,13 @@ class MqttQueue(Service):
         return f"MqttQueue[{self.printer_index}]"
 
     def worker_init(self):
-        self._notifier = AppriseNotifier(app.config["config"])
+        self._notifier = AppriseNotifier(app.config["config"], printer_index=self.printer_index)
         config_root = str(app.config["config"].config_root)
-        self._history = PrintHistory(db_path=f"{config_root}/history.db")
-        self._timelapse = TimelapseService(app.config["config"])
+        self._history = PrintHistory(
+            db_path=f"{config_root}/history.db",
+            printer_index=self.printer_index,
+        )
+        self._timelapse = TimelapseService(app.config["config"], printer_index=self.printer_index)
 
         # Home Assistant MQTT Discovery
         printer_sn = None
@@ -129,7 +132,12 @@ class MqttQueue(Service):
                 printer = cfg.printers[self.printer_index]
                 printer_sn = getattr(printer, "sn", None)
                 printer_name = getattr(printer, "name", None) or "AnkerMake M5"
-        self._ha = HomeAssistantService(app.config["config"], printer_sn=printer_sn, printer_name=printer_name)
+        self._ha = HomeAssistantService(
+            app.config["config"],
+            printer_sn=printer_sn,
+            printer_name=printer_name,
+            printer_index=self.printer_index,
+        )
         self._ha.start()
         self._printer_name = printer_name or "AnkerMake M5"
         self._printer_sn = printer_sn
@@ -205,6 +213,7 @@ class MqttQueue(Service):
         self._last_selected_storage_file_name = None
         self._last_print_schedule_filename = None
         self._last_print_schedule_seen_at = 0.0
+        self._pending_prepare_state_logged = False
         self._clear_timelapse_start_offer()
         self._pause_reason = None
         self._filament_runout_pending = False
@@ -416,15 +425,36 @@ class MqttQueue(Service):
             return None
         expected_name = os.path.basename(str(archive_info.get("filename") or ""))
         target_name = os.path.basename(str(filename or ""))
-        if expected_name and target_name and expected_name != target_name:
+        if (
+            expected_name
+            and target_name
+            and expected_name != target_name
+            and self._normalize_pending_archive_filename(expected_name)
+            != self._normalize_pending_archive_filename(target_name)
+        ):
             return None
         self._pending_archive_info = None
         return archive_info
+
+    @staticmethod
+    def _normalize_pending_archive_filename(filename):
+        cleaned = []
+        for char in os.path.basename(str(filename or "")):
+            if char.isalnum() or char in "._-":
+                cleaned.append(char)
+            else:
+                cleaned.append("_")
+        normalized = "".join(cleaned).lstrip(".")
+        while ".." in normalized:
+            normalized = normalized.replace("..", ".")
+        return normalized.lower()
 
     def _clear_recent_completion(self):
         self._recent_completion_filename = None
         self._recent_completion_task_id = None
         self._recent_completion_at = 0.0
+        self._recent_completion_bare_state_logged = False
+        self._recent_completion_stale_update_logged = False
 
     def _remember_recent_completion(self, filename=None, task_id=None):
         saved_filename = os.path.basename(str(filename or self._last_filename or "")).strip()
@@ -432,6 +462,8 @@ class MqttQueue(Service):
         self._recent_completion_filename = saved_filename or None
         self._recent_completion_task_id = saved_task_id or None
         self._recent_completion_at = time.monotonic()
+        self._recent_completion_bare_state_logged = False
+        self._recent_completion_stale_update_logged = False
 
     def _recent_completion_matches(self, *, task_id=None, filename=None):
         recent_completion_at = getattr(self, "_recent_completion_at", 0.0)
@@ -464,6 +496,7 @@ class MqttQueue(Service):
                 }
             self._clear_recent_completion()
             self._state = PrintState.PREPARING
+            self._pending_prepare_state_logged = False
             self._stop_requested = False
         log.info("Marked pending print start for %r", self._last_filename)
 
@@ -1266,7 +1299,9 @@ class MqttQueue(Service):
                     and getattr(self, "_recent_completion_at", 0.0)
                     and (time.monotonic() - getattr(self, "_recent_completion_at", 0.0)) <= RECENT_COMPLETION_GUARD_SEC
                 ):
-                    log.info("Ignoring bare ct 1000 value=1 immediately after print completion")
+                    if not getattr(self, "_recent_completion_bare_state_logged", False):
+                        log.info("Ignoring bare ct 1000 value=1 immediately after print completion")
+                        self._recent_completion_bare_state_logged = True
                 else:
                     self._transition_to_active(payload, progress=0)
             elif value == 2 and self._state == PrintState.PRINTING:
@@ -1323,7 +1358,9 @@ class MqttQueue(Service):
                     self._reset_print_state()
             elif value == 8:
                 if self._state == PrintState.PREPARING:
-                    log.info("Pending print start entered firmware prepare state (ct 1000 value=8)")
+                    if not getattr(self, "_pending_prepare_state_logged", False):
+                        log.info("Pending print start entered firmware prepare state (ct 1000 value=8)")
+                        self._pending_prepare_state_logged = True
                 else:
                     self._state = PrintState.IDLE
             log.debug(
@@ -1364,11 +1401,13 @@ class MqttQueue(Service):
             and not self.is_preparing_print
             and self._recent_completion_matches(task_id=task_id, filename=incoming_filename)
         ):
-            log.info(
-                "Ignoring stale post-completion update for task_id=%s filename=%r",
-                task_id,
-                incoming_filename,
-            )
+            if not getattr(self, "_recent_completion_stale_update_logged", False):
+                log.info(
+                    "Ignoring stale post-completion update for task_id=%s filename=%r",
+                    task_id,
+                    incoming_filename,
+                )
+                self._recent_completion_stale_update_logged = True
             return
         if task_id:
             if self._last_task_id and task_id != self._last_task_id and self._state == PrintState.PRINTING:
@@ -1612,6 +1651,62 @@ class MqttQueue(Service):
         discard_pending_resume = getattr(self._timelapse, "discard_pending_resume", None)
         if callable(discard_pending_resume):
             discard_pending_resume(filename)
+
+    def pause_timelapse_for_current_print(self):
+        with self._state_lock:
+            if not getattr(self._timelapse, "enabled", False):
+                raise RuntimeError("Timelapse is disabled.")
+            if self._state not in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED):
+                raise RuntimeError("No active print is available for timelapse.")
+
+        has_active_capture = getattr(self._timelapse, "has_active_capture", None)
+        if not callable(has_active_capture) or not has_active_capture():
+            raise RuntimeError("No active timelapse capture is running.")
+
+        self._timelapse.set_manual_pause(True)
+        return os.path.basename(str(self._last_filename or "")).strip() or None
+
+    def resume_timelapse_for_current_print(self):
+        with self._state_lock:
+            if not getattr(self._timelapse, "enabled", False):
+                raise RuntimeError("Timelapse is disabled.")
+            if self._state not in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED):
+                raise RuntimeError("No active print is available for timelapse.")
+
+        has_active_capture = getattr(self._timelapse, "has_active_capture", None)
+        if not callable(has_active_capture) or not has_active_capture():
+            raise RuntimeError("No active timelapse capture is running.")
+        runtime_state_getter = getattr(self._timelapse, "get_runtime_state", None)
+        if callable(runtime_state_getter):
+            runtime_state = runtime_state_getter()
+            if not runtime_state.get("manual_paused"):
+                raise RuntimeError("Timelapse is not paused manually.")
+
+        self._timelapse.set_manual_pause(False)
+        return os.path.basename(str(self._last_filename or "")).strip() or None
+
+    def stop_timelapse_for_current_print(self):
+        with self._state_lock:
+            if not getattr(self._timelapse, "enabled", False):
+                raise RuntimeError("Timelapse is disabled.")
+            prompt_pending = bool(getattr(self, "_timelapse_start_prompt_pending", False))
+            if self._state not in (PrintState.PRE_PRINT, PrintState.PRINTING, PrintState.PAUSED) and not prompt_pending:
+                raise RuntimeError("No active print is available for timelapse.")
+            filename = os.path.basename(str(self._last_filename or "")).strip() or None
+            self._clear_timelapse_start_offer()
+
+        has_active_capture = getattr(self._timelapse, "has_active_capture", None)
+        if prompt_pending and (not callable(has_active_capture) or not has_active_capture()):
+            discard_pending_resume = getattr(self._timelapse, "discard_pending_resume", None)
+            if callable(discard_pending_resume):
+                discard_pending_resume(filename)
+            return filename
+
+        if not callable(has_active_capture) or not has_active_capture():
+            raise RuntimeError("No active timelapse capture is running.")
+
+        self._timelapse.finish_capture(final=True)
+        return filename
 
     def simulate_event(self, event_type, payload=None):
         """Simulate an MQTT event for testing.

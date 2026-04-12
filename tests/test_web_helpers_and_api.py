@@ -28,6 +28,7 @@ from web import (
     app,
 )
 import web as web_module
+from web.config import ConfigImportError
 from web.util import flash_redirect
 
 
@@ -66,10 +67,11 @@ class FakeServices:
     def __init__(self, mqtt=None):
         self._mqtt = mqtt if mqtt is not None else SimpleNamespace(is_printing=False)
         self.restart_calls = 0
+        self.svcs = {}
 
     @contextmanager
     def borrow(self, name):
-        assert name == "mqttqueue"
+        assert str(name).startswith("mqttqueue")
         yield self._mqtt
 
     def restart_all(self, await_ready=False):
@@ -203,6 +205,134 @@ def test_api_health_and_version_routes():
     finally:
         app.config["login"] = old_login
         app.config["api_key"] = old_api_key
+
+
+def test_config_import_slicer_route_uses_autodetected_cache(monkeypatch, tmp_path):
+    client = app.test_client()
+    detected = tmp_path / "000005.ldb"
+    detected.write_bytes(b"slicer-cache")
+    imported = []
+    sentinel_config = FakeConfigManager(
+        Config(
+            account=Account(
+                auth_token="secret",
+                region="us",
+                user_id="user-1",
+                email="user@example.com",
+                country="US",
+            ),
+            printers=[_printer("SN1", "Thing 1"), _printer("SN2", "Thing 2")],
+        )
+    )
+
+    old_config = app.config.get("config")
+    app.config["config"] = sentinel_config
+
+    monkeypatch.setattr("web.platform.autodetect_login_path", lambda platform=None: str(detected))
+    monkeypatch.setattr(
+        "web.config.config_import",
+        lambda file, config: imported.append((file.stream.read(), config)),
+    )
+
+    try:
+        response = client.post("/api/ankerctl/config/import-slicer")
+        with client.session_transaction() as sess:
+            authenticated = sess.get("authenticated")
+            pending_flash = sess.get("post_reload_flash")
+    finally:
+        app.config["config"] = old_config
+
+    assert response.status_code == 302
+    assert imported == [(b"slicer-cache", sentinel_config)]
+    assert authenticated is True
+    assert pending_flash == {
+        "message": "Configuration imported from open eufyMake Studio for user@example.com with 2 printers.",
+        "category": "success",
+    }
+
+
+def test_config_import_slicer_route_handles_missing_cache(monkeypatch):
+    client = app.test_client()
+    monkeypatch.setattr("web.platform.autodetect_login_path", lambda platform=None: None)
+
+    response = client.post("/api/ankerctl/config/import-slicer")
+
+    assert response.status_code == 302
+    assert response.location.endswith("/")
+
+
+def test_config_login_route_returns_inline_error(monkeypatch):
+    client = app.test_client()
+    old_config = app.config.get("config")
+    app.config["config"] = object()
+
+    monkeypatch.setattr(
+        "web.config.config_login",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConfigImportError("invalid email or password")),
+    )
+
+    try:
+        response = client.post(
+            "/api/ankerctl/config/login",
+            data={
+                "login_email": " user@example.com ",
+                "login_password": "pw",
+                "login_country": " us ",
+            },
+        )
+    finally:
+        app.config["config"] = old_config
+
+    assert response.status_code == 200
+    assert response.get_json() == {"error": "Login failed: invalid email or password"}
+
+
+def test_server_reload_uses_pending_flash_message():
+    client = app.test_client()
+    old_config = app.config.get("config")
+    old_svc = app.svc
+    old_login = app.config.get("login")
+    old_printer_index = app.config.get("printer_index")
+    old_video_supported = app.config.get("video_supported")
+    old_unsupported_device = app.config.get("unsupported_device")
+
+    cfg = Config(
+        account=Account(
+            auth_token="secret",
+            region="us",
+            user_id="user-1",
+            email="user@example.com",
+            country="US",
+        ),
+        printers=[_printer("SN1", "Thing 1")],
+    )
+    app.config["config"] = FakeConfigManager(cfg)
+    app.config["printer_index"] = 0
+    app.svc = FakeServices()
+    app.svc.svcs = {"placeholder": object()}
+
+    try:
+        with client.session_transaction() as sess:
+            sess["post_reload_flash"] = {
+                "message": "Configuration imported from open eufyMake Studio for user@example.com with 1 printer.",
+                "category": "success",
+            }
+
+        response = client.get("/api/ankerctl/server/reload")
+        with client.session_transaction() as sess:
+            flashes = sess.get("_flashes", [])
+    finally:
+        app.config["config"] = old_config
+        app.svc = old_svc
+        app.config["login"] = old_login
+        app.config["printer_index"] = old_printer_index
+        app.config["video_supported"] = old_video_supported
+        app.config["unsupported_device"] = old_unsupported_device
+
+    assert response.status_code == 302
+    assert flashes == [
+        ("success", "Configuration imported from open eufyMake Studio for user@example.com with 1 printer.")
+    ]
 
 
 def test_console_log_buffer_supports_recent_tail_and_incremental_updates():
@@ -432,6 +562,9 @@ def test_api_timelapse_current_start_and_dismiss():
     calls = []
     mqtt = SimpleNamespace(
         start_timelapse_for_current_print=lambda: calls.append("start") or "cube.gcode",
+        pause_timelapse_for_current_print=lambda: calls.append("pause") or "cube.gcode",
+        resume_timelapse_for_current_print=lambda: calls.append("resume") or "cube.gcode",
+        stop_timelapse_for_current_print=lambda: calls.append("stop") or "cube.gcode",
         dismiss_timelapse_start_offer=lambda: calls.append("dismiss"),
         get_state=lambda: {
             "print": {
@@ -440,7 +573,11 @@ def test_api_timelapse_current_start_and_dismiss():
             },
             "timelapse": {
                 "enabled": True,
-                "capturing": "start" in calls,
+                "capturing": "start" in calls and "stop" not in calls,
+                "active_capture": "start" in calls and "stop" not in calls,
+                "paused": "pause" in calls and "resume" not in calls and "stop" not in calls,
+                "pause_reason": "manual" if "pause" in calls and "resume" not in calls and "stop" not in calls else None,
+                "manual_paused": "pause" in calls and "resume" not in calls and "stop" not in calls,
                 "prompt_start": "dismiss" not in calls and "start" not in calls,
                 "prompt_filename": "cube.gcode",
             },
@@ -459,6 +596,9 @@ def test_api_timelapse_current_start_and_dismiss():
 
     try:
         start_response = client.post("/api/timelapse/current/start")
+        pause_response = client.post("/api/timelapse/current/pause")
+        resume_response = client.post("/api/timelapse/current/resume")
+        stop_response = client.post("/api/timelapse/current/stop")
         dismiss_response = client.post("/api/timelapse/current/dismiss")
     finally:
         app.svc = old_svc
@@ -466,10 +606,17 @@ def test_api_timelapse_current_start_and_dismiss():
             app.config[key] = value
 
     assert start_response.status_code == 200
+    assert pause_response.status_code == 200
+    assert resume_response.status_code == 200
+    assert stop_response.status_code == 200
     assert dismiss_response.status_code == 200
-    assert calls == ["start", "dismiss"]
+    assert calls == ["start", "pause", "resume", "stop", "dismiss"]
     assert start_response.get_json()["filename"] == "cube.gcode"
     assert start_response.get_json()["timelapse"]["capturing"] is True
+    assert pause_response.get_json()["timelapse"]["paused"] is True
+    assert pause_response.get_json()["timelapse"]["pause_reason"] == "manual"
+    assert resume_response.get_json()["timelapse"]["paused"] is False
+    assert stop_response.get_json()["timelapse"]["capturing"] is False
     assert dismiss_response.get_json()["timelapse"]["prompt_start"] is False
 
 

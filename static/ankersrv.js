@@ -81,14 +81,39 @@ $(function () {
     }
 
     /**
+     * Normalize a time value in seconds for display.
+     * @param {number|string|null|undefined} value
+     * @returns {number|null} Whole seconds, or null when the input is not usable
+     */
+    function normalizeTimeSeconds(value) {
+        if (typeof(value) === "number") {
+            return Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
+        }
+        if (typeof(value) === "string") {
+            const trimmed = value.trim();
+            if (!trimmed) {
+                return null;
+            }
+            const parsed = Number(trimmed);
+            return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : null;
+        }
+        return null;
+    }
+
+    /**
      * Convert time in seconds to hours, minutes, and seconds format
      * @param {number} totalseconds
-     * @returns {string} Formatted time string
+     * @returns {string|null} Formatted time string, or null when the input is invalid
      */
     function getTime(totalseconds) {
-        const hours = Math.floor(totalseconds / 3600);
-        const minutes = Math.floor((totalseconds % 3600) / 60);
-        const seconds = totalseconds % 60;
+        const total = normalizeTimeSeconds(totalseconds);
+        if (total === null) {
+            return null;
+        }
+
+        const hours = Math.floor(total / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        const seconds = total % 60;
 
         const timeString =
             `${hours.toString().padStart(2, "0")}:` +
@@ -493,6 +518,10 @@ $(function () {
     };
     const _timelapseRuntime = {
         capturing: false,
+        activeCapture: false,
+        paused: false,
+        pauseReason: null,
+        manualPaused: false,
         recovering: false,
         detail: null,
         promptStart: false,
@@ -500,6 +529,20 @@ $(function () {
         resumeAvailable: false,
         resumeFrameCount: 0,
     };
+    const _cameraState = {
+        source: "printer",
+        effectiveSource: null,
+        printerSupported: false,
+        featureAvailable: false,
+        detail: null,
+        externalName: null,
+        externalConfigured: false,
+        externalRefreshSec: 3,
+    };
+    let _cameraSettingsLoading = false;
+    let _externalCameraPreviewTimer = null;
+    let _externalCameraPreviewToken = 0;
+    let videoEnabled = false;
 
     function setFilamentState(label, detail = null, detailTone = null) {
         const el = $("#filament-state");
@@ -590,6 +633,51 @@ $(function () {
         }
     }
 
+    function renderTimelapseControls() {
+        const startBtn = $("#timelapse-control-start");
+        const pauseBtn = $("#timelapse-control-pause");
+        const resumeBtn = $("#timelapse-control-resume");
+        const stopBtn = $("#timelapse-control-stop");
+        const statusEl = $("#timelapse-control-status");
+
+        if (!startBtn.length || !pauseBtn.length || !resumeBtn.length || !stopBtn.length || !statusEl.length) {
+            return;
+        }
+
+        const printActive = _currentPrintState === PRINT_STATE.CALIBRATING
+            || _currentPrintState === PRINT_STATE.PENDING_START
+            || _currentPrintState === PRINT_STATE.PRINTING
+            || _currentPrintState === PRINT_STATE.PAUSED;
+        const canStart = printActive && !_timelapseRuntime.capturing;
+        const canPause = _timelapseRuntime.capturing && !_timelapseRuntime.paused;
+        const canResume = _timelapseRuntime.capturing && _timelapseRuntime.manualPaused;
+        const canStop = _timelapseRuntime.capturing || _timelapseRuntime.activeCapture;
+
+        startBtn.prop("disabled", !canStart);
+        pauseBtn.prop("disabled", !canPause);
+        resumeBtn.prop("disabled", !canResume);
+        stopBtn.prop("disabled", !canStop);
+
+        let message = "Use these controls to start, pause, resume, or stop timelapse capture for the active print.";
+        if (_timelapseRuntime.promptStart && !_timelapseRuntime.capturing) {
+            message = "An active print is waiting for timelapse confirmation. Use Start or the action card to begin capture.";
+        } else if (_timelapseRuntime.recovering) {
+            message = "Timelapse is recovering the camera stream.";
+        } else if (_timelapseRuntime.capturing && _timelapseRuntime.paused) {
+            message = _timelapseRuntime.pauseReason === "manual"
+                ? "Timelapse is paused manually."
+                : `Timelapse is paused: ${_timelapseRuntime.detail || "capture is waiting to resume."}`;
+        } else if (_timelapseRuntime.capturing) {
+            message = "Timelapse capture is running for the active print.";
+        } else if (_timelapseRuntime.activeCapture) {
+            message = "Timelapse frames are still saved for this print, but capture is not actively running.";
+        } else if (!printActive) {
+            message = "Start a print to enable manual timelapse controls.";
+        }
+
+        statusEl.text(message);
+    }
+
     function renderTimelapseActionCard() {
         const card = document.getElementById("timelapse-action-card");
         const title = document.getElementById("timelapse-action-title");
@@ -619,7 +707,7 @@ $(function () {
     }
 
     async function sendTimelapseCurrentAction(endpoint, successMessage) {
-        const resp = await fetch(endpoint, { method: "POST" });
+        const resp = await fetch(withActivePrinterQuery(endpoint), { method: "POST" });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) {
             throw new Error(data.error || `HTTP ${resp.status}`);
@@ -627,6 +715,103 @@ $(function () {
         applyRuntimeState(data);
         if (successMessage) {
             flash_message(successMessage, "success", 4000);
+        }
+    }
+
+    function applyCameraRuntimeState(camera) {
+        if (!camera || typeof camera !== "object") {
+            return;
+        }
+        _cameraState.source = String(camera.source || _cameraState.source || "printer");
+        _cameraState.effectiveSource = camera.effective_source || null;
+        _cameraState.printerSupported = !!camera.printer_supported;
+        _cameraState.featureAvailable = !!camera.feature_available;
+        _cameraState.detail = camera.detail || null;
+        _cameraState.externalName = camera.external_name || null;
+        _cameraState.externalConfigured = !!camera.external_configured;
+        _cameraState.externalRefreshSec = Math.max(1, Number(camera.external_refresh_sec || 3));
+        renderCameraUi();
+    }
+
+    function stopExternalCameraPreview(resetImage = true) {
+        _externalCameraPreviewToken += 1;
+        if (_externalCameraPreviewTimer) {
+            clearTimeout(_externalCameraPreviewTimer);
+            _externalCameraPreviewTimer = null;
+        }
+        const img = document.getElementById("external-camera-preview");
+        if (img) {
+            img.onload = null;
+            img.onerror = null;
+            if (resetImage) {
+                img.src = "/static/img/load-screen.svg";
+            }
+        }
+    }
+
+    function scheduleExternalCameraPreview(delayMs) {
+        if (_cameraState.effectiveSource !== "external") {
+            return;
+        }
+        if (_externalCameraPreviewTimer) {
+            clearTimeout(_externalCameraPreviewTimer);
+        }
+        _externalCameraPreviewTimer = setTimeout(function () {
+            const img = document.getElementById("external-camera-preview");
+            if (!img || _cameraState.effectiveSource !== "external") {
+                return;
+            }
+            const token = _externalCameraPreviewToken;
+            const refreshMs = Math.max(1000, Math.round(_cameraState.externalRefreshSec * 1000));
+            img.onload = function () {
+                if (token !== _externalCameraPreviewToken) {
+                    return;
+                }
+                scheduleExternalCameraPreview(refreshMs);
+            };
+            img.onerror = function () {
+                if (token !== _externalCameraPreviewToken) {
+                    return;
+                }
+                scheduleExternalCameraPreview(refreshMs);
+            };
+            img.src = `/api/camera/frame?printer_index=${encodeURIComponent(getActivePrinterIndex())}&ts=${Date.now()}`;
+        }, Math.max(0, delayMs || 0));
+    }
+
+    function renderCameraUi() {
+        const select = $("#camera-source-select");
+        if (select.length) {
+            const printerOption = select.find('option[value="printer"]');
+            printerOption.prop("disabled", !_cameraState.printerSupported && _cameraState.source !== "printer");
+            select.val(_cameraState.source || "printer");
+        }
+
+        let detail = String(_cameraState.detail || "").trim();
+        if (_cameraState.effectiveSource === "printer" && typeof videoEnabled !== "undefined" && !videoEnabled) {
+            detail = detail ? `${detail} Enable printer video to start live view.` : "Enable printer video to start live view.";
+        }
+        $("#camera-source-status").text(detail || "No camera source selected.");
+
+        const printerMode = _cameraState.effectiveSource === "printer";
+        const externalMode = _cameraState.effectiveSource === "external";
+
+        if (!printerMode) {
+            $("#vplayer").hide();
+        }
+        $("#video-toggle-container").toggle(printerMode);
+        $("#external-camera-container").toggle(externalMode);
+        $("#camera-unavailable").toggle(!printerMode && !externalMode);
+
+        $("#printer-camera-controls").toggle(printerMode);
+        $("#printer-camera-quality-wrap").toggle(printerMode);
+        $("#external-camera-controls").toggleClass("d-none", !externalMode);
+
+        if (externalMode) {
+            stopExternalCameraPreview(false);
+            scheduleExternalCameraPreview(0);
+        } else {
+            stopExternalCameraPreview();
         }
     }
 
@@ -643,12 +828,17 @@ $(function () {
         _filamentStatus.pendingRunout = false;
         const timelapse = data.timelapse || {};
         _timelapseRuntime.capturing = !!timelapse.capturing;
+        _timelapseRuntime.activeCapture = !!timelapse.active_capture;
+        _timelapseRuntime.paused = !!timelapse.paused;
+        _timelapseRuntime.pauseReason = timelapse.pause_reason || null;
+        _timelapseRuntime.manualPaused = !!timelapse.manual_paused;
         _timelapseRuntime.recovering = !!timelapse.recovering;
         _timelapseRuntime.detail = timelapse.detail || null;
         _timelapseRuntime.promptStart = !!timelapse.prompt_start;
         _timelapseRuntime.promptFilename = timelapse.prompt_filename || null;
         _timelapseRuntime.resumeAvailable = !!timelapse.resume_available;
         _timelapseRuntime.resumeFrameCount = Number(timelapse.resume_frame_count || 0);
+        applyCameraRuntimeState(data.camera || {});
 
         if (data.print && data.print.state !== undefined) {
             _updatePrintControlButtons(_normalizePrintStateValue(data.print.state));
@@ -656,6 +846,7 @@ $(function () {
         renderFilamentStatus();
         renderTimelapseRuntimeStatus();
         renderTimelapseActionCard();
+        renderTimelapseControls();
     }
 
     async function loadPrinterRuntimeState() {
@@ -664,7 +855,7 @@ $(function () {
         }
         _printerRuntimeLoading = true;
         try {
-            const resp = await fetch("/api/printer/runtime-state");
+            const resp = await fetch(withActivePrinterQuery("/api/printer/runtime-state"));
             const data = await resp.json().catch(() => ({}));
             if (!resp.ok) {
                 throw new Error(data.error || `HTTP ${resp.status}`);
@@ -696,6 +887,21 @@ $(function () {
             return parsed;
         }
         return 0;
+    }
+
+    function withActivePrinterQuery(url) {
+        const activePrinterIndex = String(getActivePrinterIndex());
+        try {
+            const resolved = new URL(url, window.location.origin);
+            resolved.searchParams.set("printer_index", activePrinterIndex);
+            if (resolved.origin === window.location.origin) {
+                return `${resolved.pathname}${resolved.search}${resolved.hash}`;
+            }
+            return resolved.toString();
+        } catch (_err) {
+            const separator = String(url).includes("?") ? "&" : "?";
+            return `${url}${separator}printer_index=${encodeURIComponent(activePrinterIndex)}`;
+        }
     }
 
     function processPrinterAlertEntries(entries, notifyUser) {
@@ -1015,7 +1221,7 @@ $(function () {
 
     sockets.mqtt = new AutoWebSocket({
         name: "mqtt socket",
-        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/mqtt`,
+        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/mqtt?printer_index=${encodeURIComponent(getActivePrinterIndex())}`,
         badge: "#badge-mqtt",
 
         message: function (ev) {
@@ -1067,9 +1273,15 @@ $(function () {
                 }
             } else if (data.commandType == 1001) {
                 // ZZ_MQTT_CMD_PRINT_SCHEDULE: time=remaining, totalTime=elapsed, progress=0-10000
-                $("#time-remain").text(getTime(data.time));
+                const remainingText = getTime(data.time);
+                if (remainingText !== null) {
+                    $("#time-remain").text(remainingText);
+                }
                 if (data.totalTime !== undefined) {
-                    $("#time-elapsed").text(getTime(data.totalTime));
+                    const elapsedText = getTime(data.totalTime);
+                    if (elapsedText !== null) {
+                        $("#time-elapsed").text(elapsedText);
+                    }
                 }
                 if (data.progress !== undefined) {
                     const progress = Math.min(100, Math.round(data.progress / 100));
@@ -1202,17 +1414,18 @@ $(function () {
      */
     sockets.video = new AutoWebSocket({
         name: "Video socket",
-        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/video`,
+        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/video?printer_index=${encodeURIComponent(getActivePrinterIndex())}`,
         badge: "#badge-video",
         binary: true,
         reconnect: 2000,
 
         open: function () {
             this.videoQueue = [];
-            this.videoBufferMinPackets = 4;
-            this.videoBufferDelayMs = 300;
-            this.videoBufferMaxPackets = 300;
-            this.videoPumpMaxPacketsPerTick = 12;
+            this.videoBufferMinPackets = 2;
+            this.videoBufferDelayMs = 120;
+            this.videoBufferMaxPackets = 120;
+            this.videoBufferCatchupPackets = 24;
+            this.videoPumpMaxPacketsPerTick = 24;
             this.videoBuffering = true;
             this.jmuxer = new JMuxer({
                 node: "player",
@@ -1277,7 +1490,8 @@ $(function () {
                 receivedAt: now,
             });
             if (this.videoQueue.length > this.videoBufferMaxPackets) {
-                this.videoQueue.splice(0, this.videoQueue.length - this.videoBufferMaxPackets);
+                const keepPackets = Math.max(this.videoBufferCatchupPackets, this.videoBufferMinPackets);
+                this.videoQueue.splice(0, this.videoQueue.length - keepPackets);
                 this.videoBuffering = true;
             }
         },
@@ -1354,7 +1568,7 @@ $(function () {
 
     sockets.ctrl = new AutoWebSocket({
         name: "Control socket",
-        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/ctrl`,
+        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/ctrl?printer_index=${encodeURIComponent(getActivePrinterIndex())}`,
         badge: "#badge-ctrl",
         opened: flushCtrlMessages,
         message: function (event) {
@@ -1373,7 +1587,7 @@ $(function () {
 
     sockets.pppp_state = new AutoWebSocket({
         name: "PPPP socket",
-        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/pppp-state`,
+        url: `${location.protocol.replace("http", "ws")}//${location.host}/ws/pppp-state?printer_index=${encodeURIComponent(getActivePrinterIndex())}`,
         badge: "#badge-pppp",
         reconnect: 5000,
 
@@ -1472,13 +1686,11 @@ $(function () {
 
     sockets.video.autoReconnect = false;
 
-    let videoEnabled = false;
-
-    $("#video-toggle").on("click", function () {
-        videoEnabled = !videoEnabled;
+    function setPrinterVideoEnabled(enabled) {
+        videoEnabled = !!enabled;
         if (videoEnabled) {
             $("#vplayer").show();
-            $(this).html('<i class="bi bi-camera-video-off"></i> Disable Video');
+            $("#video-toggle").html('<i class="bi bi-camera-video-off"></i> Disable Video');
             sendCtrlMessage({ video_enabled: true });
             sockets.video.autoReconnect = true;
             if (!sockets.video.ws) {
@@ -1486,7 +1698,7 @@ $(function () {
             }
         } else {
             $("#vplayer").hide();
-            $(this).html('<i class="bi bi-camera-video"></i> Enable Video');
+            $("#video-toggle").html('<i class="bi bi-camera-video"></i> Enable Video');
             sendCtrlMessage({ video_enabled: false });
             sockets.video.autoReconnect = false;
             if (sockets.video.ws) {
@@ -1497,6 +1709,11 @@ $(function () {
             }
             $("#video-resolution").text("Current: -");
         }
+        renderCameraUi();
+    }
+
+    $("#video-toggle").on("click", function () {
+        setPrinterVideoEnabled(!videoEnabled);
     });
 
     /**
@@ -1709,39 +1926,51 @@ $(function () {
         (async () => {
             const form = $("#config-login-form");
             const url = form.attr("action");
+            const submitBtn = $("#login");
+            const originalButtonHtml = submitBtn.html();
 
             const form_data = new URLSearchParams();
             for (const pair of new FormData(form.get(0))) {
                 form_data.append(pair[0], pair[1]);
             }
 
-            const resp = await fetch(url, {
-                method: 'POST',
-                body: form_data
-            });
+            submitBtn.prop("disabled", true);
+            submitBtn.html('<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>Working...');
 
-            if (resp.status < 300) {
-                const data = await resp.json();
-                const input = $("#loginCaptchaText");
-                if ("redirect" in data) {
-                    document.location = data["redirect"];
+            try {
+                const resp = await fetch(url, {
+                    method: 'POST',
+                    body: form_data
+                });
+
+                if (resp.status < 300) {
+                    const data = await resp.json();
+                    const input = $("#loginCaptchaText");
+                    if ("redirect" in data) {
+                        document.location = data["redirect"];
+                        return;
+                    }
+                    else if ("error" in data) {
+                        flash_message(data["error"], "danger");
+                        input.get(0).focus();
+                    }
+                    else if ("captcha_id" in data) {
+                        input.val("");
+                        input.attr("aria-required", "true");
+                        input.prop("required", true);
+                        input.get(0).focus();
+                        $("#loginCaptchaId").val(data["captcha_id"]);
+                        $("#loginCaptchaImg").attr("src", data["captcha_url"]);
+                        $("#captchaRow").show();
+                    }
                 }
-                else if ("error" in data) {
-                    flash_message(data["error"], "danger");
-                    input.get(0).focus();
-                }
-                else if ("captcha_id" in data) {
-                    input.val("");
-                    input.attr("aria-required", "true");
-                    input.prop("required", true);
-                    input.get(0).focus();
-                    $("#loginCaptchaId").val(data["captcha_id"]);
-                    $("#loginCaptchaImg").attr("src", data["captcha_url"]);
-                    $("#captchaRow").show();
+                else {
+                    flash_message(`HTTP Error ${resp.status}: ${resp.statusText}`, "danger")
                 }
             }
-            else {
-                flash_message(`HTTP Error ${resp.status}: ${resp.statusText}`, "danger")
+            finally {
+                submitBtn.prop("disabled", false);
+                submitBtn.html(originalButtonHtml);
             }
         })();
     });
@@ -2270,7 +2499,7 @@ $(function () {
         }
         bedSnapSave(snaps);
         bedSnapRefreshUI();
-        flash_message("Snapshot saved.", "success", 3000);
+        flash_message("Bed map saved.", "success", 3000);
     }
 
     /**
@@ -2295,7 +2524,7 @@ $(function () {
             const prevA = selA.value;
             selA.innerHTML = "";
             if (snaps.length === 0) {
-                selA.innerHTML = '<option value="" disabled selected>No snapshots saved yet</option>';
+                selA.innerHTML = '<option value="" disabled selected>No bed maps saved yet</option>';
             } else {
                 snaps.forEach(s => {
                     const opt = document.createElement("option");
@@ -2325,7 +2554,7 @@ $(function () {
         const listEl = document.getElementById("bed-snap-list");
         if (listEl) {
             if (snaps.length === 0) {
-                listEl.innerHTML = '<span class="text-muted small">No snapshots saved yet.</span>';
+                listEl.innerHTML = '<span class="text-muted small">No bed maps saved yet.</span>';
             } else {
                 listEl.innerHTML = "";
                 snaps.forEach(s => {
@@ -2430,14 +2659,14 @@ $(function () {
 
         const snapIdA = selA ? selA.value : "";
         if (!snapIdA) {
-            statusEl.innerHTML = '<div class="alert alert-warning py-2 small mb-0">Please select Snapshot A first.</div>';
+            statusEl.innerHTML = '<div class="alert alert-warning py-2 small mb-0">Please select Bed Map A first.</div>';
             return;
         }
 
         const snaps = bedSnapLoad();
         const snapA = snaps.find(s => s.id === snapIdA);
         if (!snapA) {
-            statusEl.innerHTML = '<div class="alert alert-danger py-2 small mb-0">Snapshot A not found.</div>';
+            statusEl.innerHTML = '<div class="alert alert-danger py-2 small mb-0">Bed Map A not found.</div>';
             return;
         }
 
@@ -2468,7 +2697,7 @@ $(function () {
         } else {
             const snapB = snaps.find(s => s.id === snapBId);
             if (!snapB) {
-                statusEl.innerHTML = '<div class="alert alert-danger py-2 small mb-0">Snapshot B not found.</div>';
+                statusEl.innerHTML = '<div class="alert alert-danger py-2 small mb-0">Bed Map B not found.</div>';
                 return;
             }
             dataB = snapB.data;
@@ -2695,11 +2924,11 @@ $(function () {
     /**
      * Snapshot Button
      */
-    $("#snapshot-btn").on("click", async function () {
+    $("#snapshot-btn, #snapshot-btn-secondary").on("click", async function () {
         const btn = $(this);
         btn.prop("disabled", true);
         try {
-            const resp = await fetch("/api/snapshot");
+            const resp = await fetch(`/api/snapshot?printer_index=${encodeURIComponent(getActivePrinterIndex())}`);
             if (!resp.ok) {
                 const data = await resp.json().catch(() => ({}));
                 const msg = data.error || `HTTP ${resp.status}`;
@@ -2715,6 +2944,8 @@ $(function () {
             a.download = `ankerctl_snapshot_${Date.now()}.jpg`;
             a.click();
             URL.revokeObjectURL(url);
+            flash_message("Snapshot downloaded and saved to Snapshots.", "success", 4000);
+            loadTimelapseSnapshots();
         } catch (err) {
             const msg = err.message || String(err);
             const banner = /^snapshot\b/i.test(msg) ? msg : `Snapshot failed: ${msg}`;
@@ -2723,6 +2954,139 @@ $(function () {
             btn.prop("disabled", false);
         }
     });
+
+    function applyCameraSettingsToForm(camera) {
+        $("#camera-external-name").val(camera && camera.external ? camera.external.name || "" : "");
+        $("#camera-external-stream-url").val(camera && camera.external ? camera.external.stream_url || "" : "");
+        $("#camera-external-snapshot-url").val(camera && camera.external ? camera.external.snapshot_url || "" : "");
+        $("#camera-external-refresh").val(camera && camera.external ? camera.external.refresh_sec || 3 : 3);
+    }
+
+    async function loadCameraSettings() {
+        if (_cameraSettingsLoading) {
+            return;
+        }
+        _cameraSettingsLoading = true;
+        try {
+            const resp = await fetch("/api/settings/camera");
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            applyCameraRuntimeState(data.camera || {});
+            applyCameraSettingsToForm(data.camera || {});
+        } catch (err) {
+            flash_message(`Failed to load camera settings: ${err.message || err}`, "danger");
+        } finally {
+            _cameraSettingsLoading = false;
+        }
+    }
+
+    async function saveCameraSettings(payload, successMessage = null) {
+        const resp = await fetch("/api/settings/camera", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ camera: payload }),
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+        applyCameraRuntimeState(data.camera || {});
+        applyCameraSettingsToForm(data.camera || {});
+        if (_cameraState.effectiveSource !== "printer" && videoEnabled) {
+            setPrinterVideoEnabled(false);
+        }
+        if (successMessage) {
+            flash_message(successMessage, "success");
+        }
+        return data.camera || {};
+    }
+
+    $("#camera-save").on("click", async function () {
+        const btn = $(this);
+        btn.prop("disabled", true);
+        try {
+            await saveCameraSettings({
+                external: {
+                    name: $("#camera-external-name").val().trim(),
+                    stream_url: $("#camera-external-stream-url").val().trim(),
+                    snapshot_url: $("#camera-external-snapshot-url").val().trim(),
+                    refresh_sec: parseInt($("#camera-external-refresh").val(), 10) || 3,
+                },
+            }, "External camera settings saved");
+        } catch (err) {
+            flash_message(`Failed to save camera settings: ${err.message || err}`, "danger");
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#camera-source-select").on("change", async function () {
+        const select = $(this);
+        const selected = select.val() || "printer";
+        select.prop("disabled", true);
+        try {
+            const successMessage = selected === "external"
+                ? (_cameraState.externalConfigured
+                    ? "Camera source switched to external camera."
+                    : "External camera selected. Finish setup in Setup -> Camera to use it.")
+                : "Camera source switched to printer camera.";
+            await saveCameraSettings({ source: selected }, successMessage);
+        } catch (err) {
+            flash_message(`Failed to switch camera source: ${err.message || err}`, "danger");
+            await loadCameraSettings();
+        } finally {
+            select.prop("disabled", false);
+        }
+    });
+
+    $("#launcher-download-btn").on("click", async function () {
+        const btn = $(this);
+        const installDir = ($("#launcher-install-dir").val() || "").trim();
+        if (!installDir) {
+            flash_message("Enter the Ankerctl folder before downloading the launcher.", "warning");
+            return;
+        }
+        btn.prop("disabled", true);
+        try {
+            const resp = await fetch("/api/settings/launcher-bat", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ install_dir: installDir }),
+            });
+            const data = await resp.blob();
+            if (!resp.ok) {
+                const text = await data.text().catch(() => "");
+                let errorMessage = `HTTP ${resp.status}`;
+                try {
+                    const parsed = JSON.parse(text);
+                    errorMessage = parsed.error || errorMessage;
+                } catch (_err) {
+                    if (text) {
+                        errorMessage = text;
+                    }
+                }
+                throw new Error(errorMessage);
+            }
+
+            const url = URL.createObjectURL(data);
+            const link = document.createElement("a");
+            link.href = url;
+            link.download = "ankerctl-launcher.bat";
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            URL.revokeObjectURL(url);
+            flash_message("Windows launcher downloaded.", "success");
+        } catch (err) {
+            flash_message(`Failed to download launcher: ${err.message || err}`, "danger");
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    loadCameraSettings();
 
     /**
      * GCode Console
@@ -3529,86 +3893,428 @@ $(function () {
         return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(0)} KB`;
     }
 
+    let _timelapseSnapshotCollections = [];
+    let _timelapseSelectedCollectionId = null;
+    let _timelapseSelectedFrameName = null;
+
+    function getTimelapseSnapshotCollection(id) {
+        return _timelapseSnapshotCollections.find(collection => collection.id === id) || null;
+    }
+
+    function configureTimelapseSnapshotDeleteButton(mode, options = {}) {
+        const deleteBtn = document.getElementById("timelapse-snapshot-delete");
+        if (!deleteBtn) return;
+
+        const enabled = options.enabled === true;
+        deleteBtn.disabled = !enabled;
+        deleteBtn.dataset.mode = mode || "frame";
+        deleteBtn.innerHTML = mode === "collection"
+            ? '<i class="bi bi-trash"></i> Discard Capture'
+            : '<i class="bi bi-trash"></i> Delete';
+
+        if (options.collectionId) {
+            deleteBtn.dataset.collection = options.collectionId;
+        } else {
+            deleteBtn.removeAttribute("data-collection");
+        }
+
+        if (options.filename) {
+            deleteBtn.dataset.file = options.filename;
+        } else {
+            deleteBtn.removeAttribute("data-file");
+        }
+    }
+
+    function clearTimelapseSnapshotPreview(message) {
+        const imageEl = document.getElementById("timelapse-snapshot-image");
+        const placeholder = document.getElementById("timelapse-snapshot-placeholder");
+        const placeholderText = document.getElementById("timelapse-snapshot-placeholder-text");
+        const titleEl = document.getElementById("timelapse-snapshot-title");
+        const subtitleEl = document.getElementById("timelapse-snapshot-subtitle");
+        const metaEl = document.getElementById("timelapse-snapshot-meta");
+        const downloadEl = document.getElementById("timelapse-snapshot-download");
+        const deleteBtn = document.getElementById("timelapse-snapshot-delete");
+
+        if (imageEl) {
+            imageEl.onload = null;
+            imageEl.onerror = null;
+            imageEl.removeAttribute("src");
+            imageEl.style.display = "none";
+        }
+        if (placeholderText && message) {
+            placeholderText.textContent = message;
+        }
+        if (placeholder) {
+            placeholder.style.display = "";
+        }
+        if (titleEl) titleEl.textContent = "Snapshot Viewer";
+        if (subtitleEl) {
+            subtitleEl.textContent = "Select a saved snapshot to preview.";
+            subtitleEl.style.display = "";
+        }
+        if (metaEl) {
+            metaEl.textContent = "";
+            metaEl.style.display = "none";
+        }
+        if (downloadEl) {
+            downloadEl.classList.add("disabled");
+            downloadEl.setAttribute("href", "#");
+            downloadEl.removeAttribute("download");
+        }
+        configureTimelapseSnapshotDeleteButton("frame", { enabled: false });
+    }
+
+    function getSnapshotCollectionStateSuffix(collection) {
+        if (!collection) return "";
+        if (collection.state === "capturing") return " (active)";
+        if (collection.state === "resume_pending") return " (paused)";
+        if (collection.state === "manual") return " (manual)";
+        return "";
+    }
+
+    function getSnapshotCollectionSubtitle(collection) {
+        if (!collection) return "";
+        if (collection.state === "manual") {
+            return collection.source_label
+                ? `Manual snapshot from ${collection.source_label}.`
+                : "Manual snapshot.";
+        }
+        if (collection.state === "capturing") {
+            return "Timelapse capture in progress.";
+        }
+        if (collection.state === "resume_pending") {
+            return "Timelapse capture is paused and still resumable.";
+        }
+        return collection.video_filename
+            ? `Saved from timelapse ${collection.video_filename}.`
+            : "Saved timelapse snapshot.";
+    }
+
+    function timelapseSelectSnapshot(collectionId, frameName) {
+        const collection = getTimelapseSnapshotCollection(collectionId);
+        const frame = collection ? (collection.frames || []).find(item => item.filename === frameName) : null;
+        const collectionSelect = document.getElementById("timelapse-snapshot-collection");
+        const frameSelect = document.getElementById("timelapse-snapshot-select");
+        const imageEl = document.getElementById("timelapse-snapshot-image");
+        const placeholder = document.getElementById("timelapse-snapshot-placeholder");
+        const titleEl = document.getElementById("timelapse-snapshot-title");
+        const subtitleEl = document.getElementById("timelapse-snapshot-subtitle");
+        const metaEl = document.getElementById("timelapse-snapshot-meta");
+        const statusEl = document.getElementById("timelapse-snapshot-status");
+        const downloadEl = document.getElementById("timelapse-snapshot-download");
+        const deleteBtn = document.getElementById("timelapse-snapshot-delete");
+
+        if (!collection || !frame) {
+            _timelapseSelectedCollectionId = null;
+            _timelapseSelectedFrameName = null;
+            clearTimelapseSnapshotPreview("Select a saved snapshot to preview");
+            if (statusEl && !_timelapseSnapshotCollections.length) {
+                statusEl.textContent = "Saved timelapse and manual snapshots will appear here.";
+            }
+            return;
+        }
+
+        _timelapseSelectedCollectionId = collection.id;
+        _timelapseSelectedFrameName = frame.filename;
+
+        if (collectionSelect) collectionSelect.value = collection.id;
+        if (frameSelect) frameSelect.value = frame.filename;
+
+        if (titleEl) titleEl.textContent = collection.label || collection.id;
+        if (subtitleEl) {
+            const subtitle = getSnapshotCollectionSubtitle(collection);
+            subtitleEl.textContent = subtitle;
+            subtitleEl.style.display = subtitle ? "" : "none";
+        }
+        if (metaEl) {
+            const created = frame.created_at ? new Date(frame.created_at).toLocaleString() : "-";
+            metaEl.textContent = `${frame.filename} · ${created} · ${formatSize(frame.size_bytes)}`;
+            metaEl.style.display = "";
+        }
+        if (statusEl) {
+            if (collection.state === "manual") {
+                statusEl.textContent = collection.source_label
+                    ? `Manual snapshot saved from ${collection.source_label}.`
+                    : "Manual snapshot saved.";
+            } else if (collection.allow_delete) {
+                statusEl.textContent = `${collection.frame_count} frame(s) available in this capture.`;
+            } else if (collection.state === "capturing") {
+                statusEl.textContent = "This capture is still running. Frames are view-only until the timelapse finishes.";
+            } else if (collection.state === "resume_pending") {
+                statusEl.textContent = "This paused capture is still resumable. Use Discard Capture if you want to remove it.";
+            } else {
+                statusEl.textContent = "This capture is still resumable. Frames are view-only until the timelapse is finalized.";
+            }
+        }
+        if (imageEl) {
+            imageEl.onload = function () {
+                imageEl.style.display = "";
+                if (placeholder) {
+                    placeholder.style.display = "none";
+                }
+            };
+            imageEl.onerror = function () {
+                clearTimelapseSnapshotPreview("Unable to load snapshot preview");
+            };
+            imageEl.src = withActivePrinterQuery(
+                `/api/timelapse-snapshot/${encodeURIComponent(collection.id)}/${encodeURIComponent(frame.filename)}`
+            );
+        }
+        if (downloadEl) {
+            downloadEl.classList.remove("disabled");
+            downloadEl.href = withActivePrinterQuery(
+                `/api/timelapse-snapshot/${encodeURIComponent(collection.id)}/${encodeURIComponent(frame.filename)}?download=1`
+            );
+            downloadEl.setAttribute("download", frame.filename);
+        }
+        if (collection.state === "resume_pending") {
+            configureTimelapseSnapshotDeleteButton("collection", {
+                enabled: true,
+                collectionId: collection.id,
+            });
+        } else {
+            configureTimelapseSnapshotDeleteButton("frame", {
+                enabled: !!collection.allow_delete,
+                collectionId: collection.id,
+                filename: frame.filename,
+            });
+        }
+    }
+
+    function renderTimelapseSnapshots() {
+        const collectionSelect = document.getElementById("timelapse-snapshot-collection");
+        const frameSelect = document.getElementById("timelapse-snapshot-select");
+        const statusEl = document.getElementById("timelapse-snapshot-status");
+
+        if (!collectionSelect || !frameSelect) return;
+
+        collectionSelect.innerHTML = "";
+        frameSelect.innerHTML = "";
+
+        if (!_timelapseSnapshotCollections.length) {
+            collectionSelect.innerHTML = '<option value="" selected>No snapshots available</option>';
+            collectionSelect.disabled = true;
+            frameSelect.innerHTML = '<option value="" selected>No snapshots available</option>';
+            frameSelect.disabled = true;
+            if (statusEl) {
+                statusEl.textContent = "Saved timelapse and manual snapshots will appear here.";
+            }
+            clearTimelapseSnapshotPreview("Select a saved snapshot to preview");
+            return;
+        }
+
+        collectionSelect.disabled = false;
+        _timelapseSnapshotCollections.forEach(collection => {
+            const option = document.createElement("option");
+            option.value = collection.id;
+            const stateSuffix = getSnapshotCollectionStateSuffix(collection);
+            option.textContent = `${collection.label || collection.id} · ${collection.frame_count} frame(s)${stateSuffix}`;
+            collectionSelect.appendChild(option);
+        });
+
+        let selectedCollection = getTimelapseSnapshotCollection(_timelapseSelectedCollectionId);
+        if (!selectedCollection) {
+            selectedCollection = _timelapseSnapshotCollections[0];
+            _timelapseSelectedCollectionId = selectedCollection.id;
+        }
+        collectionSelect.value = selectedCollection.id;
+
+        const frames = Array.isArray(selectedCollection.frames) ? selectedCollection.frames : [];
+        if (!frames.length) {
+            frameSelect.innerHTML = '<option value="" selected>No snapshots available</option>';
+            frameSelect.disabled = true;
+            clearTimelapseSnapshotPreview("No snapshots available in this collection");
+            return;
+        }
+
+        frameSelect.disabled = false;
+        frames.forEach(frame => {
+            const option = document.createElement("option");
+            option.value = frame.filename;
+            const created = frame.created_at ? new Date(frame.created_at).toLocaleTimeString() : "-";
+            option.textContent = `${frame.filename} · ${created}`;
+            frameSelect.appendChild(option);
+        });
+
+        const selectedFrame = frames.find(frame => frame.filename === _timelapseSelectedFrameName) || frames[frames.length - 1];
+        timelapseSelectSnapshot(selectedCollection.id, selectedFrame.filename);
+    }
+
+    function loadTimelapseSnapshots() {
+        return fetch(withActivePrinterQuery("/api/timelapse-snapshots"))
+            .then(r => r.json())
+            .then(data => {
+                _timelapseSnapshotCollections = Array.isArray(data.collections) ? data.collections : [];
+                renderTimelapseSnapshots();
+            })
+            .catch(err => console.error("Timelapse snapshot load failed:", err));
+    }
+
+    function clearTimelapseVideoPreview(message) {
+        const headerEl = document.getElementById("timelapse-player-header");
+        const placeholderEl = document.getElementById("timelapse-player-placeholder");
+        const placeholderTextEl = document.getElementById("timelapse-player-placeholder-text");
+        const videoEl = document.getElementById("timelapse-player");
+        const titleEl = document.getElementById("timelapse-player-title");
+        const metaEl = document.getElementById("timelapse-player-meta");
+        const deleteBtn = document.getElementById("timelapse-player-delete");
+
+        if (videoEl) {
+            try {
+                videoEl.pause();
+            } catch (_err) {}
+            videoEl.removeAttribute("src");
+            videoEl.removeAttribute("data-file");
+            videoEl.style.display = "none";
+            videoEl.load();
+        }
+        if (headerEl) headerEl.style.display = "none";
+        if (titleEl) titleEl.textContent = "";
+        if (metaEl) {
+            metaEl.textContent = "";
+            metaEl.style.display = "none";
+        }
+        if (placeholderTextEl) {
+            placeholderTextEl.textContent = message || "Select a video to play";
+        }
+        if (placeholderEl) placeholderEl.style.display = "";
+        if (deleteBtn) deleteBtn.removeAttribute("data-file");
+
+        document.querySelectorAll("#timelapse-list .list-group-item").forEach(el => {
+            el.classList.remove("active");
+        });
+    }
+
     function timelapseSelectVideo(v) {
-        const card        = document.getElementById("timelapse-player-card");
-        const placeholder = document.getElementById("timelapse-player-placeholder");
-        const videoEl     = document.getElementById("timelapse-player");
-        const titleEl     = document.getElementById("timelapse-player-title");
-        const metaEl      = document.getElementById("timelapse-player-meta");
-        const deleteBtn   = document.getElementById("timelapse-player-delete");
-        if (!card || !videoEl) return;
+        const headerEl = document.getElementById("timelapse-player-header");
+        const placeholderEl = document.getElementById("timelapse-player-placeholder");
+        const videoEl = document.getElementById("timelapse-player");
+        const titleEl = document.getElementById("timelapse-player-title");
+        const metaEl = document.getElementById("timelapse-player-meta");
+        const deleteBtn = document.getElementById("timelapse-player-delete");
+        if (!videoEl) return;
 
         document.querySelectorAll("#timelapse-list .list-group-item").forEach(el => {
             el.classList.toggle("active", el.dataset.file === v.filename);
         });
 
-        titleEl.textContent = v.filename;
-        metaEl.textContent  = `${v.created_at ? new Date(v.created_at).toLocaleString() : "-"} · ${formatSize(v.size_bytes)}`;
-        videoEl.src         = `/api/timelapse/${encodeURIComponent(v.filename)}`;
-        videoEl.load();
+        if (titleEl) titleEl.textContent = v.filename;
+        if (metaEl) {
+            metaEl.textContent = `${v.created_at ? new Date(v.created_at).toLocaleString() : "-"} · ${formatSize(v.size_bytes)}`;
+            metaEl.style.display = "";
+        }
+
         if (deleteBtn) deleteBtn.dataset.file = v.filename;
-        card.style.display        = "";
-        placeholder.style.display = "none";
+        videoEl.dataset.file = v.filename;
+        videoEl.src = withActivePrinterQuery(`/api/timelapse/${encodeURIComponent(v.filename)}`);
+        videoEl.style.display = "";
+        videoEl.load();
+
+        if (headerEl) headerEl.style.display = "";
+        if (placeholderEl) placeholderEl.style.display = "none";
     }
 
     function loadTimelapses() {
-        fetch("/api/timelapses")
+        fetch(withActivePrinterQuery("/api/timelapses"))
             .then(r => r.json())
             .then(data => {
                 const banner = document.getElementById("timelapse-disabled-banner");
-                if (banner) banner.style.display = data.enabled ? "none" : "";
-
                 const list = document.getElementById("timelapse-list");
+                const videoEl = document.getElementById("timelapse-player");
+                const currentFile = videoEl ? (videoEl.dataset.file || "") : "";
+
+                if (banner) banner.style.display = data.enabled ? "none" : "";
                 if (!list) return;
+
                 list.innerHTML = "";
 
-                if (data.videos.length === 0) {
+                if (!Array.isArray(data.videos) || data.videos.length === 0) {
                     list.innerHTML = '<div class="text-center text-muted py-4">No timelapse videos yet</div>';
+                    clearTimelapseVideoPreview("Select a video to play");
                     return;
                 }
+
+                let currentFileStillExists = false;
+
                 data.videos.forEach(v => {
-                    const created      = v.created_at ? new Date(v.created_at).toLocaleString() : "-";
+                    const created = v.created_at ? new Date(v.created_at).toLocaleString() : "-";
                     const safeFilename = escapeHtml(v.filename);
-                    const item         = document.createElement("div");
-                    item.className     = "list-group-item list-group-item-action d-flex justify-content-between align-items-center py-2 px-3";
-                    item.dataset.file  = v.filename;
-                    item.innerHTML     = `
+                    const item = document.createElement("div");
+                    item.className = "list-group-item list-group-item-action d-flex justify-content-between align-items-center py-2 px-3";
+                    item.dataset.file = v.filename;
+                    item.innerHTML = `
                         <div class="overflow-hidden me-2" style="cursor:pointer; flex:1; min-width:0;">
                             <div class="text-truncate fw-semibold small">${safeFilename}</div>
                             <div class="text-muted" style="font-size:0.75em;">${created} · ${formatSize(v.size_bytes)}</div>
                         </div>
                         <div class="d-flex gap-1 flex-shrink-0">
-                            <a href="/api/timelapse/${encodeURIComponent(v.filename)}" class="btn btn-sm btn-outline-secondary" download title="Download">
+                            <a href="${withActivePrinterQuery(`/api/timelapse/${encodeURIComponent(v.filename)}`)}" class="btn btn-sm btn-outline-secondary" download title="Download">
                                 <i class="bi bi-download"></i>
                             </a>
-                            <button type="button" class="btn btn-sm btn-outline-danger timelapse-delete" data-file="${safeFilename}" title="Delete">
+                            <button type="button" class="btn btn-sm btn-outline-danger timelapse-delete" title="Delete">
                                 <i class="bi bi-trash"></i>
                             </button>
                         </div>`;
+
+                    item.querySelector(".timelapse-delete").dataset.file = v.filename;
+
+                    if (currentFile && currentFile === v.filename) {
+                        item.classList.add("active");
+                        currentFileStillExists = true;
+                    }
+
                     item.querySelector(".overflow-hidden").addEventListener("click", () => timelapseSelectVideo(v));
                     list.appendChild(item);
                 });
+
+                if (currentFile && !currentFileStillExists) {
+                    clearTimelapseVideoPreview("Select a video to play");
+                }
             })
             .catch(err => console.error("Timelapse load failed:", err));
     }
 
     // Load on tab show; auto-refresh every 15 s while active.
     const timelapseTabBtn = document.querySelector('button[data-bs-target="#timelapse"]');
-    let _timelapseInterval = null;
+    let _timelapseVideoInterval = null;
     if (timelapseTabBtn) {
         timelapseTabBtn.addEventListener("shown.bs.tab", function () {
             loadPrinterRuntimeState().catch(function (err) {
                 console.warn("Failed to refresh timelapse runtime state", err);
             });
             loadTimelapses();
-            if (!_timelapseInterval) {
-                _timelapseInterval = setInterval(loadTimelapses, 15000);
+            if (!_timelapseVideoInterval) {
+                _timelapseVideoInterval = setInterval(function () {
+                    loadTimelapses();
+                }, 15000);
             }
         });
         timelapseTabBtn.addEventListener("hidden.bs.tab", function () {
-            if (_timelapseInterval) {
-                clearInterval(_timelapseInterval);
-                _timelapseInterval = null;
+            if (_timelapseVideoInterval) {
+                clearInterval(_timelapseVideoInterval);
+                _timelapseVideoInterval = null;
+            }
+        });
+    }
+
+    const snapshotsTabBtn = document.querySelector('button[data-bs-target="#snapshots"]');
+    let _timelapseSnapshotInterval = null;
+    if (snapshotsTabBtn) {
+        snapshotsTabBtn.addEventListener("shown.bs.tab", function () {
+            loadPrinterRuntimeState().catch(function (err) {
+                console.warn("Failed to refresh snapshot runtime state", err);
+            });
+            loadTimelapseSnapshots();
+            if (!_timelapseSnapshotInterval) {
+                _timelapseSnapshotInterval = setInterval(function () {
+                    loadTimelapseSnapshots();
+                }, 15000);
+            }
+        });
+        snapshotsTabBtn.addEventListener("hidden.bs.tab", function () {
+            if (_timelapseSnapshotInterval) {
+                clearInterval(_timelapseSnapshotInterval);
+                _timelapseSnapshotInterval = null;
             }
         });
     }
@@ -3619,8 +4325,62 @@ $(function () {
         btn.prop("disabled", true);
         try {
             await sendTimelapseCurrentAction("/api/timelapse/current/start", `Timelapse started for ${fileName}.`);
+            loadTimelapseSnapshots();
         } catch (err) {
             flash_message(`Timelapse start failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#timelapse-control-start").on("click", async function () {
+        const btn = $(this);
+        const fileName = String(_timelapseRuntime.promptFilename || "this print").trim() || "this print";
+        btn.prop("disabled", true);
+        try {
+            await sendTimelapseCurrentAction("/api/timelapse/current/start", `Timelapse started for ${fileName}.`);
+            loadTimelapseSnapshots();
+        } catch (err) {
+            flash_message(`Timelapse start failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#timelapse-control-pause").on("click", async function () {
+        const btn = $(this);
+        btn.prop("disabled", true);
+        try {
+            await sendTimelapseCurrentAction("/api/timelapse/current/pause", "Timelapse paused.");
+        } catch (err) {
+            flash_message(`Timelapse pause failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#timelapse-control-resume").on("click", async function () {
+        const btn = $(this);
+        btn.prop("disabled", true);
+        try {
+            await sendTimelapseCurrentAction("/api/timelapse/current/resume", "Timelapse resumed.");
+        } catch (err) {
+            flash_message(`Timelapse resume failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#timelapse-control-stop").on("click", async function () {
+        const btn = $(this);
+        if (!confirm("Stop timelapse capture for the current print?")) return;
+        btn.prop("disabled", true);
+        try {
+            await sendTimelapseCurrentAction("/api/timelapse/current/stop", "Timelapse stopped.");
+            loadTimelapseSnapshots();
+            loadTimelapses();
+        } catch (err) {
+            flash_message(`Timelapse stop failed: ${err.message || err}`, "danger", 6000);
         } finally {
             btn.prop("disabled", false);
         }
@@ -3631,8 +4391,66 @@ $(function () {
         btn.prop("disabled", true);
         try {
             await sendTimelapseCurrentAction("/api/timelapse/current/dismiss", "Pending timelapse capture dismissed.");
+            loadTimelapseSnapshots();
         } catch (err) {
             flash_message(`Dismiss failed: ${err.message || err}`, "danger", 6000);
+        } finally {
+            btn.prop("disabled", false);
+        }
+    });
+
+    $("#timelapse-snapshot-collection").on("change", function () {
+        _timelapseSelectedCollectionId = this.value || null;
+        _timelapseSelectedFrameName = null;
+        renderTimelapseSnapshots();
+    });
+
+    $("#timelapse-snapshot-select").on("change", function () {
+        if (!_timelapseSelectedCollectionId) return;
+        timelapseSelectSnapshot(_timelapseSelectedCollectionId, this.value || "");
+    });
+
+    $("#timelapse-snapshot-delete").on("click", async function () {
+        const btn = $(this);
+        const mode = String(btn.data("mode") || "frame");
+        const collectionId = btn.data("collection");
+        const filename = btn.data("file");
+        const collection = getTimelapseSnapshotCollection(collectionId);
+        if (!collectionId || !collection) return;
+
+        let requestUrl = null;
+        let successMessage = null;
+        let confirmMessage = null;
+
+        if (mode === "collection") {
+            confirmMessage = `Discard paused capture ${collection.label || collection.id}?`;
+            requestUrl = withActivePrinterQuery(
+                `/api/timelapse-snapshot/${encodeURIComponent(collectionId)}`
+            );
+            successMessage = `Discarded paused capture ${collection.label || collection.id}.`;
+        } else {
+            if (!filename || !collection.allow_delete) {
+                return;
+            }
+            confirmMessage = `Delete snapshot ${filename}?`;
+            requestUrl = withActivePrinterQuery(
+                `/api/timelapse-snapshot/${encodeURIComponent(collectionId)}/${encodeURIComponent(filename)}`
+            );
+            successMessage = `Deleted snapshot ${filename}.`;
+        }
+
+        if (!confirm(confirmMessage)) return;
+        btn.prop("disabled", true);
+        try {
+            const resp = await fetch(requestUrl, { method: "DELETE" });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            flash_message(successMessage, "success", 4000);
+            await loadTimelapseSnapshots();
+        } catch (err) {
+            flash_message(`Snapshot delete failed: ${err.message || err}`, "danger", 6000);
         } finally {
             btn.prop("disabled", false);
         }
@@ -3642,18 +4460,14 @@ $(function () {
     $(document).on("click", ".timelapse-delete", function () {
         const file = $(this).data("file");
         if (!confirm(`Delete timelapse ${file}?`)) return;
-        fetch(`/api/timelapse/${encodeURIComponent(file)}`, { method: "DELETE" })
+        fetch(withActivePrinterQuery(`/api/timelapse/${encodeURIComponent(file)}`), { method: "DELETE" })
             .then(() => {
-                // If the deleted video is currently loaded in the player, clear it
-                const videoEl     = document.getElementById("timelapse-player");
-                const card        = document.getElementById("timelapse-player-card");
-                const placeholder = document.getElementById("timelapse-player-placeholder");
-                if (videoEl && videoEl.src.endsWith(encodeURIComponent(file))) {
-                    videoEl.src = "";
-                    if (card)        card.style.display        = "none";
-                    if (placeholder) placeholder.style.display = "";
+                const videoEl = document.getElementById("timelapse-player");
+                if (videoEl && (videoEl.dataset.file || "") === file) {
+                    clearTimelapseVideoPreview("Select a video to play");
                 }
                 loadTimelapses();
+                loadTimelapseSnapshots();
             });
     });
 
@@ -3673,7 +4487,7 @@ $(function () {
 
         const loadTimelapseSettings = async () => {
             try {
-                const resp = await fetch("/api/settings/timelapse");
+                const resp = await fetch(withActivePrinterQuery("/api/settings/timelapse"));
                 if (resp.ok) {
                     const data = await resp.json();
                     const cfg = data.timelapse || {};
@@ -3701,7 +4515,7 @@ $(function () {
                 }
             };
             try {
-                const resp = await fetch("/api/settings/timelapse", {
+                const resp = await fetch(withActivePrinterQuery("/api/settings/timelapse"), {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify(payload)
@@ -4579,6 +5393,28 @@ $(function () {
         el.textContent = message || "";
     }
 
+    function filamentSetTableMessage(message, tone = "muted") {
+        const tbody = document.getElementById("filaments-tbody");
+        if (!tbody) return;
+        const textClass = tone === "danger" ? "text-danger" : "text-muted";
+        tbody.innerHTML = `<tr><td colspan="8" class="text-center ${textClass} py-4">${escapeHtml(message)}</td></tr>`;
+    }
+
+    function filamentSetSwapStateMessage(message) {
+        const stateEl = document.getElementById("filament-swap-state");
+        if (!stateEl) return;
+        stateEl.textContent = message || "";
+    }
+
+    async function filamentJsonRequest(url, options = {}, fallbackMessage = "Request failed") {
+        const resp = await fetch(url, options);
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+            throw new Error(data.error || `${fallbackMessage} (HTTP ${resp.status})`);
+        }
+        return data;
+    }
+
     function filamentPopulateSelect(selectId, selectedValue = "") {
         const select = document.getElementById(selectId);
         if (!select) return;
@@ -4706,29 +5542,22 @@ $(function () {
 
     async function filamentRefreshSwapState() {
         try {
-            const resp = await fetch("/api/filaments/service/swap");
-            const data = await resp.json();
-            if (!resp.ok) {
-                filamentSetServiceStatus(data.error || `Failed to load swap state (HTTP ${resp.status})`, "danger");
-                return;
-            }
+            const data = await filamentJsonRequest("/api/filaments/service/swap", {}, "Failed to load swap state");
             filamentUpdateSwapState(data);
         } catch (err) {
-                filamentSetServiceStatus(`Failed to load swap state: ${err}`, "danger");
+            console.warn("Filament swap state refresh failed:", err);
+            if (_filamentSwapToken) {
+                filamentSetSwapStateMessage(`Swap status refresh failed: ${err.message}. The last known state may be stale.`);
+            }
         }
     }
 
     async function filamentServiceRequest(url, payload) {
-        const resp = await fetch(url, {
+        return filamentJsonRequest(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload || {}),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) {
-            throw new Error(data.error || `HTTP ${resp.status}`);
-        }
-        return data;
+        }, "Filament service request failed");
     }
 
     function _renderFilaments() {
@@ -4748,7 +5577,7 @@ $(function () {
             return _filamentSortAsc ? cmp : -cmp;
         });
         if (profiles.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="8" class="text-center text-muted py-4">No filament profiles found</td></tr>';
+            filamentSetTableMessage("No filament profiles found.");
             return;
         }
         tbody.innerHTML = "";
@@ -4785,46 +5614,60 @@ $(function () {
                             </div>
                         </td>`;
                     tr.querySelector(".filament-edit").addEventListener("click", () => filamentOpenEdit(p));
-                    tr.querySelector(".filament-duplicate").addEventListener("click", () => {
-                        fetch(`/api/filaments/${safeId}/duplicate`, { method: "POST" })
-                            .then(r => r.json())
-                            .then(() => loadFilaments())
-                            .catch(err => console.error("Duplicate failed:", err));
+                    tr.querySelector(".filament-duplicate").addEventListener("click", async () => {
+                        try {
+                            await filamentJsonRequest(`/api/filaments/${safeId}/duplicate`, { method: "POST" }, "Failed to duplicate filament profile");
+                            await loadFilaments();
+                            flash_message(`Created a copy of "${p.name}".`, "success");
+                        } catch (err) {
+                            flash_message(`Duplicate failed: ${err.message}`, "danger");
+                        }
                     });
-                    tr.querySelector(".filament-preheat").addEventListener("click", () => {
+                    tr.querySelector(".filament-preheat").addEventListener("click", async () => {
                         const nozzle = p.nozzle_temp_first_layer ?? p.nozzle_temp_other_layer ?? p.nozzle_temp ?? "?";
                         const bed    = p.bed_temp_first_layer ?? p.bed_temp_other_layer ?? p.bed_temp ?? "?";
                         if (!confirm(`Preheat printer for ${p.name}?\nNozzle: ${nozzle}°C, Bed: ${bed}°C`)) return;
-                        fetch(`/api/filaments/${safeId}/apply`, { method: "POST" })
-                            .then(r => r.json())
-                            .then(res => {
-                                if (res.error) { alert("Error: " + res.error); return; }
-                                console.log("Preheat sent:", res.gcode);
-                            })
-                            .catch(err => console.error("Preheat failed:", err));
+                        try {
+                            await filamentJsonRequest(`/api/filaments/${safeId}/apply`, { method: "POST" }, "Failed to preheat filament profile");
+                            filamentSetServiceStatus(`Preheating ${p.name}: nozzle ${nozzle}\u00B0C, bed ${bed}\u00B0C.`, "warning");
+                        } catch (err) {
+                            filamentSetServiceStatus(`Preheat failed: ${err.message}`, "danger");
+                            flash_message(`Preheat failed: ${err.message}`, "danger");
+                        }
                     });
-                    tr.querySelector(".filament-delete").addEventListener("click", () => {
+                    tr.querySelector(".filament-delete").addEventListener("click", async () => {
                         if (!confirm(`Delete filament profile "${p.name}"?`)) return;
-                        fetch(`/api/filaments/${safeId}`, { method: "DELETE" })
-                            .then(() => loadFilaments())
-                            .catch(err => console.error("Delete failed:", err));
+                        try {
+                            await filamentJsonRequest(`/api/filaments/${safeId}`, { method: "DELETE" }, "Failed to delete filament profile");
+                            await loadFilaments();
+                            flash_message(`Deleted filament profile "${p.name}".`, "success");
+                        } catch (err) {
+                            flash_message(`Delete failed: ${err.message}`, "danger");
+                        }
                     });
                     tbody.appendChild(tr);
                 });
     }
 
-    function loadFilaments() {
-        fetch("/api/filaments")
-            .then(r => r.json())
-            .then(data => {
-                _filamentAllProfiles = data.filaments || [];
-                filamentPopulateSelect("filament-service-profile");
-                filamentPopulateSelect("filament-swap-unload-profile");
-                filamentPopulateSelect("filament-swap-load-profile");
-                filamentSyncQuickServiceTemp();
-                _renderFilaments();
-            })
-            .catch(err => console.error("Filaments load failed:", err));
+    async function loadFilaments() {
+        filamentSetTableMessage("Loading filament profiles...");
+        try {
+            const data = await filamentJsonRequest("/api/filaments", {}, "Failed to load filament profiles");
+            _filamentAllProfiles = data.filaments || [];
+            filamentPopulateSelect("filament-service-profile");
+            filamentPopulateSelect("filament-swap-unload-profile");
+            filamentPopulateSelect("filament-swap-load-profile");
+            filamentSyncQuickServiceTemp();
+            _renderFilaments();
+        } catch (err) {
+            _filamentAllProfiles = [];
+            filamentPopulateSelect("filament-service-profile");
+            filamentPopulateSelect("filament-swap-unload-profile");
+            filamentPopulateSelect("filament-swap-load-profile");
+            filamentSyncQuickServiceTemp();
+            filamentSetTableMessage(`Failed to load filament profiles. ${err.message}`, "danger");
+            flash_message(`Failed to load filament profiles: ${err.message}`, "danger");
+        }
     }
 
     // Sort button
@@ -5045,11 +5888,13 @@ $(function () {
     // Save button: create or update
     const filamentSaveBtn = document.getElementById("filament-save-btn");
     if (filamentSaveBtn) {
-        filamentSaveBtn.addEventListener("click", function () {
+        filamentSaveBtn.addEventListener("click", async function () {
             const profileId = document.getElementById("filament-id").value;
             const payload   = filamentReadForm();
+            payload.name = String(payload.name || "").trim();
             if (!payload.name) {
                 document.getElementById("filament-name").classList.add("is-invalid");
+                flash_message("Filament profile name is required.", "warning");
                 return;
             }
             document.getElementById("filament-name").classList.remove("is-invalid");
@@ -5057,19 +5902,21 @@ $(function () {
             const isNew  = !profileId;
             const url    = isNew ? "/api/filaments" : `/api/filaments/${profileId}`;
             const method = isNew ? "POST" : "PUT";
-
-            fetch(url, {
-                method: method,
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(payload),
-            })
-                .then(r => r.json())
-                .then(res => {
-                    if (res.error) { alert("Error: " + res.error); return; }
-                    if (bsFilamentModal) bsFilamentModal.hide();
-                    loadFilaments();
-                })
-                .catch(err => console.error("Save failed:", err));
+            try {
+                await filamentJsonRequest(url, {
+                    method: method,
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                }, "Failed to save filament profile");
+                if (bsFilamentModal) bsFilamentModal.hide();
+                await loadFilaments();
+                flash_message(
+                    isNew ? `Created filament profile "${payload.name}".` : `Saved filament profile "${payload.name}".`,
+                    "success"
+                );
+            } catch (err) {
+                flash_message(`Save failed: ${err.message}`, "danger");
+            }
         });
     }
 

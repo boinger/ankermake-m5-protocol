@@ -3,32 +3,60 @@
     <div class="container">
         <div class="row g-3">
             <div class="col-md-12 col-lg-6 col-xl-8">
-                {% if video_supported %}
-                {% if not ffmpeg_available %}
+                {% if show_camera_ffmpeg_warning and not ffmpeg_available %}
                 <div class="alert alert-warning d-flex gap-2 align-items-start">
                     <span class="mt-1">{{ macro.bi_icon("exclamation-triangle-fill") }}</span>
                     <div>
                         <div class="fw-semibold">Camera features need `ffmpeg`</div>
                         <div class="small">
-                            Snapshots, timelapse capture and related video tools are limited until `ffmpeg` is installed
-                            on this host. Live video can still work without it.
+                            External camera preview, snapshots, and timelapse capture are limited until `ffmpeg` is installed
+                            on this host. Printer live video can still work without it when the printer supports it.
                         </div>
                     </div>
                 </div>
                 {% endif %}
-                <!-- Video Container -->
-                <div id="vplayer" style="display: none;">
-                    <video class="w-100 d-block rounded-3 bg-body-tertiary" playsinline autoplay muted id="player"
-                        poster="{{ url_for('static', filename='img/load-screen.svg') }}">
-                    </video>
-                </div>
-                <div id="video-toggle-container" class="text-center mb-3">
-                    <button class="btn btn-primary" id="video-toggle">
-                        {{ macro.bi_icon("camera-video") }} Enable Video
-                    </button>
+                <div class="card mb-3">
+                    <div class="card-header d-flex flex-column flex-md-row align-items-md-center justify-content-between gap-2">
+                        <div class="d-flex flex-column">
+                            <span class="fs-6">Camera</span>
+                            <span id="camera-source-status" class="small text-muted">
+                                Loading camera settings...
+                            </span>
+                        </div>
+                        <div class="d-flex align-items-center gap-2">
+                            <label class="small text-muted mb-0" for="camera-source-select">Source</label>
+                            <select class="form-select form-select-sm" id="camera-source-select" style="min-width: 180px;">
+                                <option value="printer">Printer camera</option>
+                                <option value="external">External camera</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="card-body">
+                        <div id="vplayer" style="display: none;">
+                            <video class="w-100 d-block rounded-3 bg-body-tertiary" playsinline autoplay muted id="player"
+                                poster="{{ url_for('static', filename='img/load-screen.svg') }}">
+                            </video>
+                        </div>
+                        <div id="external-camera-container" style="display: none;">
+                            <img class="w-100 d-block rounded-3 bg-body-tertiary" id="external-camera-preview"
+                                alt="External camera preview"
+                                src="{{ url_for('static', filename='img/load-screen.svg') }}">
+                        </div>
+                        <div id="camera-unavailable" class="text-center text-muted py-5" style="display: none;">
+                            <p class="display-1 mb-2">
+                                {{ macro.bi_icon("camera-video-off") }}
+                            </p>
+                            <p class="display-6 mb-2">No camera source available</p>
+                            <p class="mb-0">Set up an external camera in <strong>Setup -> Camera</strong>.</p>
+                        </div>
+                        <div id="video-toggle-container" class="text-center mt-3" style="display: none;">
+                            <button class="btn btn-primary" id="video-toggle">
+                                {{ macro.bi_icon("camera-video") }} Enable Video
+                            </button>
+                        </div>
+                    </div>
                 </div>
 
-                <!-- Printer Control Card -->
                 <div class="card mb-3">
                     <div class="card-header d-flex align-items-center justify-content-between">
                         <span class="fs-6">Printer Control</span>
@@ -115,16 +143,6 @@
                         </div>
                     </div>
                 </div>
-                {% else %}
-                <div class="card">
-                    <div class="card-body text-center">
-                        <p class="display-1">
-                            {{ macro.bi_icon("camera-video-off") }}
-                        </p>
-                        <p class="display-6">Camera not available</p>
-                    </div>
-                </div>
-                {% endif %}
                 <!-- Temperature Graph -->
                 <div class="card mt-3">
                     <div class="card-header fs-6 d-flex justify-content-between align-items-center"
@@ -196,9 +214,8 @@
                             </div>
                         </div>
                     </div>
-                    {% if video_supported %}
                     <div class="card-header d-flex align-items-center justify-content-between">
-                        <span class="fs-6">Video Controls</span>
+                        <span class="fs-6">Camera Controls</span>
                         <button class="btn btn-sm btn-outline-secondary collapse-toggle" type="button"
                             data-bs-toggle="collapse" data-bs-target="#video-controls-section" aria-expanded="true"
                             aria-controls="video-controls-section">
@@ -208,23 +225,41 @@
                     <div class="collapse show" id="video-controls-section">
                         <div class="card-body">
                             <div class="row g-3 mb-3">
-                                <div class="col-4">
-                                    <button class="w-100 btn btn-secondary" id="light-on" aria-pressed="false">
-                                        {{ macro.bi_icon("lightbulb", "Light on") }}
-                                    </button>
-                                </div>
-                                <div class="col-4">
-                                    <button class="w-100 btn btn-secondary" id="light-off" aria-pressed="false">
-                                        {{ macro.bi_icon("lightbulb-off", "Light off") }}
-                                    </button>
-                                </div>
-                                <div class="col-4">
-                                    <button class="w-100 btn btn-secondary" id="snapshot-btn" title="Download Snapshot">
-                                        {{ macro.bi_icon("camera", "Snapshot") }}
-                                    </button>
+                                <div class="col-12">
+                                    <div id="printer-camera-controls">
+                                        <div class="row g-2">
+                                            <div class="col-4">
+                                                <button class="w-100 btn btn-secondary camera-control-btn" id="light-on" aria-pressed="false">
+                                                    {{ macro.bi_icon("lightbulb", "Light on") }}
+                                                </button>
+                                            </div>
+                                            <div class="col-4">
+                                                <button class="w-100 btn btn-secondary camera-control-btn" id="light-off" aria-pressed="false">
+                                                    {{ macro.bi_icon("lightbulb-off", "Light off") }}
+                                                </button>
+                                            </div>
+                                            <div class="col-4">
+                                                <button class="w-100 btn btn-secondary camera-control-btn" id="snapshot-btn" title="Download Snapshot">
+                                                    {{ macro.bi_icon("camera", "Snapshot") }}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div id="external-camera-controls" class="d-none">
+                                        <div class="form-text mb-2">
+                                            External preview refreshes as still frames. Snapshot and timelapse use the same external source.
+                                        </div>
+                                        <div class="row g-2">
+                                            <div class="col-12">
+                                                <button class="w-100 btn btn-secondary camera-control-btn" id="snapshot-btn-secondary" title="Download Snapshot">
+                                                    {{ macro.bi_icon("camera", "Snapshot") }} Snapshot
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
                                 </div>
                             </div>
-                            <div class="row g-3">
+                            <div class="row g-3" id="printer-camera-quality-wrap">
                                 <div class="col-12">
                                     <label class="form-label">Live View Quality</label>
                                     <div class="row g-3">
@@ -247,7 +282,6 @@
                             </div>
                         </div>
                     </div>
-                    {% endif %}
                     <div class="card-header fs-6">Print Progress</div>
                     <div class="card-body">
                         <div class="row mb-3 g-3" id="print-controls">

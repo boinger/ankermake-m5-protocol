@@ -17,6 +17,7 @@ log = logging.getLogger("history")
 
 _DEFAULT_RETENTION_DAYS = 90
 _DEFAULT_MAX_ENTRIES = 500
+_PENDING_ARCHIVE_GRACE_SECONDS = 60 * 60
 
 _PLACEHOLDER_NAMES = frozenset({"unknown", "unknown.gcode", ""})
 
@@ -24,6 +25,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS print_history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     filename    TEXT NOT NULL,
+    printer_index INTEGER,
     status      TEXT NOT NULL DEFAULT 'started',
     started_at  TEXT NOT NULL,
     finished_at TEXT,
@@ -41,14 +43,24 @@ CREATE TABLE IF NOT EXISTS print_history (
 class PrintHistory:
     """Thread-safe SQLite print history store."""
 
-    def __init__(self, db_path=None, retention_days=None, max_entries=None):
+    def __init__(self, db_path=None, retention_days=None, max_entries=None, printer_index=None):
         self._db_path = db_path or os.path.expanduser("~/.config/ankerctl/history.db")
         self._archive_dir = self._default_archive_dir()
         self._retention_days = int(os.getenv("PRINT_HISTORY_RETENTION_DAYS", retention_days or _DEFAULT_RETENTION_DAYS))
         self._max_entries = int(os.getenv("PRINT_HISTORY_MAX_ENTRIES", max_entries or _DEFAULT_MAX_ENTRIES))
+        self._printer_index = self._normalize_printer_index(printer_index)
         self._lock = threading.Lock()
         self._memory_conn = None
         self._init_db()
+
+    @staticmethod
+    def _normalize_printer_index(printer_index):
+        if printer_index is None:
+            return None
+        try:
+            return int(printer_index)
+        except (TypeError, ValueError):
+            return None
 
     def _default_archive_dir(self):
         db_path = os.fspath(self._db_path)
@@ -92,6 +104,9 @@ class PrintHistory:
         try:
             cursor = conn.execute("PRAGMA table_info(print_history)")
             columns = [row[1] for row in cursor.fetchall()]
+            if "printer_index" not in columns:
+                log.info("History: migrating schema, adding printer_index column")
+                conn.execute("ALTER TABLE print_history ADD COLUMN printer_index INTEGER")
             if "task_id" not in columns:
                 log.info("History: migrating schema, adding task_id column")
                 conn.execute("ALTER TABLE print_history ADD COLUMN task_id TEXT")
@@ -105,8 +120,42 @@ class PrintHistory:
             if "preview_url" not in columns:
                 log.info("History: migrating schema, adding preview_url column")
                 conn.execute("ALTER TABLE print_history ADD COLUMN preview_url TEXT")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_task_id ON print_history(task_id)")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_print_history_printer_status "
+                "ON print_history(printer_index, status)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_print_history_task_printer "
+                "ON print_history(task_id, printer_index)"
+            )
         except Exception as e:
             log.warning(f"History: schema migration failed: {e}")
+
+    def _select_existing_task_row(self, conn, task_id):
+        if not task_id:
+            return None
+        if self._printer_index is None:
+            return conn.execute(
+                "SELECT id, status, archive_relpath, archive_size, preview_url, printer_index "
+                "FROM print_history WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        return conn.execute(
+            "SELECT id, status, archive_relpath, archive_size, preview_url, printer_index "
+            "FROM print_history "
+            "WHERE task_id=? AND (printer_index=? OR printer_index IS NULL) "
+            "ORDER BY CASE WHEN printer_index IS NULL THEN 1 ELSE 0 END, id DESC LIMIT 1",
+            (task_id, self._printer_index),
+        ).fetchone()
+
+    def _update_row_printer_scope(self, conn, row_id):
+        if self._printer_index is None:
+            return
+        conn.execute(
+            "UPDATE print_history SET printer_index=COALESCE(printer_index, ?) WHERE id=?",
+            (self._printer_index, row_id),
+        )
 
 
     def _connect(self):
@@ -188,8 +237,43 @@ class PrintHistory:
     def _thumbnail_abspath(self, thumbnail_relpath):
         return self._archive_abspath(thumbnail_relpath)
 
-    def _decorate_entry(self, row):
+    def _find_archive_fallback(self, conn, entry):
+        if entry.get("archive_relpath"):
+            return None
+
+        task_id = str(entry.get("task_id") or "").strip()
+        if not task_id:
+            return None
+
+        printer_index = entry.get("printer_index")
+        params = [task_id]
+        sql = (
+            "SELECT archive_relpath, archive_size "
+            "FROM print_history "
+            "WHERE task_id=? AND archive_relpath IS NOT NULL AND archive_relpath != ''"
+        )
+        if printer_index is not None:
+            sql += " AND (printer_index=? OR printer_index IS NULL)"
+            params.append(printer_index)
+        if entry.get("id") is not None:
+            sql += " AND id != ?"
+            params.append(entry["id"])
+
+        if printer_index is not None:
+            sql += " ORDER BY CASE WHEN printer_index IS NULL THEN 1 ELSE 0 END, id DESC LIMIT 1"
+        else:
+            sql += " ORDER BY id DESC LIMIT 1"
+
+        return conn.execute(sql, tuple(params)).fetchone()
+
+    def _decorate_entry(self, row, conn=None):
         entry = dict(row)
+        if conn is not None:
+            fallback = self._find_archive_fallback(conn, entry)
+            if fallback:
+                entry["archive_relpath"] = fallback["archive_relpath"]
+                if entry.get("archive_size") is None:
+                    entry["archive_size"] = fallback["archive_size"]
         archive_path = self._archive_abspath(entry.get("archive_relpath"))
         thumbnail_path = self._thumbnail_abspath(self._thumbnail_relpath(entry.get("archive_relpath")))
         entry["archive_available"] = bool(archive_path and os.path.exists(archive_path))
@@ -204,6 +288,7 @@ class PrintHistory:
         archive_dir = self._archive_dir
         if not archive_dir or not os.path.isdir(archive_dir):
             return
+        now_ts = datetime.now(timezone.utc).timestamp()
         keep = {
             row[0]
             for row in conn.execute(
@@ -222,11 +307,29 @@ class PrintHistory:
             path = os.path.join(archive_dir, name)
             try:
                 if os.path.isfile(path):
+                    age_seconds = max(0.0, now_ts - os.path.getmtime(path))
+                    if age_seconds < _PENDING_ARCHIVE_GRACE_SECONDS:
+                        continue
                     os.unlink(path)
             except FileNotFoundError:
                 continue
             except Exception as exc:
                 log.warning(f"History: could not delete unreferenced archive {path}: {exc}")
+
+    def _delete_archive_relpaths(self, archive_relpaths):
+        for archive_relpath in archive_relpaths or ():
+            if not archive_relpath:
+                continue
+            for relpath in (archive_relpath, self._thumbnail_relpath(archive_relpath)):
+                path = self._archive_abspath(relpath)
+                if not path:
+                    continue
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    continue
+                except Exception as exc:
+                    log.warning(f"History: could not delete archive file {path}: {exc}")
 
     def record_start(self, filename, task_id=None, archive_relpath=None, archive_size=None, preview_url=None):
         """Record a print start. Returns the row id.
@@ -249,21 +352,29 @@ class PrintHistory:
                 # late duplicate updates for an already-finished job; task_id is the
                 # safest stable identity we have for deduplicating those.
                 if task_id:
-                    existing = conn.execute(
-                        "SELECT id, status, archive_relpath, archive_size, preview_url "
-                        "FROM print_history WHERE task_id=? ORDER BY id DESC LIMIT 1",
-                        (task_id,)
-                    ).fetchone()
+                    existing = self._select_existing_task_row(conn, task_id)
                     if existing:
+                        self._update_row_printer_scope(conn, existing["id"])
                         if archive_relpath or archive_size is not None or preview_url:
-                            conn.execute(
-                                "UPDATE print_history "
-                                "SET archive_relpath=COALESCE(archive_relpath, ?), "
-                                "    archive_size=COALESCE(archive_size, ?), "
-                                "    preview_url=COALESCE(preview_url, ?) "
-                                "WHERE id=?",
-                                (archive_relpath, archive_size, preview_url, existing["id"]),
-                            )
+                            if self._printer_index is None:
+                                conn.execute(
+                                    "UPDATE print_history "
+                                    "SET archive_relpath=COALESCE(archive_relpath, ?), "
+                                    "    archive_size=COALESCE(archive_size, ?), "
+                                    "    preview_url=COALESCE(preview_url, ?) "
+                                    "WHERE id=?",
+                                    (archive_relpath, archive_size, preview_url, existing["id"]),
+                                )
+                            else:
+                                conn.execute(
+                                    "UPDATE print_history "
+                                    "SET archive_relpath=COALESCE(archive_relpath, ?), "
+                                    "    archive_size=COALESCE(archive_size, ?), "
+                                    "    preview_url=COALESCE(preview_url, ?), "
+                                    "    printer_index=COALESCE(printer_index, ?) "
+                                    "WHERE id=?",
+                                    (archive_relpath, archive_size, preview_url, self._printer_index, existing["id"]),
+                                )
                         if existing["status"] == "started":
                             log.info(f"History: resuming entry id={existing['id']} for task_id={task_id}")
                         else:
@@ -284,7 +395,11 @@ class PrintHistory:
                 # 2. Close any *other* open entries (orphans)
                 # If we reached here, we are starting a NEW print session.
                 orp_sql = "SELECT id, started_at FROM print_history WHERE status='started'"
-                orphans = conn.execute(orp_sql).fetchall()
+                orp_params = ()
+                if self._printer_index is not None:
+                    orp_sql += " AND printer_index=?"
+                    orp_params = (self._printer_index,)
+                orphans = conn.execute(orp_sql, orp_params).fetchall()
                 
                 if orphans:
                     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -304,10 +419,12 @@ class PrintHistory:
 
                 # 3. Create new entry
                 cur = conn.execute(
-                    "INSERT INTO print_history (filename, status, started_at, task_id, archive_relpath, archive_size, preview_url) "
-                    "VALUES (?, 'started', ?, ?, ?, ?, ?)",
+                    "INSERT INTO print_history "
+                    "(filename, printer_index, status, started_at, task_id, archive_relpath, archive_size, preview_url) "
+                    "VALUES (?, ?, 'started', ?, ?, ?, ?, ?)",
                     (
                         filename,
+                        self._printer_index,
                         datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                         task_id,
                         archive_relpath,
@@ -332,10 +449,18 @@ class PrintHistory:
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
                 started = datetime.fromisoformat(row["started_at"])
                 duration = int((now - started).total_seconds())
-                conn.execute(
-                    "UPDATE print_history SET status='finished', finished_at=?, duration_sec=?, progress=? WHERE id=?",
-                    (now.isoformat(), duration, progress, row["id"])
-                )
+                if self._printer_index is None:
+                    conn.execute(
+                        "UPDATE print_history SET status='finished', finished_at=?, duration_sec=?, progress=? WHERE id=?",
+                        (now.isoformat(), duration, progress, row["id"])
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE print_history "
+                        "SET status='finished', finished_at=?, duration_sec=?, progress=?, "
+                        "printer_index=COALESCE(printer_index, ?) WHERE id=?",
+                        (now.isoformat(), duration, progress, self._printer_index, row["id"])
+                    )
                 conn.commit()
 
     def record_fail(self, filename=None, reason=None, task_id=None):
@@ -349,14 +474,66 @@ class PrintHistory:
                 now = datetime.now(timezone.utc).replace(tzinfo=None)
                 started = datetime.fromisoformat(row["started_at"])
                 duration = int((now - started).total_seconds())
-                conn.execute(
-                    "UPDATE print_history SET status='failed', finished_at=?, duration_sec=?, failure_reason=? WHERE id=?",
-                    (now.isoformat(), duration, reason, row["id"])
-                )
+                if self._printer_index is None:
+                    conn.execute(
+                        "UPDATE print_history SET status='failed', finished_at=?, duration_sec=?, failure_reason=? WHERE id=?",
+                        (now.isoformat(), duration, reason, row["id"])
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE print_history "
+                        "SET status='failed', finished_at=?, duration_sec=?, failure_reason=?, "
+                        "printer_index=COALESCE(printer_index, ?) WHERE id=?",
+                        (now.isoformat(), duration, reason, self._printer_index, row["id"])
+                    )
                 conn.commit()
 
     def _find_active(self, conn, filename=None, task_id=None):
         """Find the most recent active print, optionally matching task_id or filename."""
+        if self._printer_index is not None:
+            # 1. Try task_id exact printer match.
+            if task_id:
+                row = conn.execute(
+                    "SELECT * FROM print_history WHERE status='started' AND task_id=? AND printer_index=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id, self._printer_index),
+                ).fetchone()
+                if row:
+                    return row
+
+                # Legacy migration fallback: allow a matching unscoped row to be claimed.
+                row = conn.execute(
+                    "SELECT * FROM print_history WHERE status='started' AND task_id=? AND printer_index IS NULL "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if row:
+                    return row
+
+            # 2. Try filename exact printer match, then legacy fallback.
+            if filename:
+                row = conn.execute(
+                    "SELECT * FROM print_history WHERE status='started' AND filename=? AND printer_index=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (filename, self._printer_index),
+                ).fetchone()
+                if row:
+                    return row
+
+                row = conn.execute(
+                    "SELECT * FROM print_history WHERE status='started' AND filename=? AND printer_index IS NULL "
+                    "ORDER BY id DESC LIMIT 1",
+                    (filename,),
+                ).fetchone()
+                if row:
+                    return row
+
+            # 3. Fallback: only active rows for this printer.
+            return conn.execute(
+                "SELECT * FROM print_history WHERE status='started' AND printer_index=? ORDER BY id DESC LIMIT 1",
+                (self._printer_index,),
+            ).fetchone()
+
         # 1. Try task_id match (strongest)
         if task_id:
             row = conn.execute(
@@ -392,7 +569,7 @@ class PrintHistory:
                     "SELECT * FROM print_history ORDER BY id DESC LIMIT ? OFFSET ?",
                     (limit, offset)
                 ).fetchall()
-                return [self._decorate_entry(r) for r in rows]
+                return [self._decorate_entry(r, conn=conn) for r in rows]
 
     def get_entry(self, entry_id):
         with self._lock:
@@ -403,7 +580,7 @@ class PrintHistory:
                 ).fetchone()
                 if not row:
                     return None
-                return self._decorate_entry(row)
+                return self._decorate_entry(row, conn=conn)
 
     def get_archive_path(self, entry_id):
         entry = self.get_entry(entry_id)
@@ -431,10 +608,16 @@ class PrintHistory:
                 row = self._find_active(conn, filename, task_id)
                 if not row:
                     return False
-                conn.execute(
-                    "UPDATE print_history SET preview_url=? WHERE id=?",
-                    (preview_url, row["id"]),
-                )
+                if self._printer_index is None:
+                    conn.execute(
+                        "UPDATE print_history SET preview_url=? WHERE id=?",
+                        (preview_url, row["id"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE print_history SET preview_url=?, printer_index=COALESCE(printer_index, ?) WHERE id=?",
+                        (preview_url, self._printer_index, row["id"]),
+                    )
                 conn.commit()
                 return True
 
@@ -464,11 +647,33 @@ class PrintHistory:
         placeholders = ",".join("?" for _ in ids)
         with self._lock:
             with self._connect() as conn:
+                archive_relpaths = [
+                    row[0]
+                    for row in conn.execute(
+                        f"SELECT DISTINCT archive_relpath FROM print_history "
+                        f"WHERE id IN ({placeholders}) AND archive_relpath IS NOT NULL AND archive_relpath != ''",
+                        tuple(ids),
+                    ).fetchall()
+                    if row[0]
+                ]
                 cursor = conn.execute(
                     f"DELETE FROM print_history WHERE id IN ({placeholders})",
                     tuple(ids),
                 )
                 deleted = cursor.rowcount or 0
+                if archive_relpaths:
+                    still_referenced = {
+                        row[0]
+                        for row in conn.execute(
+                            "SELECT DISTINCT archive_relpath FROM print_history "
+                            f"WHERE archive_relpath IN ({','.join('?' for _ in archive_relpaths)})",
+                            tuple(archive_relpaths),
+                        ).fetchall()
+                        if row[0]
+                    }
+                    self._delete_archive_relpaths(
+                        [relpath for relpath in archive_relpaths if relpath not in still_referenced]
+                    )
                 self._delete_unreferenced_archives(conn)
                 conn.commit()
                 if deleted:

@@ -13,12 +13,16 @@ import threading
 import time
 from datetime import datetime
 
+import web.camera
+import web.timelapse_settings
+
 
 _DEFAULT_INTERVAL_SEC = 30
 _DEFAULT_MAX_VIDEOS = 10
 _SNAPSHOT_TIMEOUT = 10
 _RESUME_WINDOW_SEC = 60 * 60  # 60 minutes
 _IN_PROGRESS_SUBDIR = "in_progress"
+_SNAPSHOT_ARCHIVE_SUBDIR = "snapshots"
 _MAX_ORPHAN_AGE_SEC = 24 * 3600  # 24 hours
 _RECOVERY_REQUEST_COOLDOWN_SEC = 8.0
 _RECOVERY_WAIT_SEC = 4.0
@@ -39,8 +43,9 @@ def _resolve_ffmpeg_path():
 class TimelapseService:
     """Captures periodic snapshots during a print and assembles a timelapse video."""
 
-    def __init__(self, config_manager, captures_dir=None):
+    def __init__(self, config_manager, captures_dir=None, printer_index=None):
         self._config_manager = config_manager
+        self._printer_index = 0 if printer_index is None else int(printer_index)
         default_captures = os.path.join(str(config_manager.config_root), "captures")
         self._captures_dir = captures_dir or os.getenv("TIMELAPSE_CAPTURES_DIR", default_captures)
         os.makedirs(self._captures_dir, exist_ok=True)
@@ -52,9 +57,12 @@ class TimelapseService:
         self._current_filename = None
         self._frame_count = 0
         self._capture_pause_reason = None
+        self._automatic_pause_reason = None
+        self._manual_pause_requested = False
         self._last_recovery_request_at = 0.0
         self._recovery_active = False
         self._recovery_reason = None
+        self._capture_camera = None
 
         # Set defaults to ensure attributes exist even if config is None
         self._enabled = False
@@ -63,9 +71,9 @@ class TimelapseService:
         self._save_persistent = True
         self._light_mode = None  # None | "session" | "snapshot"
 
-        # Track whether timelapse enabled video/light so we can restore afterwards
+        # Track whether timelapse currently holds the printer-video session.
         self._video_enabled_by_timelapse = False
-        self._enable_generation = None  # VideoQueue generation when WE enabled video
+        self._enable_generation = None
         self._light_was_on = None  # original light state before timelapse touched it
 
         # Resume-window state: hold completed capture state while waiting to see
@@ -89,10 +97,10 @@ class TimelapseService:
             with config.open() as cfg:
                 config = cfg
 
-        if not config or not getattr(config, 'timelapse', None):
+        if not config:
             return
 
-        cfg = config.timelapse
+        cfg = web.timelapse_settings.resolve_timelapse_settings(config, self._printer_index)
         self._enabled = cfg.get("enabled", False)
         self._interval = max(1, int(cfg.get("interval", _DEFAULT_INTERVAL_SEC)))
         self._max_videos = int(cfg.get("max_videos", _DEFAULT_MAX_VIDEOS))
@@ -114,11 +122,14 @@ class TimelapseService:
     def get_runtime_state(self):
         with self._lock:
             capture_thread = self._capture_thread
+            pause_reason = self._combined_pause_reason_locked()
             return {
                 "enabled": self._enabled,
                 "capturing": bool(capture_thread and capture_thread.is_alive()),
-                "paused": self._capture_pause_reason is not None,
-                "pause_reason": self._capture_pause_reason,
+                "active_capture": bool(self._current_dir or self._resume_dir or (capture_thread and capture_thread.is_alive())),
+                "paused": pause_reason is not None,
+                "pause_reason": pause_reason,
+                "manual_paused": self._manual_pause_requested,
                 "recovering": self._recovery_active,
                 "recovery_reason": self._recovery_reason,
                 "resume_available": bool(self._resume_dir),
@@ -128,13 +139,42 @@ class TimelapseService:
             }
 
     def _runtime_detail(self):
+        pause_reason = self._combined_pause_reason_locked()
         if self._recovery_active:
             return "Recovering video stream..."
-        if self._capture_pause_reason == "filament_runout":
+        if pause_reason == "filament_runout":
             return "Paused for filament runout."
-        if self._capture_pause_reason == "filament_change":
+        if pause_reason == "filament_change":
             return "Paused for filament change."
+        if pause_reason == "manual":
+            return "Paused manually."
         return None
+
+    def _combined_pause_reason_locked(self):
+        if self._automatic_pause_reason:
+            return self._automatic_pause_reason
+        if self._manual_pause_requested:
+            return "manual"
+        return None
+
+    def _apply_pause_state_locked(self, *, automatic_reason=None, manual_pause=None):
+        previous = self._combined_pause_reason_locked()
+        if automatic_reason is not None:
+            self._automatic_pause_reason = automatic_reason
+        if manual_pause is not None:
+            self._manual_pause_requested = bool(manual_pause)
+        current = self._combined_pause_reason_locked()
+        self._capture_pause_reason = current
+        return previous, current
+
+    @staticmethod
+    def _log_pause_state_change(previous, current):
+        if previous == current:
+            return
+        if current:
+            log.info(f"Timelapse: capture paused ({current})")
+        else:
+            log.info("Timelapse: capture resumed")
 
     def _set_recovery_state(self, active, reason=None):
         recovery_reason = str(reason or "").strip() or None
@@ -155,37 +195,47 @@ class TimelapseService:
             log.info("Timelapse: recovery cleared")
 
     def set_capture_paused(self, paused, reason=None):
-        pause_reason = str(reason or "paused").strip() if paused else None
         with self._lock:
-            if self._capture_pause_reason == pause_reason:
-                return
-            self._capture_pause_reason = pause_reason
-        if pause_reason:
-            log.info(f"Timelapse: capture paused ({pause_reason})")
-        else:
-            log.info("Timelapse: capture resumed")
+            previous = self._combined_pause_reason_locked()
+            self._automatic_pause_reason = str(reason or "paused").strip() if paused else None
+            current = self._combined_pause_reason_locked()
+            self._capture_pause_reason = current
+        self._log_pause_state_change(previous, current)
+
+    def set_manual_pause(self, paused):
+        with self._lock:
+            previous, current = self._apply_pause_state_locked(manual_pause=paused)
+        self._log_pause_state_change(previous, current)
 
     def is_capture_paused(self):
         with self._lock:
-            return self._capture_pause_reason is not None
+            return self._combined_pause_reason_locked() is not None
+
+    def has_active_capture(self):
+        with self._lock:
+            return bool(
+                self._current_dir
+                or self._resume_dir
+                or (self._capture_thread and self._capture_thread.is_alive())
+            )
 
     def _enable_video_for_timelapse(self):
         """Start video streaming for timelapse capture if not already active."""
+        import web
         from web import app
         from web.lib.service import RunState, ServiceStoppedError
 
-        vq = app.svc.svcs.get("videoqueue")
+        vq = web.get_video_service(self._printer_index)
         if not vq:
             log.warning("Timelapse: videoqueue service not available, snapshots will be skipped")
             return
 
-        was_enabled = vq.video_enabled
-        self._video_enabled_by_timelapse = not was_enabled
+        self._video_enabled_by_timelapse = True
+        self._enable_generation = getattr(vq, "_enable_generation", None)
 
-        if not was_enabled:
-            log.info("Timelapse: enabling video streaming for capture")
-            vq.set_video_enabled(True)
-            self._enable_generation = vq._enable_generation
+        if not getattr(vq, "owns_video_for_timelapse", lambda: False)():
+            log.info("Timelapse: acquiring video streaming for capture")
+        vq.set_timelapse_enabled(True)
 
         # If service is Running but PPPP not connected (was started with video_enabled=False),
         # stop and restart so worker_start() runs with video_enabled=True.
@@ -211,10 +261,15 @@ class TimelapseService:
                 log.info("Timelapse: turning on light for capture session")
                 vq.api_light_state(True)
 
+    def _resolve_capture_camera(self):
+        with self._config_manager.open() as cfg:
+            return web.camera.resolve_camera_settings(cfg, printer_index=self._printer_index)
+
     def _disable_video_for_timelapse(self):
         """Disable video streaming if timelapse enabled it."""
-        from web import app
-        vq = app.svc.svcs.get("videoqueue")
+        import web
+
+        vq = web.get_video_service(self._printer_index)
 
         if self._light_mode == "session" and vq and self._light_was_on is not True:
             restore = self._light_was_on if self._light_was_on is not None else False
@@ -225,19 +280,16 @@ class TimelapseService:
         if not self._video_enabled_by_timelapse:
             return
         if vq:
-            if (self._enable_generation is not None
-                    and vq._enable_generation != self._enable_generation):
-                log.info("Timelapse: video was re-enabled by user during capture, leaving it on")
-            else:
-                log.info("Timelapse: disabling video streaming after capture")
-                vq.set_video_enabled(False)
+            log.info("Timelapse: releasing video streaming after capture")
+            vq.set_timelapse_enabled(False)
         self._video_enabled_by_timelapse = False
         self._enable_generation = None
 
     def _await_video_frame(self, timeout=2.5, max_age=1.5):
         """Wait until a recent video frame has been received from the camera."""
-        from web import app
-        vq = app.svc.svcs.get("videoqueue")
+        import web
+
+        vq = web.get_video_service(self._printer_index)
         if not vq or not hasattr(vq, "last_frame_at"):
             self._set_recovery_state(False)
             return True
@@ -275,9 +327,9 @@ class TimelapseService:
         return (now - last_frame) <= max_age
 
     def _request_video_recovery(self, reason, force_pppp_recycle=False):
-        from web import app
+        import web
 
-        vq = app.svc.svcs.get("videoqueue")
+        vq = web.get_video_service(self._printer_index)
         if not vq:
             return False
 
@@ -335,6 +387,8 @@ class TimelapseService:
 
             log.info(f"Timelapse: discarded pending capture for '{self._resume_filename}'")
             self._cancel_pending_resume()
+            self._automatic_pause_reason = None
+            self._manual_pause_requested = False
             self._capture_pause_reason = None
             self._recovery_active = False
             self._recovery_reason = None
@@ -375,12 +429,12 @@ class TimelapseService:
 
             # Assemble outside the lock (ffmpeg can take a while)
             # Pass locals directly — avoids writing to self outside the lock
-            if saved_frame_count >= 2:
-                self._assemble_video_from(saved_dir, saved_filename, saved_frame_count, suffix=suffix)
-                self._prune_old_videos()
-            else:
-                log.info("Timelapse: not enough frames after resume window, skipping assembly")
-            self._cleanup_dir(saved_dir)
+            self._finalize_capture_dir(
+                saved_dir,
+                saved_filename,
+                saved_frame_count,
+                suffix=suffix,
+            )
 
         timer = threading.Timer(_RESUME_WINDOW_SEC, _finalize)
         timer.daemon = True
@@ -404,21 +458,61 @@ class TimelapseService:
             return
 
         with self._lock:
-            self._stop_capture_thread()
-            self._capture_pause_reason = None
-            self._last_recovery_request_at = 0.0
-            self._recovery_active = False
-            self._recovery_reason = None
+            self._capture_camera = self._resolve_capture_camera()
+            if not self._capture_camera.get("effective_source"):
+                log.warning(
+                    "Timelapse: skipping capture because no camera source is ready for this printer"
+                )
+                return
+
+            active_same_capture = (
+                self._current_dir is not None
+                and self._current_filename == filename
+                and filename
+                and filename != "unknown"
+            )
+            capture_thread_alive = bool(self._capture_thread and self._capture_thread.is_alive())
+
+            if active_same_capture:
+                self._automatic_pause_reason = None
+                self._manual_pause_requested = False
+                self._capture_pause_reason = None
+                self._last_recovery_request_at = 0.0
+                self._recovery_active = False
+                self._recovery_reason = None
+                if self._capture_camera.get("effective_source") == web.camera.CAMERA_SOURCE_PRINTER:
+                    self._enable_video_for_timelapse()
+                if capture_thread_alive:
+                    log.info(
+                        f"Timelapse: capture already active for '{filename}', "
+                        f"keeping existing session ({self._frame_count} frames)"
+                    )
+                    return
+                log.info(
+                    f"Timelapse: restarting capture thread for '{filename}' "
+                    f"({self._frame_count} existing frames)"
+                )
+            else:
+                self._stop_capture_thread()
+                self._automatic_pause_reason = None
+                self._manual_pause_requested = False
+                self._capture_pause_reason = None
+                self._last_recovery_request_at = 0.0
+                self._recovery_active = False
+                self._recovery_reason = None
 
             # Check if we can seamlessly resume a previous capture of the same print
             can_resume = (
-                self._resume_dir is not None
+                not active_same_capture
+                and self._resume_dir is not None
                 and self._resume_filename == filename
                 and filename
                 and filename != "unknown"
             )
 
-            if can_resume:
+            if active_same_capture:
+                pass
+            elif can_resume:
                 log.info(
                     f"Timelapse: resuming capture for '{filename}' "
                     f"({self._resume_frame_count} existing frames)"
@@ -430,11 +524,13 @@ class TimelapseService:
                 self._resume_dir = None
                 self._resume_filename = None
                 self._resume_frame_count = 0
-                self._enable_video_for_timelapse()
+                if self._capture_camera.get("effective_source") == web.camera.CAMERA_SOURCE_PRINTER:
+                    self._enable_video_for_timelapse()
             else:
                 # New capture or different file — discard any pending resume
                 self._cancel_pending_resume()
-                self._enable_video_for_timelapse()
+                if self._capture_camera.get("effective_source") == web.camera.CAMERA_SOURCE_PRINTER:
+                    self._enable_video_for_timelapse()
                 self._current_filename = filename
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in filename)
@@ -451,7 +547,11 @@ class TimelapseService:
                 name="timelapse-capture",
             )
             self._capture_thread.start()
-            log.info(f"Timelapse: started capture for '{filename}' (interval={self._interval}s)")
+            camera_source = self._capture_camera.get("effective_source") or "none"
+            log.info(
+                f"Timelapse: started capture for '{filename}' "
+                f"(interval={self._interval}s, source={camera_source})"
+            )
 
     def finish_capture(self, final=False):
         """Stop capture and assemble video.
@@ -470,12 +570,15 @@ class TimelapseService:
         assemble_frame_count = 0
         with self._lock:
             self._stop_capture_thread()
+            self._automatic_pause_reason = None
+            self._manual_pause_requested = False
             self._capture_pause_reason = None
             self._recovery_active = False
             self._recovery_reason = None
             if not self._current_dir:
                 if not self._resume_dir:
                     self._disable_video_for_timelapse()
+                    self._capture_camera = None
                 return
             if final:
                 self._cancel_pending_resume()
@@ -493,8 +596,9 @@ class TimelapseService:
                 self._current_filename = None
                 self._frame_count = 0
             self._disable_video_for_timelapse()
+            self._capture_camera = None
         if final and assemble_dir:
-            if assemble_frame_count >= 2:
+            if assemble_frame_count > 0:
                 t = threading.Thread(
                     target=self._finalize_now,
                     args=(assemble_dir, assemble_filename, assemble_frame_count),
@@ -503,16 +607,12 @@ class TimelapseService:
                 )
                 t.start()
             else:
-                log.info("Timelapse: not enough frames, skipping assembly")
+                log.info("Timelapse: no frames captured, skipping finalization")
                 self._cleanup_dir(assemble_dir)
 
     def _finalize_now(self, dir_path, filename, frame_count):
         """Assemble video immediately (runs in dedicated background thread)."""
-        try:
-            self._assemble_video_from(dir_path, filename, frame_count)
-            self._prune_old_videos()
-        finally:
-            self._cleanup_dir(dir_path)
+        self._finalize_capture_dir(dir_path, filename, frame_count)
 
     def fail_capture(self):
         """Stop capture on failure — assemble partial timelapse if frames exist."""
@@ -523,12 +623,17 @@ class TimelapseService:
         assemble_frame_count = 0
         with self._lock:
             self._stop_capture_thread()
+            self._automatic_pause_reason = None
+            self._manual_pause_requested = False
             self._capture_pause_reason = None
             self._recovery_active = False
             self._recovery_reason = None
             self._cancel_pending_resume()
-            if self._current_dir and self._frame_count >= 2:
-                log.info("Timelapse: print failed, assembling partial timelapse")
+            if self._current_dir and self._frame_count > 0:
+                if self._frame_count >= 2:
+                    log.info("Timelapse: print failed, assembling partial timelapse")
+                else:
+                    log.info("Timelapse: print failed, preserving captured snapshot")
                 assemble_dir = self._current_dir
                 assemble_filename = self._current_filename
                 assemble_frame_count = self._frame_count
@@ -538,13 +643,15 @@ class TimelapseService:
             else:
                 self._cleanup_temp()
             self._disable_video_for_timelapse()
+            self._capture_camera = None
         # Assemble outside the lock — ffmpeg can take up to 120 s
         if assemble_dir:
-            try:
-                self._assemble_video_from(assemble_dir, assemble_filename, assemble_frame_count, suffix="_partial")
-                self._prune_old_videos()
-            finally:
-                self._cleanup_dir(assemble_dir)
+            self._finalize_capture_dir(
+                assemble_dir,
+                assemble_filename,
+                assemble_frame_count,
+                suffix="_partial",
+            )
 
     def _stop_capture_thread(self):
         if self._capture_thread and self._capture_thread.is_alive():
@@ -572,26 +679,31 @@ class TimelapseService:
 
     def _take_snapshot(self):
         """Capture a single frame using ffmpeg."""
+        import web
         from web import app  # Lazy import to avoid circular deps
         ffmpeg_path = _resolve_ffmpeg_path()
         if not ffmpeg_path:
             log.warning("Timelapse: ffmpeg not available, skipping snapshot")
             return
 
+        camera_settings = self._capture_camera or self._resolve_capture_camera()
+        effective_source = camera_settings.get("effective_source")
+        if not effective_source:
+            log.warning("Timelapse: no camera source is configured for this printer")
+            return
+
         host = os.getenv("FLASK_HOST") or "127.0.0.1"
         if host in {"0.0.0.0", "::"}:
             host = "127.0.0.1"
         port = os.getenv("FLASK_PORT") or "4470"
-        url = f"http://{host}:{port}/video?for_timelapse=1"
-        # Pass API key as query parameter so /video auth is satisfied when a
-        # key is configured.  The URL is loopback-only and never exposed to clients.
         api_key = app.config.get("api_key")
-        if api_key:
-            from urllib.parse import quote
-            url += f"&apikey={quote(api_key, safe='')}"
 
         # Per-snapshot light control: turn on, wait for camera to adjust, then shoot
-        vq = app.svc.svcs.get("videoqueue") if self._light_mode == "snapshot" else None
+        vq = (
+            web.get_video_service(self._printer_index)
+            if self._light_mode == "snapshot" and effective_source == web.camera.CAMERA_SOURCE_PRINTER
+            else None
+        )
         snap_original_light = None
         if vq:
             snap_original_light = getattr(vq, "saved_light_state", None)
@@ -602,49 +714,30 @@ class TimelapseService:
 
         frame_path = os.path.join(self._current_dir, f"frame_{self._frame_count:05d}.jpg")
         try:
-            if not self._await_video_frame():
+            if effective_source == web.camera.CAMERA_SOURCE_PRINTER and not self._await_video_frame():
                 log.debug("Timelapse: no recent video frame, skipping snapshot")
                 return
 
-            result = subprocess.run(
-                [
-                    ffmpeg_path, "-loglevel", "error", "-nostdin", "-y",
-                    "-f", "h264", "-i", url,
-                    "-frames:v", "1",
-                    frame_path,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+            web.camera.capture_camera_snapshot_to_file(
+                camera_settings,
+                ffmpeg_path,
+                frame_path,
+                host=host,
+                port=port,
+                api_key=api_key,
                 timeout=_SNAPSHOT_TIMEOUT,
+                for_timelapse=(effective_source == web.camera.CAMERA_SOURCE_PRINTER),
             )
-            if result.returncode != 0:
-                # Retry without format hint
-                result = subprocess.run(
-                    [
-                        ffmpeg_path, "-loglevel", "error", "-nostdin", "-y",
-                        "-i", url,
-                        "-frames:v", "1",
-                        frame_path,
-                    ],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=_SNAPSHOT_TIMEOUT,
-                )
-
-            if result.returncode == 0 and os.path.exists(frame_path) and os.path.getsize(frame_path) > 0:
-                self._set_recovery_state(False)
-                self._frame_count += 1
-                self._write_meta(self._current_dir, self._current_filename, self._frame_count)
-            else:
-                try:
-                    os.remove(frame_path)
-                except OSError:
-                    pass
-                stderr = getattr(result, "stderr", b"").decode(errors="ignore").strip()
-                if stderr:
-                    log.warning(f"Timelapse: snapshot failed: {stderr}")
-                else:
-                    log.warning("Timelapse: snapshot failed")
+            self._set_recovery_state(False)
+            self._frame_count += 1
+            self._write_meta(self._current_dir, self._current_filename, self._frame_count)
+        except web.camera.CameraCaptureError as err:
+            try:
+                os.remove(frame_path)
+            except OSError:
+                pass
+            log.warning(f"Timelapse: snapshot failed: {err}")
+            if effective_source == web.camera.CAMERA_SOURCE_PRINTER:
                 self._request_video_recovery("timelapse snapshot failed to decode live stream")
         except subprocess.TimeoutExpired:
             try:
@@ -652,10 +745,11 @@ class TimelapseService:
             except OSError:
                 pass
             log.warning("Timelapse: snapshot timed out waiting for a camera frame")
-            self._request_video_recovery(
-                "timelapse snapshot timed out waiting for a camera frame",
-                force_pppp_recycle=True,
-            )
+            if effective_source == web.camera.CAMERA_SOURCE_PRINTER:
+                self._request_video_recovery(
+                    "timelapse snapshot timed out waiting for a camera frame",
+                    force_pppp_recycle=True,
+                )
         except OSError as err:
             try:
                 os.remove(frame_path)
@@ -676,11 +770,52 @@ class TimelapseService:
         os.makedirs(path, exist_ok=True)
         return path
 
-    def _write_meta(self, dir_path, filename, frame_count):
+    def _snapshot_archive_base(self):
+        """Return (and create) the persistent archived snapshots directory."""
+        path = os.path.join(self._captures_dir, _SNAPSHOT_ARCHIVE_SUBDIR)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _snapshot_source_label(camera_settings):
+        effective_source = (camera_settings or {}).get("effective_source")
+        if effective_source == web.camera.CAMERA_SOURCE_PRINTER:
+            return "Printer camera"
+        if effective_source == web.camera.CAMERA_SOURCE_EXTERNAL:
+            external = (camera_settings or {}).get("external") or {}
+            external_name = str(external.get("name") or "").strip()
+            if external_name:
+                return f"External camera ({external_name})"
+            return "External camera"
+        return "Camera"
+
+    @staticmethod
+    def _snapshot_frame_names(dir_path):
+        if not dir_path or not os.path.isdir(dir_path):
+            return []
+        return sorted(
+            filename for filename in os.listdir(dir_path)
+            if os.path.isfile(os.path.join(dir_path, filename))
+            and filename.lower().endswith(".jpg")
+        )
+
+    @staticmethod
+    def _safe_path_component(value):
+        value = os.path.basename(str(value or "")).strip()
+        if not value or value in {".", ".."}:
+            return None
+        return value
+
+    def _write_meta(self, dir_path, filename, frame_count, **extra):
         """Write a small JSON sidecar so state survives container restarts."""
         try:
+            payload = self._read_meta(dir_path) or {}
+            payload.update({"filename": filename, "frame_count": frame_count})
+            for key, value in extra.items():
+                if value is not None:
+                    payload[key] = value
             with open(os.path.join(dir_path, ".meta"), "w") as f:
-                json.dump({"filename": filename, "frame_count": frame_count}, f)
+                json.dump(payload, f)
         except OSError as err:
             log.warning(f"Timelapse: could not write .meta: {err}")
 
@@ -691,6 +826,177 @@ class TimelapseService:
                 return json.load(f)
         except (OSError, ValueError):
             return None
+
+    def _resolve_snapshot_collection_dir(self, collection_id):
+        safe_collection = self._safe_path_component(collection_id)
+        if not safe_collection:
+            return None, None
+        for root, read_only in (
+            (self._snapshot_archive_base(), False),
+            (self._in_progress_base(), True),
+        ):
+            path = os.path.join(root, safe_collection)
+            if os.path.isdir(path):
+                return path, read_only
+        return None, None
+
+    def _snapshot_collection_record(self, dir_path, *, state="archived", allow_delete=True):
+        if not dir_path or not os.path.isdir(dir_path):
+            return None
+
+        meta = self._read_meta(dir_path) or {}
+        record_state = state
+        meta_state = str(meta.get("status") or "").strip().lower()
+        if state == "archived" and meta_state in {"archived", "manual"}:
+            record_state = meta_state
+
+        frames = self._snapshot_frame_names(dir_path)
+        if not frames:
+            return None
+
+        try:
+            dir_stat = os.stat(dir_path)
+        except OSError:
+            return None
+
+        frame_items = []
+        for frame_name in frames:
+            frame_path = os.path.join(dir_path, frame_name)
+            try:
+                stat = os.stat(frame_path)
+            except OSError:
+                continue
+            frame_items.append({
+                "filename": frame_name,
+                "size_bytes": stat.st_size,
+                "created_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            })
+        if not frame_items:
+            return None
+
+        return {
+            "id": os.path.basename(dir_path),
+            "label": meta.get("filename") or os.path.basename(dir_path),
+            "video_filename": meta.get("video_filename"),
+            "frame_count": len(frame_items),
+            "created_at": meta.get("archived_at") or datetime.fromtimestamp(dir_stat.st_mtime).isoformat(),
+            "state": record_state,
+            "source_label": meta.get("source_label"),
+            "allow_delete": bool(allow_delete),
+            "frames": frame_items,
+        }
+
+    def _archive_snapshot_frames(self, dir_path, filename, frame_count, *, video_filename=None):
+        if not self._save_persistent or not dir_path or not os.path.isdir(dir_path) or frame_count <= 0:
+            return False
+
+        if video_filename:
+            collection_id = os.path.splitext(os.path.basename(video_filename))[0]
+        else:
+            safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in (filename or "print"))
+            collection_id = f"{safe_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+        archive_dir = os.path.join(self._snapshot_archive_base(), collection_id)
+        try:
+            if os.path.isdir(archive_dir):
+                shutil.rmtree(archive_dir, ignore_errors=True)
+            shutil.move(dir_path, archive_dir)
+            self._write_meta(
+                archive_dir,
+                filename,
+                frame_count,
+                video_filename=video_filename,
+                archived_at=datetime.now().isoformat(),
+                status="archived",
+            )
+            log.info(
+                f"Timelapse: archived {frame_count} snapshot(s) for '{filename}'"
+                + (f" with video {video_filename}" if video_filename else "")
+            )
+            return True
+        except OSError as err:
+            log.warning(f"Timelapse: could not archive snapshots: {err}")
+            return False
+
+    def _prune_old_snapshot_collections(self):
+        """Remove oldest archived snapshot collections if over max count."""
+        if self._max_videos <= 0:
+            return
+        try:
+            base = self._snapshot_archive_base()
+            collections = sorted(
+                (
+                    os.path.join(base, name)
+                    for name in os.listdir(base)
+                    if os.path.isdir(os.path.join(base, name))
+                ),
+                key=os.path.getmtime,
+            )
+            while len(collections) > self._max_videos:
+                oldest = collections.pop(0)
+                shutil.rmtree(oldest, ignore_errors=True)
+                log.info(f"Timelapse: pruned old snapshot collection {os.path.basename(oldest)}")
+        except OSError as err:
+            log.warning(f"Timelapse: snapshot prune failed: {err}")
+
+    def save_manual_snapshot(self, source_path, *, camera_settings=None, taken_at=None):
+        """Persist a manually captured snapshot so it appears in the Snapshots tab."""
+        if not source_path or not os.path.isfile(source_path):
+            raise FileNotFoundError("Manual snapshot source file not found")
+
+        taken_at = taken_at or datetime.now()
+        safe_timestamp = taken_at.strftime("%Y%m%d_%H%M%S")
+        collection_id = f"manual_snapshot_{taken_at.strftime('%Y%m%d_%H%M%S_%f')}"
+        archive_dir = os.path.join(self._snapshot_archive_base(), collection_id)
+        frame_name = f"ankerctl_snapshot_{safe_timestamp}.jpg"
+        archive_path = os.path.join(archive_dir, frame_name)
+        source_label = self._snapshot_source_label(camera_settings)
+        display_label = f"Manual snapshot {taken_at.strftime('%Y-%m-%d %H:%M:%S')}"
+
+        try:
+            os.makedirs(archive_dir, exist_ok=True)
+            shutil.copy2(source_path, archive_path)
+            self._write_meta(
+                archive_dir,
+                display_label,
+                1,
+                archived_at=taken_at.isoformat(),
+                status="manual",
+                source_label=source_label,
+            )
+            self._prune_old_snapshot_collections()
+            log.info(f"Timelapse: saved manual snapshot ({source_label}) as {collection_id}")
+            return {
+                "collection_id": collection_id,
+                "filename": frame_name,
+                "label": display_label,
+                "source_label": source_label,
+            }
+        except OSError as err:
+            log.warning(f"Timelapse: could not save manual snapshot: {err}")
+            shutil.rmtree(archive_dir, ignore_errors=True)
+            raise
+
+    def _finalize_capture_dir(self, dir_path, filename, frame_count, *, suffix=""):
+        """Assemble a video when possible and archive the captured JPG frames."""
+        video_filename = None
+        if frame_count >= 2:
+            video_filename = self._assemble_video_from(dir_path, filename, frame_count, suffix=suffix)
+            self._prune_old_videos()
+        else:
+            log.info("Timelapse: not enough frames for video assembly, keeping snapshots only")
+
+        archived = self._archive_snapshot_frames(
+            dir_path,
+            filename,
+            frame_count,
+            video_filename=video_filename,
+        )
+        if archived:
+            self._prune_old_snapshot_collections()
+        else:
+            self._cleanup_dir(dir_path)
+        return video_filename
 
     def _scan_in_progress_captures(self):
         """On startup, detect persisted in-progress frame directories.
@@ -726,11 +1032,8 @@ class TimelapseService:
 
         # Assemble/delete all but the youngest (shouldn't normally happen)
         for age, dir_path, filename, frame_count in candidates[1:]:
-            if frame_count >= 2:
-                log.info(f"Timelapse: recovering orphaned capture '{filename}' ({frame_count} frames)")
-                self._assemble_video_from(dir_path, filename, frame_count, suffix="_recovered")
-                self._prune_old_videos()
-            shutil.rmtree(dir_path, ignore_errors=True)
+            log.info(f"Timelapse: recovering orphaned capture '{filename}' ({frame_count} frames)")
+            self._finalize_capture_dir(dir_path, filename, frame_count, suffix="_recovered")
 
         # Handle the youngest candidate
         if youngest_age <= _MAX_ORPHAN_AGE_SEC:
@@ -746,11 +1049,11 @@ class TimelapseService:
             # Schedule finalize so orphaned frames are eventually assembled
             self._schedule_finalize(youngest_dir, youngest_filename, youngest_frames)
         else:
-            if youngest_frames >= 2:
-                log.info(f"Timelapse: assembling stale capture '{youngest_filename}' ({youngest_frames} frames, {youngest_age / 3600:.1f}h old)")
-                self._assemble_video_from(youngest_dir, youngest_filename, youngest_frames, suffix="_recovered")
-                self._prune_old_videos()
-            shutil.rmtree(youngest_dir, ignore_errors=True)
+            log.info(
+                f"Timelapse: assembling stale capture '{youngest_filename}' "
+                f"({youngest_frames} frames, {youngest_age / 3600:.1f}h old)"
+            )
+            self._finalize_capture_dir(youngest_dir, youngest_filename, youngest_frames, suffix="_recovered")
 
     def _assemble_video(self, suffix=""):
         """Assemble current capture into an MP4 video."""
@@ -760,7 +1063,7 @@ class TimelapseService:
         """Assemble frames from dir_path into an MP4 video (no self state read)."""
         if not self._save_persistent:
             log.info("Timelapse: persistent save disabled, skipping assembly")
-            return
+            return None
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in (filename or "print"))
@@ -774,7 +1077,7 @@ class TimelapseService:
         ffmpeg_path = _resolve_ffmpeg_path()
         if not ffmpeg_path:
             log.warning("Timelapse: ffmpeg not available, skipping assembly")
-            return
+            return None
 
         try:
             result = subprocess.run(
@@ -793,11 +1096,13 @@ class TimelapseService:
             if result.returncode == 0 and os.path.exists(output_path):
                 size_mb = os.path.getsize(output_path) / (1024 * 1024)
                 log.info(f"Timelapse: assembled {output_name} ({frame_count} frames, {size_mb:.1f}MB)")
+                return output_name
             else:
                 stderr = result.stderr.decode(errors="ignore").strip()
                 log.warning(f"Timelapse: assembly failed: {stderr}")
         except (subprocess.TimeoutExpired, OSError) as err:
             log.warning(f"Timelapse: assembly failed: {err}")
+        return None
 
     def _cleanup_temp(self):
         """Remove current capture's temporary frame directory."""
@@ -848,6 +1153,57 @@ class TimelapseService:
             pass
         return videos
 
+    def list_snapshots(self):
+        """Return snapshot collections and their JPG frames for the Snapshots tab."""
+        collections = []
+        seen = set()
+
+        with self._lock:
+            in_progress = [
+                ("capturing", self._current_dir, False),
+                ("resume_pending", self._resume_dir, False),
+            ]
+
+        for state, dir_path, allow_delete in in_progress:
+            if not dir_path or not os.path.isdir(dir_path):
+                continue
+            collection_id = os.path.basename(dir_path)
+            if collection_id in seen:
+                continue
+            record = self._snapshot_collection_record(
+                dir_path,
+                state=state,
+                allow_delete=allow_delete,
+            )
+            if record:
+                collections.append(record)
+                seen.add(collection_id)
+
+        try:
+            archive_base = self._snapshot_archive_base()
+            archived_dirs = sorted(
+                (
+                    os.path.join(archive_base, name)
+                    for name in os.listdir(archive_base)
+                    if os.path.isdir(os.path.join(archive_base, name))
+                ),
+                key=os.path.getmtime,
+                reverse=True,
+            )
+        except OSError:
+            archived_dirs = []
+
+        for dir_path in archived_dirs:
+            collection_id = os.path.basename(dir_path)
+            if collection_id in seen:
+                continue
+            record = self._snapshot_collection_record(dir_path)
+            if record:
+                collections.append(record)
+                seen.add(collection_id)
+
+        return collections
+
     def get_video_path(self, filename):
         """Return full path to a video file, or None if not found."""
         path = os.path.join(self._captures_dir, filename)
@@ -855,11 +1211,130 @@ class TimelapseService:
             return path
         return None
 
+    def get_snapshot_path(self, collection_id, filename):
+        """Return full path to a saved snapshot JPG, or None if not found."""
+        dir_path, _read_only = self._resolve_snapshot_collection_dir(collection_id)
+        safe_filename = self._safe_path_component(filename)
+        if not dir_path or not safe_filename or not safe_filename.lower().endswith(".jpg"):
+            return None
+        path = os.path.join(dir_path, safe_filename)
+        if os.path.isfile(path):
+            return path
+        return None
+
+    def delete_snapshot(self, collection_id, filename):
+        """Delete an archived snapshot JPG."""
+        dir_path, read_only = self._resolve_snapshot_collection_dir(collection_id)
+        if not dir_path:
+            return False
+        if read_only:
+            raise RuntimeError("Cannot delete snapshots from an active or resumable timelapse capture")
+
+        path = self.get_snapshot_path(collection_id, filename)
+        if not path:
+            return False
+
+        os.remove(path)
+        remaining = self._snapshot_frame_names(dir_path)
+        if remaining:
+            meta = self._read_meta(dir_path) or {}
+            self._write_meta(
+                dir_path,
+                meta.get("filename", collection_id),
+                len(remaining),
+            )
+        else:
+            shutil.rmtree(dir_path, ignore_errors=True)
+        log.info(f"Timelapse: deleted snapshot {filename} from {collection_id}")
+        return True
+
+    def delete_snapshot_collection(self, collection_id):
+        """Delete an entire snapshot collection.
+
+        Archived and manual collections are removed immediately.
+        A resumable paused capture may also be discarded here so it does not
+        stay stuck in the Snapshots tab with no cleanup path.
+        Active in-progress captures remain protected.
+        """
+        safe_collection = self._safe_path_component(collection_id)
+        if not safe_collection:
+            return False
+
+        with self._lock:
+            current_collection = (
+                os.path.basename(self._current_dir)
+                if self._current_dir and os.path.isdir(self._current_dir)
+                else None
+            )
+            if current_collection == safe_collection:
+                raise RuntimeError("Cannot delete snapshots from an active timelapse capture")
+
+            resume_collection = (
+                os.path.basename(self._resume_dir)
+                if self._resume_dir and os.path.isdir(self._resume_dir)
+                else None
+            )
+            if resume_collection == safe_collection:
+                log.info(f"Timelapse: discarded paused capture collection {safe_collection}")
+                self._cancel_pending_resume()
+                self._automatic_pause_reason = None
+                self._manual_pause_requested = False
+                self._capture_pause_reason = None
+                self._recovery_active = False
+                self._recovery_reason = None
+                self._disable_video_for_timelapse()
+                return True
+
+        dir_path, read_only = self._resolve_snapshot_collection_dir(safe_collection)
+        if not dir_path:
+            return False
+        if read_only:
+            raise RuntimeError("Cannot delete snapshots from an active timelapse capture")
+
+        shutil.rmtree(dir_path, ignore_errors=True)
+        log.info(f"Timelapse: deleted snapshot collection {safe_collection}")
+        return True
+
+    def _snapshot_collection_dirs_for_video(self, filename):
+        safe_video = self._safe_path_component(filename)
+        if not safe_video:
+            return []
+
+        safe_stem = os.path.splitext(safe_video)[0]
+        matches = []
+        seen = set()
+        try:
+            for name in os.listdir(self._snapshot_archive_base()):
+                dir_path = os.path.join(self._snapshot_archive_base(), name)
+                if not os.path.isdir(dir_path):
+                    continue
+                meta = self._read_meta(dir_path) or {}
+                meta_video = self._safe_path_component(meta.get("video_filename"))
+                if name == safe_stem or meta_video == safe_video:
+                    real_path = os.path.realpath(dir_path)
+                    if real_path in seen:
+                        continue
+                    seen.add(real_path)
+                    matches.append(dir_path)
+        except OSError:
+            return []
+        return matches
+
     def delete_video(self, filename):
         """Delete a timelapse video."""
         path = self.get_video_path(filename)
         if path:
             os.remove(path)
-            log.info(f"Timelapse: deleted {filename}")
+            removed_collections = []
+            for collection_dir in self._snapshot_collection_dirs_for_video(filename):
+                shutil.rmtree(collection_dir, ignore_errors=True)
+                removed_collections.append(os.path.basename(collection_dir))
+            if removed_collections:
+                log.info(
+                    f"Timelapse: deleted {filename} and snapshot collection(s) "
+                    f"{', '.join(removed_collections)}"
+                )
+            else:
+                log.info(f"Timelapse: deleted {filename}")
             return True
         return False

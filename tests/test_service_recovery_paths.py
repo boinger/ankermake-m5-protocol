@@ -12,7 +12,7 @@ from web import app
 from web.lib.service import RunState, ServiceRestartSignal
 from web.service.filetransfer import FileTransferService
 from web.service.pppp import PPPPService, probe_pppp
-from web.service.video import VideoQueue, _STALL_TIMEOUT
+from web.service.video import VideoQueue, _INITIAL_FRAME_TIMEOUT, _STALL_TIMEOUT
 
 
 def _config():
@@ -173,7 +173,11 @@ def test_video_queue_worker_run_detects_disconnect_api_swap_and_stall(monkeypatc
     commands = []
     queue.pppp.api_command = lambda command, data=None: commands.append((command, data))
     queue._live_auth_data = lambda: {"encryptkey": "secret", "accountId": "user-123456"}
-    times = iter([100.0 + _STALL_TIMEOUT + 1, 100.0 + _STALL_TIMEOUT + 1, 100.0 + _STALL_TIMEOUT + 1])
+    times = iter([
+        100.0 + _INITIAL_FRAME_TIMEOUT + 1,
+        100.0 + _INITIAL_FRAME_TIMEOUT + 1,
+        100.0 + _INITIAL_FRAME_TIMEOUT + 1,
+    ])
     monkeypatch.setattr("web.service.video.time.monotonic", lambda: next(times))
     queue.worker_run(timeout=0.1)
 
@@ -181,9 +185,47 @@ def test_video_queue_worker_run_detects_disconnect_api_swap_and_stall(monkeypatc
     assert commands[1][0] == P2PSubCmdType.START_LIVE
 
 
+def test_video_queue_timelapse_only_mode_still_recovers_stalled_video(monkeypatch):
+    queue = object.__new__(VideoQueue)
+    queue.video_enabled = False
+    queue.timelapse_enabled = True
+    queue.wanted = True
+    queue.handlers = []
+    queue.idle = lambda timeout=None: None
+    queue._in_place_recovery = False
+    queue._live_started_at = None
+    queue.last_frame_at = 100.0
+    queue._last_live_refresh_at = 0.0
+    queue._last_no_frame_log_at = 0.0
+    queue._last_start_live_at = 0.0
+    queue._live_active = True
+    queue._stall_retry_count = 0
+    queue._manual_recovery_requested = False
+    queue._manual_recovery_reason = None
+    queue._manual_recovery_force_pppp = False
+    api = object()
+    queue.pppp = SimpleNamespace(connected=True, _api=api)
+    queue.api_id = id(api)
+    recovery_calls = []
+
+    monkeypatch.setattr("web.service.video.time.sleep", lambda seconds: None)
+    monkeypatch.setattr("web.service.video.time.monotonic", lambda: 100.0 + _STALL_TIMEOUT + 1.0)
+    monkeypatch.setattr(
+        queue,
+        "_attempt_stall_recovery",
+        lambda pppp, warn_msg, retry_fail_msg, exhaust_msg: recovery_calls.append((warn_msg, exhaust_msg)),
+    )
+
+    queue.worker_run(timeout=0.1)
+
+    assert len(recovery_calls) == 1
+    assert "No video frames" in recovery_calls[0][0]
+
+
 def test_video_queue_disable_cancels_recovery_with_connected_viewer():
     queue = object.__new__(VideoQueue)
     queue.video_enabled = True
+    queue.timelapse_enabled = False
     queue.wanted = True
     queue.persistent = True
     queue.state = RunState.Running
@@ -227,9 +269,92 @@ def test_video_queue_disable_cancels_recovery_with_connected_viewer():
     assert queue.wanted is False
 
 
+def test_video_queue_disable_live_view_keeps_timelapse_stream_running():
+    queue = object.__new__(VideoQueue)
+    queue.video_enabled = True
+    queue.timelapse_enabled = True
+    queue.wanted = True
+    queue.persistent = True
+    queue.state = RunState.Running
+    queue._viewer_count = 1
+    queue._pending_disable = False
+    queue._live_active = True
+    queue._live_started_at = 100.0
+    queue.last_frame_at = 100.0
+    queue._last_start_live_at = 100.0
+    queue._last_no_frame_log_at = 100.0
+    queue._last_live_refresh_at = 100.0
+    queue._stall_retry_count = 1
+    queue._awaiting_pppp_recycle = False
+    queue._pppp_recycle_requested_at = None
+    stop_calls = []
+
+    queue.stop = lambda: stop_calls.append(True)
+
+    assert queue.set_video_enabled(False) is True
+
+    assert stop_calls == []
+    assert queue.video_enabled is False
+    assert queue.timelapse_enabled is True
+    assert queue.wanted is True
+    assert queue.persistent is True
+    assert queue.last_frame_at == 100.0
+
+
+def test_video_queue_release_timelapse_hold_only_stops_without_other_requesters():
+    queue = object.__new__(VideoQueue)
+    queue.video_enabled = False
+    queue.timelapse_enabled = True
+    queue.wanted = True
+    queue.persistent = True
+    queue.state = RunState.Running
+    queue._viewer_count = 0
+    queue._pending_disable = False
+    queue._live_active = True
+    queue._live_started_at = 100.0
+    queue.last_frame_at = 100.0
+    queue._last_start_live_at = 100.0
+    queue._last_no_frame_log_at = 100.0
+    queue._last_live_refresh_at = 100.0
+    queue._stall_retry_count = 1
+    queue._awaiting_pppp_recycle = False
+    queue._pppp_recycle_requested_at = None
+    stop_calls = []
+
+    def stop():
+        stop_calls.append(True)
+        queue.wanted = False
+
+    queue.stop = stop
+
+    assert queue.set_timelapse_enabled(False) is True
+
+    assert stop_calls == [True]
+    assert queue.timelapse_enabled is False
+    assert queue.wanted is False
+    assert queue.persistent is False
+
+    queue.video_enabled = True
+    queue.timelapse_enabled = True
+    queue.wanted = True
+    queue.persistent = True
+    queue.state = RunState.Running
+    queue.last_frame_at = 200.0
+    stop_calls.clear()
+
+    assert queue.set_timelapse_enabled(False) is True
+
+    assert stop_calls == []
+    assert queue.video_enabled is True
+    assert queue.timelapse_enabled is False
+    assert queue.wanted is True
+    assert queue.persistent is True
+
+
 def test_video_queue_request_live_recovery_sets_worker_flag(monkeypatch):
     queue = object.__new__(VideoQueue)
     queue.video_enabled = True
+    queue.timelapse_enabled = False
     queue.wanted = True
     queue.state = RunState.Running
     queue._manual_recovery_requested = False
@@ -250,6 +375,7 @@ def test_video_queue_request_live_recovery_sets_worker_flag(monkeypatch):
 def test_video_queue_worker_run_honors_manual_recovery_request(monkeypatch):
     queue = object.__new__(VideoQueue)
     queue.video_enabled = True
+    queue.timelapse_enabled = False
     queue.wanted = True
     queue.handlers = []
     queue.idle = lambda timeout=None: None
@@ -310,19 +436,25 @@ def test_pppp_service_api_command_and_connected_property():
     svc = object.__new__(PPPPService)
     with pytest.raises(ConnectionError, match="No pppp connection"):
         svc.api_command(123)
+    svc._api = None
+    with pytest.raises(ConnectionError, match="No pppp connection"):
+        svc.api_command(123)
+    assert svc.connected is False
 
     sent = []
     svc._api = SimpleNamespace(
         state=None,
         send_xzyh=lambda payload, cmd=None, block=None: sent.append((payload, cmd, block)) or "ok",
     )
+    assert svc.connected is False
+    with pytest.raises(ConnectionError, match="No pppp connection"):
+        svc.api_command(7, value=9)
+    svc._api.state = PPPPState.Connected
     result = svc.api_command(7, value=9)
 
     assert result == "ok"
     assert b'"commandType": 7' in sent[0][0]
     assert sent[0][2] is False
-    assert svc.connected is False
-    svc._api.state = 2
     svc._api.state = PPPPState.Connected
     assert svc.connected is True
 

@@ -115,6 +115,7 @@ class AnkerConfigManager(BaseConfigManager):
 
 API_KEY_MIN_LENGTH = 16
 API_KEY_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
+HEX_AUTH_TOKEN_RE = re.compile(r'^[0-9a-f]{47,48}$')
 
 
 def validate_api_key(key):
@@ -212,15 +213,39 @@ def import_config_from_server(config, login_data, insecure):
     # extract account region
     region = logincache.guess_region(login_data["ab_code"])
 
-    try:
-        cfg = load_config_from_api(auth_token, region, insecure)
-    except APIError as err:
-        log.critical(f"Config import failed: {err} "
-                     "(auth token might be expired: try 'ankerctl config login' to refresh)")
-        raise
-    except Exception as err:
-        log.critical(f"Config import failed: {err}")
-        raise
+    candidate_tokens = [auth_token]
+    if isinstance(auth_token, str) and len(auth_token) == 47 and HEX_AUTH_TOKEN_RE.match(auth_token):
+        log.info("Detected a truncated eufyMake Studio session token; validating candidate prefixes..")
+        candidate_tokens.extend(f"{prefix}{auth_token}" for prefix in "0123456789abcdef")
+
+    cfg = None
+    last_error = None
+    recovered_token = None
+    for candidate_token in candidate_tokens:
+        try:
+            cfg = load_config_from_api(candidate_token, region, insecure)
+            recovered_token = candidate_token
+            break
+        except APIError as err:
+            last_error = err
+        except Exception as err:
+            last_error = err
+            if len(candidate_tokens) == 1:
+                log.critical(f"Config import failed: {err}")
+                raise
+
+    if cfg is None:
+        if isinstance(last_error, APIError):
+            log.critical(f"Config import failed: {last_error} "
+                         "(auth token might be expired: try 'ankerctl config login' to refresh)")
+        elif last_error is not None:
+            log.critical(f"Config import failed: {last_error}")
+        raise last_error
+
+    if recovered_token and recovered_token != auth_token:
+        log.info("Recovered full auth token from eufyMake Studio session cache.")
+        auth_token = recovered_token
+        cfg.account.auth_token = recovered_token
 
     # keep any user preferences and printer IPs
     existing = config.load("default", None)

@@ -508,29 +508,48 @@ def http_calc_sec_code(duid, mac):
 
 
 def _find_login_file():
-    """Auto-detect login.json / user_info file from default install locations."""
+    """Auto-detect login cache from default install locations."""
+    import os
+
     useros = platform.system()
 
     darfileloc = path.expanduser('~/Library/Application Support/AnkerMake/AnkerMake_64bit_fp/login.json')
-    winfilelocs = [
-        path.expandvars(r'%APPDATA%\Roaming\eufyMake Studio Profile\cache\offline\user_info'),
+    winfilelocs = []
+
+    leveldb_dir = path.expandvars(r'%LOCALAPPDATA%\eufyMake Studio Profile\EBWebView\Default\Local Storage\leveldb')
+    if path.isdir(leveldb_dir):
+        for name in sorted(os.listdir(leveldb_dir), reverse=True):
+            if name.lower().endswith(('.ldb', '.log')):
+                winfilelocs.append(path.join(leveldb_dir, name))
+
+    winfilelocs.extend([
         path.expandvars(r'%APPDATA%\eufyMake Studio Profile\cache\offline\user_info'),
         path.expandvars(r'%LOCALAPPDATA%\Ankermake\AnkerMake_64bit_fp\login.json'),
         path.expandvars(r'%LOCALAPPDATA%\Ankermake\login.json'),
-    ]
+    ])
 
     try:
         if useros == 'Darwin':
-            return open(darfileloc, 'r')
+            return open(darfileloc, 'rb')
         elif useros == 'Windows':
             for winfileloc in winfilelocs:
                 if path.isfile(winfileloc):
-                    return open(winfileloc, 'r')
+                    try:
+                        with open(winfileloc, 'rb') as probe:
+                            if winfileloc.lower().endswith(('.ldb', '.log')):
+                                if not libflagship.logincache.has_webview_session_marker(probe.read()):
+                                    continue
+                    except OSError:
+                        continue
+                    return open(winfileloc, 'rb')
             raise FileNotFoundError
         else:
             log.critical("This platform does not support autodetection. Please specify file location")
     except FileNotFoundError:
-        log.critical("Failed to import file - check if you are logged into Ankerslicer")
+        log.critical(
+            "Failed to auto-detect slicer login cache. "
+            "Make sure eufyMake Studio is open and signed in, or specify the file manually."
+        )
 
     return None
 
@@ -546,7 +565,7 @@ def config(ctx):
 
 
 @config.command("decode")
-@click.argument("fd", required=False, type=click.File("r"), metavar="path/to/login.json")
+@click.argument("fd", required=False, type=click.File("rb"), metavar="path/to/login.json")
 @pass_env
 def config_decode(env, fd):
     """
@@ -563,14 +582,14 @@ def config_decode(env, fd):
 
 
 @config.command("import")
-@click.argument("fd", required=False, type=click.File("r"), metavar="path/to/login.json")
+@click.argument("fd", required=False, type=click.File("rb"), metavar="path/to/login.json")
 @pass_env
 def config_import(env, fd):
     """
-    Import printer and account information from login.json
+    Import printer and account information from login.json or slicer cache
 
-    When run without filename, attempt to auto-detect login.json in default
-    install location
+    When run without filename, attempt to auto-detect the slicer login cache in
+    the default install location.
     """
 
     if fd is None:
