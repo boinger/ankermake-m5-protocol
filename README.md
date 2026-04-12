@@ -104,19 +104,19 @@ python3 ankerctl.py config import
 **Windows legacy cache example**
 
 ```sh
-python3 ankerctl.py config import "%LOCALAPPDATA%\eufyMake Studio Profile\EBWebView\Default\Local Storage\leveldb\000123.ldb"
+python3 ankerctl.py config import %APPDATA%\Roaming\eufyMake Studio Profile\cache\offline\user_info
 ```
 
 **Windows newer eufyMake Studio LevelDB folder example**
 
 ```sh
-python3 ankerctl.py config import "%LOCALAPPDATA%\eufyMake Studio Profile\EBWebView\Default\Local Storage\leveldb\000123.ldb"
+python3 ankerctl.py config import %LOCALAPPDATA%\eufyMake Studio Profile\EBWebView\Default\Local Storage\leveldb\000123.ldb
 ```
 
 **macOS example**
 
 ```sh
-./ankerctl.py config import "$HOME/Library/Application Support/eufyMake Studio Profile\EBWebView\Default\Local Storage\leveldb\000123.ldb"
+./ankerctl.py config import $HOME/Library/Application Support/eufyMake Studio Profile\EBWebView\Default\Local Storage\leveldb\000123.ldb
 ```
 
 **Linux/Wine example**
