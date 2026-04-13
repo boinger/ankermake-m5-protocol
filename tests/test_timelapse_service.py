@@ -892,6 +892,40 @@ def test_timelapse_service_uses_per_printer_settings_when_present(tmp_path):
     assert svc1._camera_source == "external"
 
 
+def test_timelapse_reload_config_applies_saved_output_dir(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    initial_dir = tmp_path / "captures-initial"
+    updated_dir = tmp_path / "captures-updated"
+    cfg._cfg.timelapse["output_dir"] = str(initial_dir)
+
+    svc = TimelapseService(cfg)
+
+    assert svc._captures_dir == str(initial_dir)
+    assert initial_dir.is_dir()
+
+    cfg._cfg.timelapse["output_dir"] = str(updated_dir)
+    svc.reload_config()
+
+    assert svc._captures_dir == str(updated_dir)
+    assert updated_dir.is_dir()
+
+    (updated_dir / "updated.mp4").write_bytes(b"video")
+    assert svc.get_video_path("updated.mp4") == str(updated_dir / "updated.mp4")
+
+
+def test_timelapse_explicit_captures_dir_overrides_saved_output_dir(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    explicit_dir = tmp_path / "explicit"
+    configured_dir = tmp_path / "configured"
+    cfg._cfg.timelapse["output_dir"] = str(configured_dir)
+
+    svc = TimelapseService(cfg, captures_dir=explicit_dir)
+
+    assert svc._captures_dir == str(explicit_dir)
+    assert explicit_dir.is_dir()
+    assert not configured_dir.exists()
+
+
 def test_timelapse_runtime_state_reports_recovery(tmp_path):
     cfg = FakeConfigManager(tmp_path)
     svc = TimelapseService(cfg, captures_dir=tmp_path)

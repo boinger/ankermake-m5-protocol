@@ -47,7 +47,11 @@ class TimelapseService:
         self._config_manager = config_manager
         self._printer_index = 0 if printer_index is None else int(printer_index)
         default_captures = os.path.join(str(config_manager.config_root), "captures")
-        self._captures_dir = captures_dir or os.getenv("TIMELAPSE_CAPTURES_DIR", default_captures)
+        self._captures_dir_explicit = captures_dir is not None
+        initial_captures_dir = captures_dir or os.getenv("TIMELAPSE_CAPTURES_DIR", default_captures) or default_captures
+        self._captures_dir = self._normalize_captures_dir(
+            initial_captures_dir
+        )
         self._printer_scope = self._resolve_printer_scope()
         os.makedirs(self._captures_dir, exist_ok=True)
 
@@ -87,6 +91,27 @@ class TimelapseService:
 
         self.reload_config()
         self._scan_in_progress_captures()
+
+    @staticmethod
+    def _normalize_captures_dir(path):
+        raw_path = str(path or "").strip()
+        if not raw_path:
+            return None
+        return os.path.abspath(os.path.expanduser(raw_path))
+
+    def _apply_captures_dir(self, path):
+        target = self._normalize_captures_dir(path)
+        if not target:
+            return False
+        try:
+            os.makedirs(target, exist_ok=True)
+        except OSError as err:
+            log.warning(f"Timelapse: could not use output directory {target!r}: {err}")
+            return False
+        if target != self._captures_dir:
+            log.info(f"Timelapse: output directory set to {target}")
+        self._captures_dir = target
+        return True
 
     @staticmethod
     def _safe_scope_component(value):
@@ -131,6 +156,8 @@ class TimelapseService:
         self._interval = max(1, int(cfg.get("interval", _DEFAULT_INTERVAL_SEC)))
         self._max_videos = int(cfg.get("max_videos", _DEFAULT_MAX_VIDEOS))
         self._save_persistent = cfg.get("save_persistent", True)
+        if not self._captures_dir_explicit:
+            self._apply_captures_dir(cfg.get("output_dir"))
         raw_light = cfg.get("light", None)
         if raw_light == "snapshot":
             self._light_mode = "snapshot"
