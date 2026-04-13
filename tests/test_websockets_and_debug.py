@@ -384,7 +384,7 @@ def test_pppp_probe_helper_and_state_websocket_emit_status(monkeypatch):
     assert json.loads(sock.sent[0]) == {"status": "connected", "source": "probe"}
 
 
-def test_pppp_state_websocket_marks_stale_probe_success_dormant(monkeypatch):
+def test_pppp_state_websocket_marks_stale_probe_success_dormant_without_reprobe(monkeypatch):
     with web_module.app.pppp_probe_lock:
         web_module.app.pppp_probe = {
             "result": True,
@@ -430,7 +430,7 @@ def test_pppp_state_websocket_marks_stale_probe_success_dormant(monkeypatch):
             }
 
     assert json.loads(sock.sent[0]) == {"status": "dormant", "source": "none"}
-    assert probe_calls == [("cached probe stale", 0)]
+    assert probe_calls == []
 
 
 def test_pppp_probe_helper_skips_when_services_are_already_recovering(monkeypatch):

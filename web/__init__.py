@@ -1839,13 +1839,14 @@ def pppp_state(sock):
                 )
                 stale_probe_success = probe_result is True and not probe_success_fresh
 
+                # A stale successful probe should only stop cached-green badges; it should not
+                # cause another passive probe by itself or the UI loops while video is off.
                 should_probe = (
                     (
                         mqtt_stale
                         or mqtt_recovered
                         or probe_result is False
                         or pppp_went_dormant
-                        or stale_probe_success
                     )
                     and (now - last_probe_time) > next_interval
                 )
@@ -1853,7 +1854,6 @@ def pppp_state(sock):
                     reason = ("PPPP service stopped" if pppp_went_dormant
                               else "MQTT recovered" if mqtt_recovered
                               else "MQTT stale" if mqtt_stale
-                              else "cached probe stale" if stale_probe_success
                               else "retry after fail")
                     _maybe_start_pppp_probe(reason, printer_index=printer_index)
 
