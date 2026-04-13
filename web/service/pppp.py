@@ -25,10 +25,10 @@ _REPEATED_LOG_NOTICE_COUNT = 5
 def probe_pppp(config, printer_index) -> bool:
     """Try a PPPP LAN connection. Returns True if handshake succeeds, False otherwise.
 
-    Delegates to pppp_resolve_printer_ip(), which internally calls
-    probe_printer_ip() — a full PPPP handshake that already proves
-    reachability.  A successful IP resolution means the printer is
-    online and responding to PPPP on the LAN.
+    This intentionally does not use pppp_resolve_printer_ip(). The normal
+    resolver may fall back to the last saved IP so real connection attempts can
+    still try a known-good address, but a status probe must only report green
+    after the printer responds to a directed probe or LAN discovery.
     """
     try:
         with config.open() as cfg:
@@ -36,8 +36,12 @@ def probe_pppp(config, printer_index) -> bool:
                 return False
             printer = cfg.printers[printer_index]
 
-        ip_addr = cli.pppp.pppp_resolve_printer_ip(config, printer, printer_index)
-        return bool(ip_addr)
+        ip_addr = (printer.ip_addr or "").strip()
+        if ip_addr and cli.pppp.probe_printer_ip(printer, ip_addr):
+            return True
+
+        discovered = cli.pppp.lan_search(config)
+        return any(result.get("duid") == printer.p2p_duid for result in discovered)
     except Exception:
         return False
 

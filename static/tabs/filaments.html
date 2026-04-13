@@ -90,10 +90,10 @@
                                                         <div class="form-check mt-sm-4 pt-sm-2">
                                                             <input class="form-check-input" type="checkbox" id="filament-allow-legacy-swap">
                                                             <label class="form-check-label" for="filament-allow-legacy-swap">
-                                                                Enable legacy automatic unload / purge
+                                                                Enable guided automatic unload / purge
                                                             </label>
                                                         </div>
-                                                        <div class="form-text">Only enable this if you explicitly want the old automated swap behavior.</div>
+                                                        <div class="form-text">This will home, lift Z 50 mm, park at X0 Y230, then move filament automatically.</div>
                                                     </div>
                                                     <div class="col-12 d-flex flex-wrap gap-2 align-items-center">
                                                         <button class="btn btn-outline-secondary btn-sm" id="filament-save-swap-settings-btn">
@@ -116,13 +116,17 @@
                                                 <option value="">Select profile...</option>
                                             </select>
                                         </div>
-                                        <div class="col-sm-6">
-                                            <label for="filament-swap-unload-length" class="form-label">Unload Length (mm)</label>
-                                            <input type="number" class="form-control" id="filament-swap-unload-length" min="1" max="300" step="1" value="40">
+                                        <div class="col-sm-4">
+                                            <label for="filament-swap-prime-length" class="form-label">Prime Length (mm)</label>
+                                            <input type="number" class="form-control" id="filament-swap-prime-length" min="1" max="300" step="1" value="10">
                                         </div>
-                                        <div class="col-sm-6">
+                                        <div class="col-sm-4">
+                                            <label for="filament-swap-unload-length" class="form-label">Unload Retract (mm)</label>
+                                            <input type="number" class="form-control" id="filament-swap-unload-length" min="1" max="300" step="1" value="50">
+                                        </div>
+                                        <div class="col-sm-4">
                                             <label for="filament-swap-load-length" class="form-label">Load / Purge Length (mm)</label>
-                                            <input type="number" class="form-control" id="filament-swap-load-length" min="1" max="300" step="1" value="40">
+                                            <input type="number" class="form-control" id="filament-swap-load-length" min="1" max="300" step="1" value="120">
                                         </div>
                                         <div class="col-12">
                                             <div id="filament-swap-state" class="form-text">No swap in progress.</div>
@@ -132,7 +136,7 @@
                                                 {{ macro.bi_icon("arrow-left-right") }} Start Swap
                                             </button>
                                             <button class="btn btn-outline-success" id="filament-swap-confirm-btn" disabled>
-                                                {{ macro.bi_icon("check2-circle") }} Confirm New Filament Loaded
+                                                {{ macro.bi_icon("check2-circle") }} Continue / Load New Filament
                                             </button>
                                             <button class="btn btn-outline-danger" id="filament-swap-cancel-btn" disabled>
                                                 {{ macro.bi_icon("x-circle") }} Cancel Swap

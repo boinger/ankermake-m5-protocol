@@ -1189,6 +1189,12 @@ $(function () {
      * This class wraps a WebSocket, and makes it automatically reconnect if the
      * connection is lost.
      */
+    function setConnectionBadge(selector, tone) {
+        $(selector)
+            .removeClass("text-bg-success text-bg-danger text-bg-secondary text-bg-warning")
+            .addClass(`text-bg-${tone}`);
+    }
+
     class AutoWebSocket {
         constructor({
             name,
@@ -1218,13 +1224,13 @@ $(function () {
         }
 
         _open() {
-            $(this.badge).removeClass("text-bg-success text-bg-danger text-bg-secondary").addClass("text-bg-warning");
+            setConnectionBadge(this.badge, "warning");
             if (this.open)
                 this.open(this.ws);
         }
 
         _close() {
-            $(this.badge).removeClass("text-bg-warning text-bg-success text-bg-secondary").addClass("text-bg-danger");
+            setConnectionBadge(this.badge, "danger");
             console.log(`${this.name} close`);
             this.is_open = false;
             const old = this.ws;
@@ -1266,7 +1272,7 @@ $(function () {
                 }
             }
             if (!this.is_open) {
-                $(this.badge).removeClass("text-bg-danger text-bg-warning").addClass("text-bg-success");
+                setConnectionBadge(this.badge, "success");
                 this.is_open = true;
                 if (this.opened)
                     this.opened(event);
@@ -1820,6 +1826,9 @@ $(function () {
                 return;
             }
             flushCtrlMessages();
+            if (data.ankerctl) {
+                setConnectionBadge("#badge-ctrl", "warning");
+            }
             if (data.video_profile) {
                 setVideoProfileActive(data.video_profile);
             }
@@ -1841,11 +1850,14 @@ $(function () {
                 return;
             }
             if (data.status === "connected") {
-                $(this.badge).removeClass("text-bg-danger text-bg-warning text-bg-secondary").addClass("text-bg-success");
+                setConnectionBadge(this.badge, "success");
+                setConnectionBadge("#badge-ctrl", "success");
             } else if (data.status === "disconnected") {
-                $(this.badge).removeClass("text-bg-success text-bg-warning text-bg-secondary").addClass("text-bg-danger");
+                setConnectionBadge(this.badge, "warning");
+                setConnectionBadge("#badge-ctrl", "warning");
             } else if (data.status === "dormant") {
-                $(this.badge).removeClass("text-bg-success text-bg-danger text-bg-warning").addClass("text-bg-secondary");
+                setConnectionBadge(this.badge, "secondary");
+                setConnectionBadge("#badge-ctrl", "warning");
             }
         },
     });
@@ -5753,6 +5765,7 @@ $(function () {
     let _filamentSortAsc = true;
     let _filamentAllProfiles = [];
     let _filamentSwapToken = null;
+    let _filamentSwapMode = null;
     let _filamentSwapPollHandle = null;
     let _filamentServiceTemps = {
         nozzleCurrent: null,
@@ -5764,8 +5777,9 @@ $(function () {
         allow_legacy_swap: false,
         manual_swap_preheat_temp_c: 140,
         quick_move_length_mm: 40,
-        swap_unload_length_mm: 40,
-        swap_load_length_mm: 40,
+        swap_prime_length_mm: 10,
+        swap_unload_length_mm: 50,
+        swap_load_length_mm: 120,
     };
 
     function filamentFindProfileById(profileId) {
@@ -5869,6 +5883,7 @@ $(function () {
         [
             "filament-swap-unload-profile",
             "filament-swap-load-profile",
+            "filament-swap-prime-length",
             "filament-swap-unload-length",
             "filament-swap-load-length",
         ].forEach(id => {
@@ -5880,7 +5895,7 @@ $(function () {
         if (!stateEl || _filamentSwapToken) return;
 
         if (legacyEnabled) {
-            stateEl.textContent = "Legacy automatic swap enabled. Start Swap will heat and retract automatically.";
+            stateEl.textContent = "Guided automatic swap enabled. Start Swap will home, park, prime, retract, and then wait for you to load the new filament.";
         } else {
             stateEl.textContent =
                 `Recommended guided swap enabled. Start Swap will preheat to ${_filamentSwapSettings.manual_swap_preheat_temp_c}°C and wait for a manual filament change.`;
@@ -5899,17 +5914,19 @@ $(function () {
             const quickLengthEl = document.getElementById("filament-service-length");
             const tempEl = document.getElementById("filament-manual-swap-temp");
             const legacyEl = document.getElementById("filament-allow-legacy-swap");
+            const primeLengthEl = document.getElementById("filament-swap-prime-length");
             const unloadLengthEl = document.getElementById("filament-swap-unload-length");
             const loadLengthEl = document.getElementById("filament-swap-load-length");
             if (quickLengthEl) quickLengthEl.value = _filamentSwapSettings.quick_move_length_mm ?? 40;
             if (tempEl) tempEl.value = _filamentSwapSettings.manual_swap_preheat_temp_c ?? 140;
             if (legacyEl) legacyEl.checked = !!_filamentSwapSettings.allow_legacy_swap;
-            if (unloadLengthEl) unloadLengthEl.value = _filamentSwapSettings.swap_unload_length_mm ?? 40;
-            if (loadLengthEl) loadLengthEl.value = _filamentSwapSettings.swap_load_length_mm ?? 40;
+            if (primeLengthEl) primeLengthEl.value = _filamentSwapSettings.swap_prime_length_mm ?? 10;
+            if (unloadLengthEl) unloadLengthEl.value = _filamentSwapSettings.swap_unload_length_mm ?? 50;
+            if (loadLengthEl) loadLengthEl.value = _filamentSwapSettings.swap_load_length_mm ?? 120;
             filamentUpdateSwapModeUi();
             filamentSetSwapSettingsStatus(
                 _filamentSwapSettings.allow_legacy_swap
-                    ? "Legacy automatic swap is enabled."
+                    ? "Guided automatic swap is enabled."
                     : "Recommended manual swap is enabled.",
                 "muted"
             );
@@ -5937,9 +5954,12 @@ $(function () {
         const confirmBtn = document.getElementById("filament-swap-confirm-btn");
         const cancelBtn = document.getElementById("filament-swap-cancel-btn");
         const swap = data && data.pending ? data.swap : null;
-        const running = swap && ["heating_unload", "unloading", "heating_load", "loading"].includes(swap.phase);
+        const previousSwapToken = _filamentSwapToken;
+        const previousSwapMode = _filamentSwapMode;
+        const running = swap && ["homing", "heating_unload", "priming_unload", "unloading", "heating_load", "loading"].includes(swap.phase);
 
         _filamentSwapToken = swap ? swap.token : null;
+        _filamentSwapMode = swap ? swap.mode : null;
 
         if (confirmBtn) confirmBtn.disabled = !swap || running;
         if (cancelBtn) cancelBtn.disabled = !swap || running;
@@ -5952,7 +5972,17 @@ $(function () {
 
         if (!stateEl) return;
         if (!swap) {
-            filamentUpdateSwapModeUi();
+            if (previousSwapToken) {
+                const message = data?.message || (
+                    previousSwapMode === "legacy"
+                        ? "Filament changed. Nozzle heater turned off."
+                        : "Manual filament swap complete."
+                );
+                filamentSetSwapStateMessage(message);
+                filamentSetServiceStatus(message, previousSwapMode === "legacy" ? "success" : "secondary");
+            } else {
+                filamentUpdateSwapModeUi();
+            }
             return;
         }
 
@@ -6205,32 +6235,43 @@ $(function () {
     if (filamentSwapStartBtn) {
         filamentSwapStartBtn.addEventListener("click", async function () {
             try {
-                let payload = {};
-                if (_filamentSwapSettings.allow_legacy_swap) {
+                const legacyEnabled = !!document.getElementById("filament-allow-legacy-swap")?.checked;
+                const manualTempC = parseInt(document.getElementById("filament-manual-swap-temp")?.value || "140", 10);
+                let payload = {
+                    allow_legacy_swap: legacyEnabled,
+                    manual_swap_preheat_temp_c: manualTempC,
+                };
+                if (legacyEnabled) {
                     const unloadProfileId = parseInt(document.getElementById("filament-swap-unload-profile")?.value || "", 10);
                     const loadProfileId = parseInt(document.getElementById("filament-swap-load-profile")?.value || "", 10);
+                    const primeLengthMm = parseFloat(document.getElementById("filament-swap-prime-length")?.value || "0");
                     const unloadLengthMm = parseFloat(document.getElementById("filament-swap-unload-length")?.value || "0");
                     const loadLengthMm = parseFloat(document.getElementById("filament-swap-load-length")?.value || "0");
                     if (!Number.isFinite(unloadProfileId) || !Number.isFinite(loadProfileId)) {
                         filamentSetServiceStatus("Select unload and load profiles first.", "warning");
                         return;
                     }
+                    if (!window.confirm("Guided automatic swap will home the printer first. Make sure the bed and toolhead path are clear before starting.")) {
+                        return;
+                    }
                     payload = {
+                        ...payload,
                         unload_profile_id: unloadProfileId,
                         load_profile_id: loadProfileId,
+                        prime_length_mm: primeLengthMm,
                         unload_length_mm: unloadLengthMm,
                         load_length_mm: loadLengthMm,
                     };
                 }
                 filamentSetServiceStatus(
-                    _filamentSwapSettings.allow_legacy_swap
-                        ? "Legacy swap started. Waiting for heating / unload status..."
-                        : `Recommended guided swap started. Preheating to ${_filamentSwapSettings.manual_swap_preheat_temp_c}°C...`,
+                    legacyEnabled
+                        ? "Guided automatic swap started. Homing and parking before unload..."
+                        : `Recommended guided swap started. Preheating to ${manualTempC}°C...`,
                     "warning"
                 );
                 const res = await filamentServiceRequest("/api/filaments/service/swap/start", payload);
                 filamentUpdateSwapState(res);
-                filamentSetServiceStatus(res.message, _filamentSwapSettings.allow_legacy_swap ? "primary" : "warning");
+                filamentSetServiceStatus(res.message, legacyEnabled ? "primary" : "warning");
             } catch (err) {
                 filamentSetServiceStatus(`Swap start failed: ${err.message}`, "danger");
             }
@@ -6277,6 +6318,7 @@ $(function () {
             const quickLengthEl = document.getElementById("filament-service-length");
             const tempEl = document.getElementById("filament-manual-swap-temp");
             const legacyEl = document.getElementById("filament-allow-legacy-swap");
+            const primeLengthEl = document.getElementById("filament-swap-prime-length");
             const unloadLengthEl = document.getElementById("filament-swap-unload-length");
             const loadLengthEl = document.getElementById("filament-swap-load-length");
             const tempC = parseInt(tempEl?.value || "140", 10);
@@ -6286,16 +6328,18 @@ $(function () {
                         allow_legacy_swap: !!legacyEl?.checked,
                         manual_swap_preheat_temp_c: tempC,
                         quick_move_length_mm: parseFloat(quickLengthEl?.value || "40"),
-                        swap_unload_length_mm: parseFloat(unloadLengthEl?.value || "40"),
-                        swap_load_length_mm: parseFloat(loadLengthEl?.value || "40"),
+                        swap_prime_length_mm: parseFloat(primeLengthEl?.value || "10"),
+                        swap_unload_length_mm: parseFloat(unloadLengthEl?.value || "50"),
+                        swap_load_length_mm: parseFloat(loadLengthEl?.value || "120"),
                     },
                 });
                 _filamentSwapSettings = res.filament_service || _filamentSwapSettings;
                 if (quickLengthEl) quickLengthEl.value = _filamentSwapSettings.quick_move_length_mm ?? 40;
                 if (tempEl) tempEl.value = _filamentSwapSettings.manual_swap_preheat_temp_c ?? 140;
                 if (legacyEl) legacyEl.checked = !!_filamentSwapSettings.allow_legacy_swap;
-                if (unloadLengthEl) unloadLengthEl.value = _filamentSwapSettings.swap_unload_length_mm ?? 40;
-                if (loadLengthEl) loadLengthEl.value = _filamentSwapSettings.swap_load_length_mm ?? 40;
+                if (primeLengthEl) primeLengthEl.value = _filamentSwapSettings.swap_prime_length_mm ?? 10;
+                if (unloadLengthEl) unloadLengthEl.value = _filamentSwapSettings.swap_unload_length_mm ?? 50;
+                if (loadLengthEl) loadLengthEl.value = _filamentSwapSettings.swap_load_length_mm ?? 120;
                 filamentUpdateSwapModeUi();
                 filamentSetSwapSettingsStatus("Filament service settings saved.", "success");
             } catch (err) {

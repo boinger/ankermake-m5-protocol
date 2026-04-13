@@ -1018,12 +1018,21 @@ def _resolve_filament_service_settings(cfg):
 
 
 FILAMENT_SERVICE_DEFAULT_LENGTH_MM = 40.0
+FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM = 10.0
+FILAMENT_SERVICE_SWAP_UNLOAD_DEFAULT_LENGTH_MM = 50.0
+FILAMENT_SERVICE_SWAP_LOAD_DEFAULT_LENGTH_MM = 120.0
 FILAMENT_SERVICE_MAX_LENGTH_MM = 300.0
 FILAMENT_SERVICE_FEEDRATE_MM_MIN = 240
 FILAMENT_SERVICE_EXTRUDE_FEEDRATE_MM_MIN = 900
 FILAMENT_SERVICE_RETRACT_FEEDRATE_MM_MIN = 2700
+FILAMENT_SERVICE_SWAP_PRIME_FEEDRATE_MM_MIN = 240
 FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN = 240
 FILAMENT_SERVICE_SWAP_LOAD_FEEDRATE_MM_MIN = 240
+FILAMENT_SERVICE_SWAP_PARK_X_MM = 0.0
+FILAMENT_SERVICE_SWAP_PARK_Y_MM = 230.0
+FILAMENT_SERVICE_SWAP_Z_LIFT_MM = 50.0
+FILAMENT_SERVICE_SWAP_PARK_FEEDRATE_MM_MIN = 9000
+FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN = 600
 FILAMENT_SERVICE_HEAT_TIMEOUT_S = 240.0
 FILAMENT_SERVICE_HEAT_POLL_S = 0.5
 FILAMENT_SERVICE_HEAT_TOLERANCE_C = 5
@@ -1050,6 +1059,14 @@ def _filament_service_temp(profile):
     return temp
 
 
+def _filament_service_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "1", "yes", "on"}
+    return bool(value)
+
+
 def _filament_service_length(payload, key):
     raw = payload.get(key, FILAMENT_SERVICE_DEFAULT_LENGTH_MM)
     try:
@@ -1072,11 +1089,24 @@ def _filament_service_setting_length(settings, key, default=FILAMENT_SERVICE_DEF
 
 def _normalize_filament_service_settings(settings):
     normalized = dict(settings or {})
-    normalized["allow_legacy_swap"] = bool(normalized.get("allow_legacy_swap"))
+    normalized["allow_legacy_swap"] = _filament_service_bool(normalized.get("allow_legacy_swap"))
     normalized["manual_swap_preheat_temp_c"] = _filament_service_manual_swap_temp(normalized)
     normalized["quick_move_length_mm"] = _filament_service_setting_length(normalized, "quick_move_length_mm")
-    normalized["swap_unload_length_mm"] = _filament_service_setting_length(normalized, "swap_unload_length_mm")
-    normalized["swap_load_length_mm"] = _filament_service_setting_length(normalized, "swap_load_length_mm")
+    normalized["swap_prime_length_mm"] = _filament_service_setting_length(
+        normalized,
+        "swap_prime_length_mm",
+        FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM,
+    )
+    normalized["swap_unload_length_mm"] = _filament_service_setting_length(
+        normalized,
+        "swap_unload_length_mm",
+        FILAMENT_SERVICE_SWAP_UNLOAD_DEFAULT_LENGTH_MM,
+    )
+    normalized["swap_load_length_mm"] = _filament_service_setting_length(
+        normalized,
+        "swap_load_length_mm",
+        FILAMENT_SERVICE_SWAP_LOAD_DEFAULT_LENGTH_MM,
+    )
     return normalized
 
 
@@ -1106,6 +1136,24 @@ def _build_filament_move_gcode(delta_mm, feedrate_mm_min=FILAMENT_SERVICE_FEEDRA
     ])
 
 
+def _build_filament_swap_park_gcode(
+    z_lift_mm=FILAMENT_SERVICE_SWAP_Z_LIFT_MM,
+    park_x_mm=FILAMENT_SERVICE_SWAP_PARK_X_MM,
+    park_y_mm=FILAMENT_SERVICE_SWAP_PARK_Y_MM,
+):
+    return "\n".join([
+        "G28",
+        "G91",
+        f"G1 Z{_format_extrusion_mm(z_lift_mm)} F{FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN}",
+        "G90",
+        (
+            f"G1 X{_format_extrusion_mm(park_x_mm)} "
+            f"Y{_format_extrusion_mm(park_y_mm)} F{FILAMENT_SERVICE_SWAP_PARK_FEEDRATE_MM_MIN}"
+        ),
+        "M400",
+    ])
+
+
 def _serialize_filament_swap_state(state):
     if not state:
         return {"pending": False, "swap": None}
@@ -1125,8 +1173,12 @@ def _serialize_filament_swap_state(state):
             "load_profile_name": state["load_profile_name"],
             "unload_temp_c": state["unload_temp_c"],
             "load_temp_c": state["load_temp_c"],
+            "prime_length_mm": state.get("prime_length_mm"),
             "unload_length_mm": state["unload_length_mm"],
             "load_length_mm": state["load_length_mm"],
+            "z_lift_mm": state.get("z_lift_mm"),
+            "park_x_mm": state.get("park_x_mm"),
+            "park_y_mm": state.get("park_y_mm"),
             "manual_swap_preheat_temp_c": state.get("manual_swap_preheat_temp_c"),
         },
     }
@@ -1225,12 +1277,32 @@ def _run_legacy_swap_unload(token):
         return
 
     try:
-        gcode = _build_filament_move_gcode(
+        park_gcode = _build_filament_swap_park_gcode(
+            state.get("z_lift_mm", FILAMENT_SERVICE_SWAP_Z_LIFT_MM),
+            state.get("park_x_mm", FILAMENT_SERVICE_SWAP_PARK_X_MM),
+            state.get("park_y_mm", FILAMENT_SERVICE_SWAP_PARK_Y_MM),
+        )
+        prime_gcode = _build_filament_move_gcode(
+            state.get("prime_length_mm", FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM),
+            feedrate_mm_min=state.get("prime_feedrate_mm_min", FILAMENT_SERVICE_SWAP_PRIME_FEEDRATE_MM_MIN),
+        )
+        unload_gcode = _build_filament_move_gcode(
             -state["unload_length_mm"],
             feedrate_mm_min=state.get("unload_feedrate_mm_min", FILAMENT_SERVICE_FEEDRATE_MM_MIN),
         )
         with borrow_mqtt(state.get("printer_index")) as mqtt:
             _assert_filament_service_ready(mqtt)
+
+            _filament_swap_state_update(
+                token,
+                phase="homing",
+                message=(
+                    "Homing and parking before filament swap. Make sure the bed and toolhead path are clear."
+                ),
+                error=None,
+            )
+            mqtt.send_gcode(park_gcode)
+
             current_temp = mqtt.nozzle_temp
             if current_temp is None or current_temp < (state["unload_temp_c"] - FILAMENT_SERVICE_HEAT_TOLERANCE_C):
                 _filament_swap_state_update(
@@ -1244,20 +1316,31 @@ def _run_legacy_swap_unload(token):
 
             _filament_swap_state_update(
                 token,
+                phase="priming_unload",
+                message=(
+                    f"Extruding {state.get('prime_length_mm', FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM)} mm "
+                    f"to soften {state['unload_profile_name']} before unload..."
+                ),
+                error=None,
+            )
+            mqtt.send_gcode(prime_gcode)
+
+            _filament_swap_state_update(
+                token,
                 phase="unloading",
                 message=(
                     f"Retracting {state['unload_length_mm']} mm for {state['unload_profile_name']}..."
                 ),
                 error=None,
             )
-            mqtt.send_gcode(gcode)
+            mqtt.send_gcode(unload_gcode)
 
         _filament_swap_state_update(
             token,
             phase="await_manual_swap",
             message=(
-                "Unload finished. Release the extruder lever, remove the old filament, "
-                "insert the new filament, then confirm."
+                "Unload finished. Replace the filament, feed the new filament into the extruder, "
+                "then click Continue to load and purge."
             ),
             error=None,
         )
@@ -1303,6 +1386,7 @@ def _run_legacy_swap_load(token):
                 error=None,
             )
             mqtt.send_gcode(gcode)
+            mqtt.send_gcode("M104 S0")
 
         _filament_swap_state_clear(token)
     except (RuntimeError, TimeoutError, ConnectionError) as exc:
@@ -2628,13 +2712,13 @@ def app_api_settings_filament_service_update():
         return {"error": "Invalid filament_service payload"}, 400
 
     if "allow_legacy_swap" in fs_payload:
-        fs_payload["allow_legacy_swap"] = bool(fs_payload["allow_legacy_swap"])
+        fs_payload["allow_legacy_swap"] = _filament_service_bool(fs_payload["allow_legacy_swap"])
     if "manual_swap_preheat_temp_c" in fs_payload:
         try:
             fs_payload["manual_swap_preheat_temp_c"] = int(fs_payload["manual_swap_preheat_temp_c"])
         except (TypeError, ValueError):
             return {"error": "manual_swap_preheat_temp_c must be an integer"}, 400
-    for key in ("quick_move_length_mm", "swap_unload_length_mm", "swap_load_length_mm"):
+    for key in ("quick_move_length_mm", "swap_prime_length_mm", "swap_unload_length_mm", "swap_load_length_mm"):
         if key in fs_payload:
             try:
                 fs_payload[key] = _filament_service_length({key: fs_payload[key]}, key)
@@ -3793,17 +3877,23 @@ def app_api_filament_service_swap_start():
             return {"error": "No printers configured"}, 400
         filament_settings = _normalize_filament_service_settings(_resolve_filament_service_settings(cfg))
 
-    allow_legacy_swap = bool(filament_settings.get("allow_legacy_swap"))
+    allow_legacy_swap = _filament_service_bool(filament_settings.get("allow_legacy_swap"))
+    if "allow_legacy_swap" in payload:
+        allow_legacy_swap = _filament_service_bool(payload.get("allow_legacy_swap"))
     manual_swap_preheat_temp_c = _filament_service_manual_swap_temp(filament_settings)
+    if "manual_swap_preheat_temp_c" in payload:
+        manual_swap_preheat_temp_c = _filament_service_manual_swap_temp(payload)
 
     unload_profile = None
     load_profile = None
     unload_temp_c = manual_swap_preheat_temp_c
     load_temp_c = manual_swap_preheat_temp_c
+    prime_length_mm = FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM
     unload_length_mm = 0.0
     load_length_mm = 0.0
     unload_feedrate_mm_min = FILAMENT_SERVICE_FEEDRATE_MM_MIN
     load_feedrate_mm_min = FILAMENT_SERVICE_FEEDRATE_MM_MIN
+    prime_feedrate_mm_min = FILAMENT_SERVICE_SWAP_PRIME_FEEDRATE_MM_MIN
 
     if allow_legacy_swap:
         try:
@@ -3811,6 +3901,10 @@ def app_api_filament_service_swap_start():
             load_profile = _filament_service_profile(payload, "load_profile_id")
             unload_temp_c = _filament_service_temp(unload_profile)
             load_temp_c = _filament_service_temp(load_profile)
+            prime_length_mm = _filament_service_length(
+                {"prime_length_mm": payload.get("prime_length_mm", filament_settings["swap_prime_length_mm"])},
+                "prime_length_mm",
+            )
             unload_length_mm = _filament_service_length(
                 {"unload_length_mm": payload.get("unload_length_mm", filament_settings["swap_unload_length_mm"])},
                 "unload_length_mm",
@@ -3836,7 +3930,7 @@ def app_api_filament_service_swap_start():
         "created_at": int(time.time()),
         "printer_index": printer_index,
         "mode": "legacy" if allow_legacy_swap else "manual",
-        "phase": "heating_unload" if allow_legacy_swap else "await_manual_swap",
+        "phase": "homing" if allow_legacy_swap else "await_manual_swap",
         "message": None,
         "error": None,
         "unload_profile_id": unload_profile["id"] if unload_profile else None,
@@ -3845,17 +3939,23 @@ def app_api_filament_service_swap_start():
         "load_profile_name": load_profile["name"] if load_profile else None,
         "unload_temp_c": unload_temp_c,
         "load_temp_c": load_temp_c,
+        "prime_length_mm": prime_length_mm,
         "unload_length_mm": unload_length_mm,
         "load_length_mm": load_length_mm,
+        "z_lift_mm": FILAMENT_SERVICE_SWAP_Z_LIFT_MM,
+        "park_x_mm": FILAMENT_SERVICE_SWAP_PARK_X_MM,
+        "park_y_mm": FILAMENT_SERVICE_SWAP_PARK_Y_MM,
         "manual_swap_preheat_temp_c": manual_swap_preheat_temp_c,
+        "prime_feedrate_mm_min": prime_feedrate_mm_min,
         "unload_feedrate_mm_min": unload_feedrate_mm_min,
         "load_feedrate_mm_min": load_feedrate_mm_min,
     }
 
     if allow_legacy_swap:
         swap_state["message"] = (
-            f"Heating for automatic unload of {unload_profile['name']} "
-            f"at {unload_temp_c}°C."
+            "Guided automatic swap will home and park first. Make sure the bed is clear. "
+            f"Then it will heat {unload_profile['name']} to {unload_temp_c}°C, "
+            f"extrude {prime_length_mm} mm, and retract {unload_length_mm} mm."
         )
     else:
         swap_state["message"] = (
@@ -3903,7 +4003,7 @@ def app_api_filament_service_swap_confirm():
         provided_token = payload.get("token")
         if provided_token and provided_token != swap_state["token"]:
             return {"error": "Swap token mismatch"}, 409
-        if swap_state.get("phase") in {"heating_unload", "unloading", "heating_load", "loading"}:
+        if swap_state.get("phase") in {"homing", "heating_unload", "priming_unload", "unloading", "heating_load", "loading"}:
             return {"error": "Swap stage is still running; wait for it to finish first"}, 409
         printer_index = _service_printer_index(swap_state.get("printer_index", printer_index))
 
@@ -3941,6 +4041,13 @@ def app_api_filament_service_swap_confirm():
 
     _filament_swap_start_background(_run_legacy_swap_load, swap_state["token"])
     current_state = _filament_swap_state_get(swap_state["token"])
+    if current_state is None:
+        return {
+            "status": "ok",
+            "message": "Filament changed. Nozzle heater turned off.",
+            "pending": False,
+            "swap": None,
+        }
     return {
         "status": "ok",
         "message": current_state["message"],
@@ -3958,7 +4065,7 @@ def app_api_filament_service_swap_cancel():
         provided_token = payload.get("token")
         if provided_token and provided_token != swap_state["token"]:
             return {"error": "Swap token mismatch"}, 409
-        if swap_state.get("phase") in {"heating_unload", "unloading", "heating_load", "loading"}:
+        if swap_state.get("phase") in {"homing", "heating_unload", "priming_unload", "unloading", "heating_load", "loading"}:
             return {"error": "Cannot cancel while an automatic swap stage is running"}, 409
         app.filament_swap_state = None
 

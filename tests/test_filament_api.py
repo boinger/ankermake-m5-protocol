@@ -281,6 +281,7 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
     client = app.test_client()
     old_values, old_svc, old_filaments, old_swap = _install_state(tmp_path, mqtt)
     app.config["config"].cfg.filament_service["allow_legacy_swap"] = True
+    app.config["config"].cfg.filament_service["swap_prime_length_mm"] = 10
     app.config["config"].cfg.filament_service["swap_unload_length_mm"] = 55
     app.config["config"].cfg.filament_service["swap_load_length_mm"] = 65
     background_calls = []
@@ -331,5 +332,10 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
     assert confirmed.get_json()["pending"] is True
     assert cancelled.status_code == 200
     assert cancelled.get_json()["pending"] is False
-    assert "G1 E-55 F240" in sent[0]
-    assert "G1 E65 F240" in sent[1]
+    assert "G28" in sent[0]
+    assert "G1 Z50 F600" in sent[0]
+    assert "G1 X0 Y230 F9000" in sent[0]
+    assert "G1 E10 F240" in sent[1]
+    assert "G1 E-55 F240" in sent[2]
+    assert "G1 E65 F240" in sent[3]
+    assert sent[4] == "M104 S0"

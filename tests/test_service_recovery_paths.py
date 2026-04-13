@@ -423,13 +423,31 @@ def test_video_queue_api_profile_and_mode_validation():
     assert queue.api_video_mode("bad") is False
 
 
-def test_pppp_probe_handles_missing_config_and_resolver_errors(monkeypatch):
+def test_pppp_probe_handles_missing_config_and_probe_errors(monkeypatch):
     assert probe_pppp(FakeConfigManager(None), 0) is False
     monkeypatch.setattr(
-        "web.service.pppp.cli.pppp.pppp_resolve_printer_ip",
-        lambda config, printer, printer_index: (_ for _ in ()).throw(RuntimeError("boom")),
+        "web.service.pppp.cli.pppp.probe_printer_ip",
+        lambda printer, ip_addr: (_ for _ in ()).throw(RuntimeError("boom")),
     )
+    monkeypatch.setattr("web.service.pppp.cli.pppp.lan_search", lambda config: [])
     assert probe_pppp(FakeConfigManager(_config()), 0) is False
+
+
+def test_pppp_status_probe_requires_real_response_not_saved_ip_fallback(monkeypatch):
+    monkeypatch.setattr("web.service.pppp.cli.pppp.probe_printer_ip", lambda printer, ip_addr: False)
+    monkeypatch.setattr("web.service.pppp.cli.pppp.lan_search", lambda config: [])
+
+    assert probe_pppp(FakeConfigManager(_config()), 0) is False
+
+
+def test_pppp_status_probe_accepts_lan_discovery_match(monkeypatch):
+    monkeypatch.setattr("web.service.pppp.cli.pppp.probe_printer_ip", lambda printer, ip_addr: False)
+    monkeypatch.setattr(
+        "web.service.pppp.cli.pppp.lan_search",
+        lambda config: [{"duid": "duid-1", "ip_addr": "192.168.1.10", "persisted": False}],
+    )
+
+    assert probe_pppp(FakeConfigManager(_config()), 0) is True
 
 
 def test_pppp_service_api_command_and_connected_property():

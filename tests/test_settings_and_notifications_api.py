@@ -356,6 +356,7 @@ def test_filament_service_settings_endpoints_persist_manual_and_legacy_modes():
                     "allow_legacy_swap": True,
                     "manual_swap_preheat_temp_c": 149,
                     "quick_move_length_mm": 12.5,
+                    "swap_prime_length_mm": 10,
                     "swap_unload_length_mm": 55,
                     "swap_load_length_mm": 65,
                 }
@@ -374,15 +375,20 @@ def test_filament_service_settings_endpoints_persist_manual_and_legacy_modes():
     assert got.status_code == 200
     assert got.get_json()["filament_service"]["allow_legacy_swap"] is False
     assert got.get_json()["filament_service"]["quick_move_length_mm"] == 40
+    assert got.get_json()["filament_service"]["swap_prime_length_mm"] == 10
+    assert got.get_json()["filament_service"]["swap_unload_length_mm"] == 50
+    assert got.get_json()["filament_service"]["swap_load_length_mm"] == 120
     assert updated.status_code == 200
     assert updated.get_json()["filament_service"]["allow_legacy_swap"] is True
     assert updated.get_json()["filament_service"]["manual_swap_preheat_temp_c"] == 149
     assert updated.get_json()["filament_service"]["quick_move_length_mm"] == 12.5
+    assert updated.get_json()["filament_service"]["swap_prime_length_mm"] == 10
     assert updated.get_json()["filament_service"]["swap_unload_length_mm"] == 55
     assert updated.get_json()["filament_service"]["swap_load_length_mm"] == 65
     assert clamped.status_code == 200
     assert cfg.filament_service["allow_legacy_swap"] is True
     assert cfg.filament_service["quick_move_length_mm"] == 12.5
+    assert cfg.filament_service["swap_prime_length_mm"] == 10
     assert cfg.filament_service["swap_unload_length_mm"] == 55
     assert cfg.filament_service["swap_load_length_mm"] == 65
     assert cfg.filament_service["manual_swap_preheat_temp_c"] == 150
