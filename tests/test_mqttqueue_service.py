@@ -91,6 +91,24 @@ def test_forward_to_ha_keeps_local_temperature_state_when_ha_is_disabled():
     assert ha_updates == []
 
 
+def test_forward_to_ha_accepts_zero_temperature_targets():
+    global ha_updates, history_calls, timelapse_calls, events
+    ha_updates, history_calls, timelapse_calls, events = [], [], [], []
+    queue = _queue()
+
+    queue._forward_to_ha({"commandType": 1003, "currentTemp": 21500, "targetTemp": 22000})
+    queue._forward_to_ha({"commandType": 1004, "currentTemp": 6500, "targetTemp": 7000})
+    queue._forward_to_ha({"commandType": 1003, "currentTemp": 20500, "targetTemp": 0})
+    queue._forward_to_ha({"commandType": 1004, "currentTemp": 6000, "targetTemp": 0})
+
+    assert queue.nozzle_temp == 205
+    assert queue.nozzle_temp_target == 0
+    assert queue._bed_temp == 60
+    assert queue._bed_temp_target == 0
+    assert {"nozzle_temp": 205, "nozzle_temp_target": 0} in ha_updates
+    assert {"bed_temp": 60, "bed_temp_target": 0} in ha_updates
+
+
 def test_forward_to_ha_tracks_filament_state_from_material_change_mode():
     global ha_updates, history_calls, timelapse_calls, events
     ha_updates, history_calls, timelapse_calls, events = [], [], [], []

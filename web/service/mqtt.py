@@ -1152,8 +1152,10 @@ class MqttQueue(Service):
 
         # Nozzle temperature (command 1003 = 0x03eb)
         if command_type == MqttMsgType.ZZ_MQTT_CMD_NOZZLE_TEMP:
-            current = self._safe_int(payload.get("currentTemp") or payload.get("value"))
-            target = self._safe_int(payload.get("targetTemp") or payload.get("target"))
+            current_raw = payload.get("currentTemp") if "currentTemp" in payload else payload.get("value")
+            target_raw = payload.get("targetTemp") if "targetTemp" in payload else payload.get("target")
+            current = self._safe_int(current_raw)
+            target = self._safe_int(target_raw)
             if current is not None:
                 # Temps may come in 1/100th degree units
                 self._nozzle_temp = self._normalize_temp(current)
@@ -1164,8 +1166,10 @@ class MqttQueue(Service):
 
         # Bed temperature (command 1004 = 0x03ec)
         elif command_type == MqttMsgType.ZZ_MQTT_CMD_HOTBED_TEMP:
-            current = self._safe_int(payload.get("currentTemp") or payload.get("value"))
-            target = self._safe_int(payload.get("targetTemp") or payload.get("target"))
+            current_raw = payload.get("currentTemp") if "currentTemp" in payload else payload.get("value")
+            target_raw = payload.get("targetTemp") if "targetTemp" in payload else payload.get("target")
+            current = self._safe_int(current_raw)
+            target = self._safe_int(target_raw)
             if current is not None:
                 self._bed_temp = self._normalize_temp(current)
                 ha_updates["bed_temp"] = self._bed_temp
