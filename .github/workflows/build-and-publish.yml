@@ -171,19 +171,32 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          submodules: recursive
+        uses: actions/checkout@v4
 
       - name: Download release artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: release
           merge-multiple: true
 
-      - name: Publish GitHub release artifacts
-        uses: docker://antonyurchenko/git-release:v5.0.1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 - <<'EOF' > release_notes.md
+          import re, os, sys
+          version = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          text = open("CHANGELOG.md").read()
+          pattern = rf"## \[{re.escape(version)}\][^\n]*\n(.*?)(?=\n## \[|\Z)"
+          m = re.search(pattern, text, re.DOTALL)
+          if not m:
+              print(f"No changelog entry found for {version}", file=sys.stderr)
+              sys.exit(1)
+          print(m.group(1).strip())
+          EOF
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
         with:
-          args: release/ankerctl*
+          body_path: release_notes.md
+          files: release/ankerctl*
