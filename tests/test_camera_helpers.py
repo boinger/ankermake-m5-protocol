@@ -1,4 +1,5 @@
 from pathlib import Path
+import threading
 
 from web.camera import (
     CameraCaptureError,
@@ -121,3 +122,26 @@ def test_iter_mjpeg_frames_extracts_jpegs_from_chunked_stream():
         b"\xff\xd8one\xff\xd9",
         b"\xff\xd8two\xff\xd9",
     ]
+
+
+def test_iter_mjpeg_frames_stops_when_ffmpeg_stdout_stalls():
+    read_started = threading.Event()
+    release_read = threading.Event()
+
+    class FakeStdout:
+        def read(self, _size):
+            read_started.set()
+            release_read.wait(timeout=1.0)
+            return b""
+
+    class FakeProc:
+        stdout = FakeStdout()
+
+        def poll(self):
+            return None
+
+    try:
+        assert list(iter_mjpeg_frames(FakeProc(), stale_timeout=0.01)) == []
+        assert read_started.wait(timeout=0.5)
+    finally:
+        release_read.set()
