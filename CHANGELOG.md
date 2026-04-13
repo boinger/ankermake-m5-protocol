@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0] - 2026-04-13
 
 ### Added
  - External camera feed support (RTSP, HTTP, MJPEG) configurable in Setup tab
@@ -56,6 +56,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  - `multiprocessing.Queue` replaced with `queue.Queue` in service framework
  - HomeAssistantService heartbeat thread leak on MQTT reconnect
  - `/ws/ctrl` handler now catches all connection and parse errors gracefully
+
+## [Unreleased]
 
 ## [0.9.0] - 2023-04-17
 
