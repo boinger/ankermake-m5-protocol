@@ -4617,6 +4617,7 @@ _PROTECTED_GET_PATHS = {
     "/api/debug/logs",
     "/api/debug/services",
     "/api/camera/frame",
+    "/api/camera/stream",
     "/api/snapshot",
     # Sensitive credential exposure: HA MQTT password, Apprise URLs/keys
     "/api/settings/mqtt",
