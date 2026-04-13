@@ -35,7 +35,11 @@ def test_timelapse_meta_and_video_file_helpers(tmp_path):
     meta_dir.mkdir()
     svc._write_meta(meta_dir, "cube.gcode", 3)
 
-    assert svc._read_meta(meta_dir) == {"filename": "cube.gcode", "frame_count": 3}
+    meta = svc._read_meta(meta_dir)
+    assert meta["filename"] == "cube.gcode"
+    assert meta["frame_count"] == 3
+    assert meta["printer_index"] == 0
+    assert meta["printer_scope"] == "printer_SN1"
 
     video_a = tmp_path / "a.mp4"
     video_b = tmp_path / "b.mp4"
@@ -245,6 +249,95 @@ def test_timelapse_scan_recovers_or_resumes_in_progress(monkeypatch, tmp_path):
     assert scheduled and scheduled[0][1] == "young.gcode"
     assert assembled and assembled[0][1] == "old.gcode" and assembled[0][3] == "_recovered"
     assert pruned == [True]
+
+
+def test_timelapse_scan_only_recovers_matching_printer_capture(monkeypatch, tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    cfg._cfg.printers.append(SimpleNamespace(sn="SN2", name="Printer 2", model="V8111"))
+    base = tmp_path / _IN_PROGRESS_SUBDIR
+    base.mkdir()
+
+    printer_zero = base / "printer_SN1_zero_capture"
+    printer_zero.mkdir()
+    (printer_zero / "frame_00000.jpg").write_bytes(b"x")
+    (printer_zero / "frame_00001.jpg").write_bytes(b"y")
+    with open(printer_zero / ".meta", "w") as fh:
+        json.dump({
+            "filename": "zero.gcode",
+            "frame_count": 2,
+            "printer_index": 0,
+            "printer_scope": "printer_SN1",
+        }, fh)
+
+    printer_one = base / "printer_SN2_one_capture"
+    printer_one.mkdir()
+    (printer_one / "frame_00000.jpg").write_bytes(b"x")
+    (printer_one / "frame_00001.jpg").write_bytes(b"y")
+    with open(printer_one / ".meta", "w") as fh:
+        json.dump({
+            "filename": "one.gcode",
+            "frame_count": 2,
+            "printer_index": 1,
+            "printer_scope": "printer_SN2",
+        }, fh)
+
+    scheduled = []
+    finalized = []
+
+    monkeypatch.setattr(
+        TimelapseService,
+        "_schedule_finalize",
+        lambda self, d, f, c, suffix="": scheduled.append((self._printer_index, d, f, c, suffix)),
+    )
+    monkeypatch.setattr(
+        TimelapseService,
+        "_finalize_capture_dir",
+        lambda self, d, f, c, suffix="": finalized.append((self._printer_index, d, f, c, suffix)),
+    )
+
+    svc0 = TimelapseService(cfg, captures_dir=tmp_path, printer_index=0)
+    assert svc0._resume_filename == "zero.gcode"
+    assert scheduled == [(0, str(printer_zero), "zero.gcode", 2, "")]
+    assert finalized == []
+
+    scheduled.clear()
+    svc1 = TimelapseService(cfg, captures_dir=tmp_path, printer_index=1)
+    assert svc1._resume_filename == "one.gcode"
+    assert scheduled == [(1, str(printer_one), "one.gcode", 2, "")]
+    assert finalized == []
+
+
+def test_timelapse_archived_media_listing_is_scoped_per_printer(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    cfg._cfg.printers.append(SimpleNamespace(sn="SN2", name="Printer 2", model="V8111"))
+
+    svc0 = TimelapseService(cfg, captures_dir=tmp_path, printer_index=0)
+    svc1 = TimelapseService(cfg, captures_dir=tmp_path, printer_index=1)
+
+    (tmp_path / "printer_SN1_zero.mp4").write_bytes(b"zero")
+    (tmp_path / "printer_SN2_one.mp4").write_bytes(b"one")
+    (tmp_path / "legacy.mp4").write_bytes(b"legacy")
+
+    snapshots = tmp_path / "snapshots"
+    zero_snapshots = snapshots / "printer_SN1_zero"
+    zero_snapshots.mkdir(parents=True)
+    (zero_snapshots / "frame_00000.jpg").write_bytes(b"zero")
+    svc0._write_meta(zero_snapshots, "zero.gcode", 1)
+
+    one_snapshots = snapshots / "printer_SN2_one"
+    one_snapshots.mkdir(parents=True)
+    (one_snapshots / "frame_00000.jpg").write_bytes(b"one")
+    svc1._write_meta(one_snapshots, "one.gcode", 1)
+
+    assert [video["filename"] for video in svc0.list_videos()] == [
+        "printer_SN1_zero.mp4",
+        "legacy.mp4",
+    ]
+    assert [video["filename"] for video in svc1.list_videos()] == ["printer_SN2_one.mp4"]
+    assert [collection["id"] for collection in svc0.list_snapshots()] == ["printer_SN1_zero"]
+    assert [collection["id"] for collection in svc1.list_snapshots()] == ["printer_SN2_one"]
+    assert svc0.get_video_path("legacy.mp4") == str(tmp_path / "legacy.mp4")
+    assert svc1.get_video_path("legacy.mp4") is None
 
 
 def test_timelapse_finish_and_fail_paths(monkeypatch, tmp_path):

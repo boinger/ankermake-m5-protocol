@@ -48,6 +48,7 @@ class TimelapseService:
         self._printer_index = 0 if printer_index is None else int(printer_index)
         default_captures = os.path.join(str(config_manager.config_root), "captures")
         self._captures_dir = captures_dir or os.getenv("TIMELAPSE_CAPTURES_DIR", default_captures)
+        self._printer_scope = self._resolve_printer_scope()
         os.makedirs(self._captures_dir, exist_ok=True)
 
         self._lock = threading.Lock()
@@ -86,6 +87,30 @@ class TimelapseService:
 
         self.reload_config()
         self._scan_in_progress_captures()
+
+    @staticmethod
+    def _safe_scope_component(value):
+        value = str(value or "").strip()
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in value)
+        return safe.strip("._") or None
+
+    def _resolve_printer_scope(self):
+        identifier = None
+        try:
+            if hasattr(self._config_manager, "open"):
+                with self._config_manager.open() as cfg:
+                    printers = getattr(cfg, "printers", None) or []
+                    if 0 <= self._printer_index < len(printers):
+                        printer = printers[self._printer_index]
+                        for attr in ("sn", "id", "p2p_duid", "name"):
+                            candidate = getattr(printer, attr, None)
+                            if candidate:
+                                identifier = candidate
+                                break
+        except Exception as err:
+            log.debug(f"Timelapse: could not resolve printer scope: {err}")
+        safe = self._safe_scope_component(identifier) or f"index_{self._printer_index}"
+        return f"printer_{safe}"
 
     def reload_config(self, config=None):
         """Update configuration from Config object or ConfigManager."""
@@ -557,7 +582,10 @@ class TimelapseService:
                 self._current_filename = filename
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in filename)
-                self._current_dir = os.path.join(self._in_progress_base(), f"{safe_name}_{ts}")
+                self._current_dir = os.path.join(
+                    self._in_progress_base(),
+                    f"{self._printer_scope}_{safe_name}_{ts}",
+                )
                 os.makedirs(self._current_dir, exist_ok=True)
                 self._write_meta(self._current_dir, filename, 0)
                 self._frame_count = 0
@@ -833,7 +861,12 @@ class TimelapseService:
         """Write a small JSON sidecar so state survives container restarts."""
         try:
             payload = self._read_meta(dir_path) or {}
-            payload.update({"filename": filename, "frame_count": frame_count})
+            payload.update({
+                "filename": filename,
+                "frame_count": frame_count,
+                "printer_index": self._printer_index,
+                "printer_scope": self._printer_scope,
+            })
             for key, value in extra.items():
                 if value is not None:
                     payload[key] = value
@@ -850,16 +883,70 @@ class TimelapseService:
         except (OSError, ValueError):
             return None
 
+    def _capture_dir_belongs_to_this_printer(self, dir_name, meta):
+        """Return True when an in-progress capture belongs to this printer.
+
+        Legacy capture directories created before printer-scoped metadata are
+        only recovered by printer 0 because their owner cannot be known safely.
+        """
+        if isinstance(meta, dict):
+            meta_scope = meta.get("printer_scope")
+            if meta_scope:
+                return meta_scope == self._printer_scope
+            if "printer_index" in meta:
+                try:
+                    return int(meta.get("printer_index")) == self._printer_index
+                except (TypeError, ValueError):
+                    return False
+
+        if dir_name.startswith(f"{self._printer_scope}_"):
+            return True
+        if dir_name.startswith("printer_"):
+            return False
+        return self._printer_index == 0
+
+    def _media_name_belongs_to_this_printer(self, name, meta=None):
+        """Return True when an archived video/snapshot collection is ours.
+
+        Unscoped legacy media is exposed only through printer 0 because older
+        files have no reliable owner metadata.
+        """
+        if isinstance(meta, dict):
+            meta_scope = meta.get("printer_scope")
+            if meta_scope:
+                return meta_scope == self._printer_scope
+            if "printer_index" in meta:
+                try:
+                    return int(meta.get("printer_index")) == self._printer_index
+                except (TypeError, ValueError):
+                    return False
+        if str(name or "").startswith(f"{self._printer_scope}_"):
+            return True
+        if str(name or "").startswith("printer_"):
+            return False
+        return self._printer_index == 0
+
     def _resolve_snapshot_collection_dir(self, collection_id):
         safe_collection = self._safe_path_component(collection_id)
         if not safe_collection:
             return None, None
+        with self._lock:
+            for dir_path in (self._current_dir, self._resume_dir):
+                if (
+                    dir_path
+                    and os.path.isdir(dir_path)
+                    and os.path.basename(dir_path) == safe_collection
+                ):
+                    return dir_path, True
         for root, read_only in (
             (self._snapshot_archive_base(), False),
             (self._in_progress_base(), True),
         ):
             path = os.path.join(root, safe_collection)
             if os.path.isdir(path):
+                meta = self._read_meta(path)
+                if not self._media_name_belongs_to_this_printer(safe_collection, meta):
+                    continue
                 return path, read_only
         return None, None
 
@@ -917,7 +1004,7 @@ class TimelapseService:
             collection_id = os.path.splitext(os.path.basename(video_filename))[0]
         else:
             safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in (filename or "print"))
-            collection_id = f"{safe_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            collection_id = f"{self._printer_scope}_{safe_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         archive_dir = os.path.join(self._snapshot_archive_base(), collection_id)
         try:
@@ -952,6 +1039,10 @@ class TimelapseService:
                     os.path.join(base, name)
                     for name in os.listdir(base)
                     if os.path.isdir(os.path.join(base, name))
+                    and self._media_name_belongs_to_this_printer(
+                        name,
+                        self._read_meta(os.path.join(base, name)),
+                    )
                 ),
                 key=os.path.getmtime,
             )
@@ -969,7 +1060,7 @@ class TimelapseService:
 
         taken_at = taken_at or datetime.now()
         safe_timestamp = taken_at.strftime("%Y%m%d_%H%M%S")
-        collection_id = f"manual_snapshot_{taken_at.strftime('%Y%m%d_%H%M%S_%f')}"
+        collection_id = f"{self._printer_scope}_manual_snapshot_{taken_at.strftime('%Y%m%d_%H%M%S_%f')}"
         archive_dir = os.path.join(self._snapshot_archive_base(), collection_id)
         frame_name = f"ankerctl_snapshot_{safe_timestamp}.jpg"
         archive_path = os.path.join(archive_dir, frame_name)
@@ -1036,12 +1127,14 @@ class TimelapseService:
             dir_path = os.path.join(base, name)
             if not os.path.isdir(dir_path):
                 continue
+            meta = self._read_meta(dir_path)
+            if not self._capture_dir_belongs_to_this_printer(name, meta):
+                continue
             frames = [f for f in os.listdir(dir_path) if f.startswith("frame_") and f.endswith(".jpg")]
             frame_count = len(frames)
             if frame_count == 0:
                 shutil.rmtree(dir_path, ignore_errors=True)
                 continue
-            meta = self._read_meta(dir_path)
             filename = (meta or {}).get("filename", "unknown")
             age = now - os.path.getmtime(dir_path)
             candidates.append((age, dir_path, filename, frame_count))
@@ -1090,7 +1183,7 @@ class TimelapseService:
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in (filename or "print"))
-        output_name = f"{safe_name}_{ts}{suffix}.mp4"
+        output_name = f"{self._printer_scope}_{safe_name}_{ts}{suffix}.mp4"
         output_path = os.path.join(self._captures_dir, output_name)
 
         # Calculate fps to make ~30s videos, min 1fps max 30fps
@@ -1156,7 +1249,11 @@ class TimelapseService:
             return
         try:
             videos = sorted(
-                [f for f in os.listdir(self._captures_dir) if f.endswith(".mp4")],
+                [
+                    f for f in os.listdir(self._captures_dir)
+                    if f.endswith(".mp4")
+                    and self._media_name_belongs_to_this_printer(f)
+                ],
                 key=lambda f: os.path.getmtime(os.path.join(self._captures_dir, f)),
             )
             while len(videos) > self._max_videos:
@@ -1172,6 +1269,8 @@ class TimelapseService:
         try:
             for f in sorted(os.listdir(self._captures_dir), reverse=True):
                 if not f.endswith(".mp4"):
+                    continue
+                if not self._media_name_belongs_to_this_printer(f):
                     continue
                 path = os.path.join(self._captures_dir, f)
                 stat = os.stat(path)
@@ -1228,6 +1327,9 @@ class TimelapseService:
             collection_id = os.path.basename(dir_path)
             if collection_id in seen:
                 continue
+            meta = self._read_meta(dir_path) or {}
+            if not self._media_name_belongs_to_this_printer(collection_id, meta):
+                continue
             record = self._snapshot_collection_record(dir_path)
             if record:
                 collections.append(record)
@@ -1238,7 +1340,11 @@ class TimelapseService:
     def get_video_path(self, filename):
         """Return full path to a video file, or None if not found."""
         path = os.path.join(self._captures_dir, filename)
-        if os.path.isfile(path) and filename.endswith(".mp4"):
+        if (
+            os.path.isfile(path)
+            and filename.endswith(".mp4")
+            and self._media_name_belongs_to_this_printer(filename)
+        ):
             return path
         return None
 
