@@ -17,7 +17,8 @@
                             </li>
                             <li class="mb-2">
                                 If needed, switch to each printer from the navbar and save that printer's
-                                <strong>External Camera</strong>, <strong>Timelapse</strong>, and notification settings.
+                                <strong>External Camera</strong> and <strong>Timelapse</strong> settings. Then review
+                                notification settings if you use alerts.
                             </li>
                             <li class="mb-2">
                                 Connect your slicer with the OctoPrint-compatible upload settings below, then use
@@ -136,12 +137,20 @@
                         <ol class="mb-0">
                             <li class="mb-2">Switch to the printer you want to configure in the navbar first.</li>
                             <li class="mb-2">Open <strong>Setup -&gt; Camera</strong>.</li>
-                            <li class="mb-2">Enter an external camera label and stream URL.</li>
-                            <li class="mb-2">Add a direct snapshot URL if your camera supports one for faster captures.</li>
+                            <li class="mb-2">
+                                Enter an external camera label and an FFmpeg-readable stream URL, such as RTSP or MJPEG.
+                                The stream URL drives the Home page live preview.
+                            </li>
+                            <li class="mb-2">
+                                Add a direct snapshot URL if your camera supports one for faster still snapshots and
+                                fallback capture.
+                            </li>
                             <li class="mb-2">Click <strong>Save External Camera</strong>.</li>
                             <li class="mb-0">
                                 On the <strong>Home</strong> page, switch between the printer camera and external camera.
-                                Manual snapshots follow the selected camera source; timelapse can be pinned separately in <strong>Setup -&gt; Timelapse</strong>.
+                                Manual snapshots follow the selected camera source. Timelapse has its own source setting
+                                in <strong>Setup -&gt; Timelapse</strong>, so Home page viewing does not have to interrupt
+                                captures.
                             </li>
                         </ol>
                     </div>
@@ -158,6 +167,11 @@
                             <li class="mb-2">Select the printer you want to configure from the printer selector.</li>
                             <li class="mb-2">Open <strong>Setup -&gt; Timelapse</strong>.</li>
                             <li class="mb-2">Enable timelapse, choose interval, retention, persistence, camera source, and light behavior.</li>
+                            <li class="mb-2">
+                                Use <strong>Follow Home camera selection</strong> only if you want Home page camera
+                                changes to affect capture. Choose <strong>Printer camera</strong> or <strong>External
+                                camera</strong> to pin timelapse to one source.
+                            </li>
                             <li class="mb-2">Click <strong>Save</strong> for that printer.</li>
                             <li class="mb-2">
                                 Repeat for each printer. Timelapse settings are stored per printer, so Thing 1 and Thing 2
@@ -168,6 +182,56 @@
                                 manual snapshots appear on the <strong>Snapshots</strong> page.
                             </li>
                         </ol>
+                    </div>
+                </div>
+            </div>
+            <div class="col-lg-6">
+                <div class="card h-100">
+                    <div class="card-header fs-4">{{ macro.bi_icon("thermometer-half") }} Filament Service</div>
+                    <div class="card-body">
+                        <ol class="mb-0">
+                            <li class="mb-2">Open the <strong>Filaments</strong> page to manage material profiles and printer-side filament moves.</li>
+                            <li class="mb-2">
+                                Use <strong>Quick Extrude / Retract</strong> for simple profile-based preheat, extrude,
+                                retract, and cooldown commands.
+                            </li>
+                            <li class="mb-2">
+                                The recommended swap flow preheats to <strong>Manual Swap Preheat</strong> and waits for
+                                you to change filament before pressing <strong>Continue / Load New Filament</strong>.
+                            </li>
+                            <li class="mb-2">
+                                <strong>Enable guided automatic unload / purge</strong> only when the printer is ready
+                                for movement. It will warn first, home the printer, lift Z 50 mm, park at X0 Y230, prime,
+                                retract, wait for Continue, purge the new filament, and turn the nozzle heater off.
+                            </li>
+                            <li class="mb-0">
+                                Save filament service settings after changing quick move length, swap preheat, unload
+                                profile, load profile, or prime/unload/load lengths.
+                            </li>
+                        </ol>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="row g-3 mb-3">
+            <div class="col-lg-6">
+                <div class="card h-100">
+                    <div class="card-header fs-4">{{ macro.bi_icon("activity") }} Status Badges</div>
+                    <div class="card-body">
+                        <ul class="mb-3">
+                            <li><strong>MQTT</strong> is the printer cloud message connection.</li>
+                            <li><strong>PPPP</strong> is the local printer control/video reachability check.</li>
+                            <li><strong>VIDEO</strong> is the active video stream when printer video is in use.</li>
+                            <li><strong>CTRL</strong> is the browser-to-ankerctl control channel, with printer control availability tied to PPPP reachability.</li>
+                        </ul>
+                        <div class="fw-semibold mb-2">Badge colors</div>
+                        <ul class="mb-0">
+                            <li><strong>Green</strong>: connected or reachable.</li>
+                            <li><strong>Yellow</strong>: waiting, reconnecting, or reachability is not confirmed yet.</li>
+                            <li><strong>Gray</strong>: dormant or inactive.</li>
+                            <li><strong>Red</strong>: connection or service error.</li>
+                        </ul>
                     </div>
                 </div>
             </div>
@@ -187,8 +251,13 @@
                                 </a>
                             </li>
                             <li>
+                                <a href="https://support.eufymake.com/s/" target="_blank" rel="noopener noreferrer">
+                                    eufyMake support center
+                                </a>
+                            </li>
+                            <li>
                                 <a href="https://service.eufymake.com/" target="_blank" rel="noopener noreferrer">
-                                    eufyMake support
+                                    eufyMake service portal
                                 </a>
                             </li>
                         </ul>
