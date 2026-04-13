@@ -4,6 +4,8 @@ import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
+
 import web
 from web.service.timelapse import TimelapseService, _IN_PROGRESS_SUBDIR, _resolve_ffmpeg_path
 
@@ -612,15 +614,12 @@ def test_capture_thread_crash_clears_ref(tmp_path):
     """If _capture_loop() crashes from an uncaught exception, the
     try/finally should clear _capture_thread so start_capture() knows
     the thread is dead."""
-    import threading
-    from types import SimpleNamespace
-
     class CaptureLoopCrash(BaseException):
         """Uncatchable by except Exception — simulates a fatal crash."""
 
     config_mgr = SimpleNamespace(config_root=str(tmp_path))
     svc = TimelapseService(config_mgr, captures_dir=str(tmp_path))
-    svc._interval = 0.01
+    svc._interval = 0
 
     call_count = [0]
 
@@ -630,9 +629,10 @@ def test_capture_thread_crash_clears_ref(tmp_path):
             raise CaptureLoopCrash("Simulated fatal crash")
 
     svc._take_snapshot = crashing_snapshot
-    svc._capture_thread = threading.Thread(target=svc._capture_loop, daemon=True)
-    svc._capture_thread.start()
-    svc._capture_thread.join(timeout=2)
+    svc._capture_thread = object()
+
+    with pytest.raises(CaptureLoopCrash, match="Simulated fatal crash"):
+        svc._capture_loop()
 
     assert svc._capture_thread is None, "_capture_thread should be None after crash"
 
