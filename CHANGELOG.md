@@ -57,6 +57,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  - HomeAssistantService heartbeat thread leak on MQTT reconnect
  - `/ws/ctrl` handler now catches all connection and parse errors gracefully
 
+## [1.0.1] - 2026-04-14
+
+### Fixed
+ - Dead message overwrite in filament swap start (legacy path message was silently discarded)
+ - Duplicate state update call in filament swap unload phase (first call was never visible)
+ - Degree symbol inconsistency in filament swap status messages (`C` → `°C`)
+ - ffmpeg stderr no longer leaks embedded URL credentials in camera capture error responses
+
 ## [Unreleased]
 
 ## [0.9.0] - 2023-04-17
