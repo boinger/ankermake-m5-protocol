@@ -1577,17 +1577,7 @@ def _run_legacy_swap_unload(token):
                 token,
                 printer_index=printer_index,
                 phase="heating_unload",
-                message=(
-                    f"Heating nozzle to {state['unload_temp_c']}°C; "
-                    f"waiting for {home_ready_temp_c}°C before homing..."
-                ),
-                error=None,
-            )
-            _filament_swap_state_update(
-                token,
-                printer_index=printer_index,
-                phase="heating_unload",
-                message=f"Heating nozzle to {home_preheat_temp_c}C before homing...",
+                message=f"Heating nozzle to {home_preheat_temp_c}°C before homing...",
                 error=None,
             )
             mqtt.send_gcode(f"M104 S{home_preheat_temp_c}")
@@ -4388,9 +4378,6 @@ def app_api_filament_service_swap_start():
         unload_feedrate_mm_min = FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN
         load_feedrate_mm_min = FILAMENT_SERVICE_SWAP_LOAD_FEEDRATE_MM_MIN
 
-    if _filament_swap_state_get(printer_index=printer_index) is not None:
-        return {"error": "A filament swap is already in progress"}, 409
-
     swap_state = {
         "token": token(12),
         "created_at": int(time.time()),
@@ -4420,8 +4407,9 @@ def app_api_filament_service_swap_start():
 
     if allow_legacy_swap:
         swap_state["message"] = (
-            f"Guided automatic swap will start heating {unload_profile['name']} to {unload_temp_c}°C, "
-            f"then home, wait {home_pause_s:g}s, raise Z, "
+            f"Guided automatic swap will preheat to {manual_swap_preheat_temp_c}°C, "
+            f"set {unload_profile['name']} to {unload_temp_c}°C, then home, "
+            f"wait {home_pause_s:g}s, raise Z, "
             f"extrude {prime_length_mm} mm, and retract {unload_length_mm} mm."
         )
     else:
@@ -4429,14 +4417,6 @@ def app_api_filament_service_swap_start():
             f"Recommended method enabled: preheating nozzle to {manual_swap_preheat_temp_c}°C. "
             "Release the extruder lever, remove the filament manually, insert the new filament, "
             "then confirm. Use Quick Extrude afterward if you need to purge."
-        )
-
-    if allow_legacy_swap:
-        swap_state["message"] = (
-            f"Guided automatic swap will preheat to {manual_swap_preheat_temp_c}C, "
-            f"set {unload_profile['name']} to {unload_temp_c}C, then home, "
-            f"wait {home_pause_s:g}s, raise Z, "
-            f"extrude {prime_length_mm} mm, and retract {unload_length_mm} mm."
         )
 
     if _filament_swap_state_set_if_absent(swap_state) is None:

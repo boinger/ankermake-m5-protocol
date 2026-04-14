@@ -8,6 +8,12 @@ from urllib.parse import quote
 import cli.model
 
 
+def _scrub_url_credentials(text):
+    """Remove embedded credentials from URLs in ffmpeg error output."""
+    import re
+    return re.sub(r'([a-z]+://)([^:@/\s]+:[^@/\s]+@)', r'\1***@', text)
+
+
 CAMERA_SOURCE_PRINTER = "printer"
 CAMERA_SOURCE_EXTERNAL = "external"
 DEFAULT_EXTERNAL_REFRESH_SEC = 3
@@ -254,7 +260,7 @@ def _run_ffmpeg_snapshot(ffmpeg_path, input_url, output_path, *, timeout, input_
         os.remove(output_path)
     except OSError:
         pass
-    raise CameraCaptureError(last_stderr or "Snapshot capture failed")
+    raise CameraCaptureError(_scrub_url_credentials(last_stderr) or "Snapshot capture failed")
 
 
 def _external_input_url(camera_settings):
