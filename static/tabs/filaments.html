@@ -72,9 +72,14 @@
                                 <div class="border rounded-3 p-3 h-100">
                                     <div class="fw-semibold mb-2">Swap Filament</div>
                                     <div class="alert alert-warning py-2 small mb-3">
+                                        Recommended method: preheat the nozzle, release the extruder lever,
+                                        and pull the filament manually to reduce the risk of debris or melted filament
+                                        sticking to the drive gear.
+                                        <!--
                                         Recommended method: preheat the nozzle to 130-150°C, release the extruder lever,
                                         and pull the filament manually to reduce the risk of debris or melted filament
                                         sticking to the drive gear.
+                                        -->
                                     </div>
                                     <div class="row g-3">
                                         <div class="col-12">
@@ -83,8 +88,8 @@
                                                 <div class="row g-3 align-items-end">
                                                     <div class="col-sm-6">
                                                         <label for="filament-manual-swap-temp" class="form-label">Manual Swap Preheat (°C)</label>
-                                                        <input type="number" class="form-control" id="filament-manual-swap-temp" min="130" max="150" step="1" value="140">
-                                                        <div class="form-text">Used by the recommended guided swap flow.</div>
+                                                        <input type="number" class="form-control" id="filament-manual-swap-temp" min="130" max="300" step="1" value="180">
+                                                        <div class="form-text">Manual flow preheat and legacy safe-home trigger.</div>
                                                     </div>
                                                     <div class="col-sm-6">
                                                         <div class="form-check mt-sm-4 pt-sm-2">
@@ -93,7 +98,12 @@
                                                                 Enable guided automatic unload / purge
                                                             </label>
                                                         </div>
-                                                        <div class="form-text">This will home, lift Z 50 mm, park at X0 Y230, then move filament automatically.</div>
+                                                        <div class="form-text">This will heat, home, lift Z 50 mm, then move filament automatically.</div>
+                                                    </div>
+                                                    <div class="col-sm-6">
+                                                        <label for="filament-swap-home-pause" class="form-label">Home Pause (seconds)</label>
+                                                        <input type="number" class="form-control" id="filament-swap-home-pause" min="0" max="180" step="1" value="55">
+                                                        <div class="form-text">Wait after Home All before raising Z and moving filament.</div>
                                                     </div>
                                                     <div class="col-12 d-flex flex-wrap gap-2 align-items-center">
                                                         <button class="btn btn-outline-secondary btn-sm" id="filament-save-swap-settings-btn">
@@ -122,7 +132,7 @@
                                         </div>
                                         <div class="col-sm-4">
                                             <label for="filament-swap-unload-length" class="form-label">Unload Retract (mm)</label>
-                                            <input type="number" class="form-control" id="filament-swap-unload-length" min="1" max="300" step="1" value="50">
+                                            <input type="number" class="form-control" id="filament-swap-unload-length" min="1" max="300" step="1" value="60">
                                         </div>
                                         <div class="col-sm-4">
                                             <label for="filament-swap-load-length" class="form-label">Load / Purge Length (mm)</label>

@@ -272,7 +272,7 @@ def test_filament_swap_routes_follow_manual_guided_flow_by_default(tmp_path):
     assert confirmed.get_json()["pending"] is False
     assert cancelled.status_code == 200
     assert cancelled.get_json()["pending"] is False
-    assert sent == ["M104 S140"]
+    assert sent == ["M104 S180"]
 
 
 def test_filament_swap_state_is_scoped_per_printer(tmp_path):
@@ -353,16 +353,22 @@ def test_filament_swap_state_is_scoped_per_printer(tmp_path):
     assert still0.get_json()["swap"]["token"] == token0
     assert confirmed0.status_code == 200
     assert confirmed0.get_json()["pending"] is False
-    assert sent0 == ["M104 S140"]
-    assert sent1 == ["M104 S140"]
+    assert sent0 == ["M104 S180"]
+    assert sent1 == ["M104 S180"]
 
 
 def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, monkeypatch):
     sent = []
+    home_calls = []
+    home_waits = []
+    motion_waits = []
+    park_waits = []
+    target_waits = []
     mqtt = SimpleNamespace(
         is_printing=False,
-        nozzle_temp=230,
+        nozzle_temp=250,
         send_gcode=lambda gcode: sent.append(gcode),
+        send_home=lambda axis: home_calls.append(axis),
     )
     client = app.test_client()
     old_values, old_svc, old_filaments, old_swap = _install_state(tmp_path, mqtt)
@@ -376,16 +382,39 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
         background_calls.append((target, token))
         return SimpleNamespace()
 
+    def fake_motion_wait(length_mm, feedrate_mm_min, should_continue=None):
+        motion_waits.append((length_mm, feedrate_mm_min))
+        assert should_continue is None or should_continue()
+
+    def fake_park_wait(z_lift_mm, park_x_mm, park_y_mm, should_continue=None):
+        park_waits.append((z_lift_mm, park_x_mm, park_y_mm))
+        assert should_continue is None or should_continue()
+
+    def fake_home_wait(should_continue=None, pause_s=None):
+        home_waits.append(pause_s)
+        assert should_continue is None or should_continue()
+
+    def fake_target_wait(mqtt, target_temp_c, should_continue=None):
+        target_waits.append(target_temp_c)
+        assert should_continue is None or should_continue()
+        return target_temp_c
+
     monkeypatch.setattr(web_module, "_filament_swap_start_background", fake_start_background)
+    monkeypatch.setattr(web_module, "_wait_for_filament_swap_home", fake_home_wait)
+    monkeypatch.setattr(web_module, "_wait_for_filament_swap_motion", fake_motion_wait)
+    monkeypatch.setattr(web_module, "_wait_for_filament_swap_park", fake_park_wait)
+    monkeypatch.setattr(web_module, "_wait_for_filament_service_nozzle_target", fake_target_wait)
+    monkeypatch.setattr(web_module, "FILAMENT_SERVICE_SWAP_COOLDOWN_DELAY_S", 0)
 
     try:
-        unload = app.filaments.create({"name": "PLA Black", "nozzle_temp": 220, "retract_speed": 40})
-        load = app.filaments.create({"name": "PETG White", "nozzle_temp": 240, "retract_speed": 12})
+        unload = app.filaments.create({"name": "PLA Black", "nozzle_temp_other_layer": 220, "retract_speed": 40})
+        load = app.filaments.create({"name": "PETG White", "nozzle_temp_other_layer": 240, "retract_speed": 12})
         started = client.post(
             "/api/filaments/service/swap/start",
             json={
                 "unload_profile_id": unload["id"],
                 "load_profile_id": load["id"],
+                "home_pause_s": 42,
             },
             headers={"X-Api-Key": API_KEY},
         )
@@ -418,10 +447,153 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
     assert confirmed.get_json()["pending"] is True
     assert cancelled.status_code == 200
     assert cancelled.get_json()["pending"] is False
-    assert "G28" in sent[0]
-    assert "G1 Z50 F600" in sent[0]
-    assert "G1 X0 Y230 F9000" in sent[0]
-    assert "G1 E10 F240" in sent[1]
-    assert "G1 E-55 F240" in sent[2]
-    assert "G1 E65 F240" in sent[3]
-    assert sent[4] == "M104 S0"
+    assert home_calls == ["all"]
+    assert home_waits == [42.0]
+    assert sent[0] == "M104 S180"
+    assert sent[1] == "M104 S220"
+    assert sent[2] == "M104 S220"
+    assert "G0 Z50 F600" in sent[3]
+    assert sent[4] == "M104 S220"
+    assert "G1 E10 F240" in sent[5]
+    assert "G1 E-55 F2700" in sent[6]
+    assert sent[7] == "M104 S240"
+    assert "G1 E65 F240" in sent[8]
+    assert sent[9] == "M104 S0"
+    assert target_waits == [220, 220, 220]
+    assert motion_waits == [(10, 240), (55, 2700), (65, 240)]
+    assert park_waits == [(50.0, 0.0, 230.0)]
+
+
+def test_legacy_swap_sends_heat_before_homing_when_nozzle_is_cold(tmp_path, monkeypatch):
+    sent = []
+    home_calls = []
+    home_waits = []
+    wait_calls = []
+    motion_waits = []
+    park_waits = []
+    target_waits = []
+    mqtt = SimpleNamespace(
+        is_printing=False,
+        nozzle_temp=25,
+        send_gcode=lambda gcode: sent.append(gcode),
+        send_home=lambda axis: home_calls.append(axis),
+    )
+    client = app.test_client()
+    old_values, old_svc, old_filaments, old_swap = _install_state(tmp_path, mqtt)
+    app.config["config"].cfg.filament_service["allow_legacy_swap"] = True
+    background_calls = []
+
+    def fake_start_background(target, token):
+        background_calls.append((target, token))
+        return SimpleNamespace()
+
+    def fake_wait_for_nozzle(mqtt, target_temp_c, should_continue=None, tolerance_c=5):
+        wait_calls.append((target_temp_c, tolerance_c))
+        assert should_continue is None or should_continue()
+        return target_temp_c
+
+    def fake_motion_wait(length_mm, feedrate_mm_min, should_continue=None):
+        motion_waits.append((length_mm, feedrate_mm_min))
+        assert should_continue is None or should_continue()
+
+    def fake_park_wait(z_lift_mm, park_x_mm, park_y_mm, should_continue=None):
+        park_waits.append((z_lift_mm, park_x_mm, park_y_mm))
+        assert should_continue is None or should_continue()
+
+    def fake_home_wait(should_continue=None, pause_s=None):
+        home_waits.append(pause_s)
+        assert should_continue is None or should_continue()
+
+    def fake_target_wait(mqtt, target_temp_c, should_continue=None):
+        target_waits.append(target_temp_c)
+        assert should_continue is None or should_continue()
+        return target_temp_c
+
+    monkeypatch.setattr(web_module, "_filament_swap_start_background", fake_start_background)
+    monkeypatch.setattr(web_module, "_wait_for_filament_swap_home", fake_home_wait)
+    monkeypatch.setattr(web_module, "_wait_for_filament_swap_motion", fake_motion_wait)
+    monkeypatch.setattr(web_module, "_wait_for_filament_swap_park", fake_park_wait)
+    monkeypatch.setattr(web_module, "_wait_for_filament_service_nozzle", fake_wait_for_nozzle)
+    monkeypatch.setattr(web_module, "_wait_for_filament_service_nozzle_target", fake_target_wait)
+
+    try:
+        unload = app.filaments.create({"name": "PLA Cold", "nozzle_temp_other_layer": 220})
+        load = app.filaments.create({"name": "PETG Cold", "nozzle_temp_other_layer": 240})
+        started = client.post(
+            "/api/filaments/service/swap/start",
+            json={
+                "unload_profile_id": unload["id"],
+                "load_profile_id": load["id"],
+            },
+            headers={"X-Api-Key": API_KEY},
+        )
+        start_target, token = background_calls.pop()
+        start_target(token)
+    finally:
+        _restore_state(old_values, old_svc, old_filaments, old_swap)
+
+    assert started.status_code == 200
+    assert sent[0] == "M104 S180"
+    assert sent[1] == "M104 S220"
+    assert sent[2] == "M104 S220"
+    assert home_calls == ["all"]
+    assert home_waits == [55.0]
+    assert "G0 Z50 F600" in sent[3]
+    assert sent[4] == "M104 S220"
+    assert "G1 E10 F240" in sent[5]
+    assert "G1 E-60 F2700" in sent[6]
+    assert wait_calls == [(180, 0), (220, 5)]
+    assert target_waits == [220, 220, 220]
+    assert motion_waits == [(10.0, 240), (60.0, 2700)]
+    assert park_waits == [(50.0, 0.0, 230.0)]
+
+
+def test_legacy_swap_cancel_is_allowed_while_stage_is_running(tmp_path, monkeypatch):
+    sent = []
+    mqtt = SimpleNamespace(
+        is_printing=False,
+        nozzle_temp=25,
+        send_gcode=lambda gcode: sent.append(gcode),
+    )
+    client = app.test_client()
+    old_values, old_svc, old_filaments, old_swap = _install_state(tmp_path, mqtt)
+    app.config["config"].cfg.filament_service["allow_legacy_swap"] = True
+    background_calls = []
+
+    def fake_start_background(target, token):
+        background_calls.append((target, token))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(web_module, "_filament_swap_start_background", fake_start_background)
+
+    try:
+        unload = app.filaments.create({"name": "PLA Running", "nozzle_temp_other_layer": 220})
+        load = app.filaments.create({"name": "PETG Running", "nozzle_temp_other_layer": 240})
+        started = client.post(
+            "/api/filaments/service/swap/start",
+            json={
+                "unload_profile_id": unload["id"],
+                "load_profile_id": load["id"],
+            },
+            headers={"X-Api-Key": API_KEY},
+        )
+        token = started.get_json()["swap"]["token"]
+        cancelled = client.post(
+            "/api/filaments/service/swap/cancel",
+            json={"token": token},
+            headers={"X-Api-Key": API_KEY},
+        )
+        state = client.get(
+            "/api/filaments/service/swap",
+            headers={"X-Api-Key": API_KEY},
+        )
+    finally:
+        _restore_state(old_values, old_svc, old_filaments, old_swap)
+
+    assert started.status_code == 200
+    assert background_calls
+    assert cancelled.status_code == 200
+    assert cancelled.get_json()["pending"] is False
+    assert state.status_code == 200
+    assert state.get_json()["pending"] is False
+    assert sent == ["M104 S0"]

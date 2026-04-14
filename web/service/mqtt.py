@@ -147,6 +147,7 @@ class MqttQueue(Service):
         self._last_message_time = 0.0
         self._nozzle_temp = None
         self._nozzle_temp_target = None
+        self._nozzle_temp_updated_at = 0.0
         self._bed_temp = None
         self._bed_temp_target = None
         self._z_offset_steps = None
@@ -401,6 +402,10 @@ class MqttQueue(Service):
     @property
     def nozzle_temp(self):
         return self._nozzle_temp
+
+    @property
+    def nozzle_temp_updated_at(self):
+        return getattr(self, "_nozzle_temp_updated_at", 0.0)
 
     @property
     def nozzle_temp_target(self):
@@ -1159,6 +1164,7 @@ class MqttQueue(Service):
             if current is not None:
                 # Temps may come in 1/100th degree units
                 self._nozzle_temp = self._normalize_temp(current)
+                self._nozzle_temp_updated_at = time.time()
                 ha_updates["nozzle_temp"] = self._nozzle_temp
             if target is not None:
                 self._nozzle_temp_target = self._normalize_temp(target)

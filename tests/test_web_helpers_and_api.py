@@ -394,6 +394,11 @@ def test_access_log_noise_filter_suppresses_console_polling_and_static_assets():
         msg='127.0.0.1 - - [09/Apr/2026 10:15:00] "GET /api/printer/runtime-state HTTP/1.1" 200 -',
         args=(), exc_info=None,
     )
+    swap_record = logging.LogRecord(
+        name="werkzeug", level=logging.INFO, pathname=__file__, lineno=0,
+        msg='127.0.0.1 - - [13/Apr/2026 20:50:30] "GET /api/filaments/service/swap?printer_index=0 HTTP/1.1" 200 -',
+        args=(), exc_info=None,
+    )
     api_record = logging.LogRecord(
         name="werkzeug", level=logging.INFO, pathname=__file__, lineno=0,
         msg='127.0.0.1 - - [08/Apr/2026 17:57:47] "GET /api/health HTTP/1.1" 200 -',
@@ -403,6 +408,7 @@ def test_access_log_noise_filter_suppresses_console_polling_and_static_assets():
     assert filt.filter(console_record) is False
     assert filt.filter(static_record) is False
     assert filt.filter(runtime_record) is False
+    assert filt.filter(swap_record) is False
     assert filt.filter(api_record) is True
 
 
