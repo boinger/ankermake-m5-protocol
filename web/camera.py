@@ -1,6 +1,8 @@
 import os
+import queue
 import subprocess
 import tempfile
+import threading
 from urllib.parse import quote
 
 import cli.model
@@ -12,6 +14,9 @@ DEFAULT_EXTERNAL_REFRESH_SEC = 3
 PRINTERS_WITHOUT_CAMERA = {"V8110"}
 RTSP_LOW_LATENCY_INPUT_ARGS = ["-fflags", "nobuffer", "-probesize", "32768", "-analyzeduration", "0"]
 _ALLOWED_CAMERA_URL_SCHEMES = {"http", "https", "rtsp", "rtmp"}
+_MJPEG_STALE_READ_TIMEOUT_SEC = 10.0
+_MJPEG_READER_QUEUE_SIZE = 4
+_MJPEG_READ_DONE = object()
 
 
 class CameraCaptureError(RuntimeError):
@@ -307,14 +312,53 @@ def open_external_mjpeg_stream(ffmpeg_path, input_url, *, scale=None):
         raise CameraCaptureError(f"External camera stream could not start ffmpeg: {exc}") from exc
 
 
-def iter_mjpeg_frames(proc, *, chunk_size=8192, max_buffer=4 * 1024 * 1024):
+def iter_mjpeg_frames(proc, *, chunk_size=8192, max_buffer=4 * 1024 * 1024, stale_timeout=_MJPEG_STALE_READ_TIMEOUT_SEC):
     stdout = getattr(proc, "stdout", None)
     if stdout is None:
         return
 
+    chunks = queue.Queue(maxsize=_MJPEG_READER_QUEUE_SIZE)
+
+    def _reader():
+        try:
+            while True:
+                chunk = stdout.read(chunk_size)
+                while True:
+                    try:
+                        chunks.put(chunk, timeout=0.5)
+                        break
+                    except queue.Full:
+                        if getattr(proc, "poll", lambda: None)() is not None:
+                            return
+                if not chunk:
+                    break
+        except Exception as exc:
+            try:
+                chunks.put(exc, timeout=0.5)
+            except queue.Full:
+                pass
+        finally:
+            try:
+                chunks.put(_MJPEG_READ_DONE, timeout=0.5)
+            except queue.Full:
+                pass
+
+    threading.Thread(target=_reader, daemon=True, name="external-mjpeg-reader").start()
+
     buffer = bytearray()
     while True:
-        chunk = stdout.read(chunk_size)
+        try:
+            read_timeout = max(0.001, float(stale_timeout))
+        except (TypeError, ValueError):
+            read_timeout = _MJPEG_STALE_READ_TIMEOUT_SEC
+        try:
+            chunk = chunks.get(timeout=read_timeout)
+        except queue.Empty:
+            break
+        if chunk is _MJPEG_READ_DONE:
+            break
+        if isinstance(chunk, Exception):
+            break
         if not chunk:
             break
         buffer.extend(chunk)

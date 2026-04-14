@@ -36,7 +36,7 @@ class FakeManagedService:
         self.state = RunState.Running
         return True
 
-    def await_stopped(self):
+    def await_stopped(self, timeout=None):
         self.await_stopped_calls += 1
         self.state = RunState.Stopped
         return True
@@ -130,6 +130,46 @@ def test_service_manager_restart_all_stream_and_atexit():
     assert wanted.shutdown_calls == 1
     assert wanted_stops.shutdown_calls == 1
     assert idle.shutdown_calls == 1
+
+
+def test_service_manager_replace_service_waits_for_old_service_stop_before_swap():
+    manager = ServiceManager()
+
+    class ReplaceableService(FakeManagedService):
+        def __init__(self):
+            super().__init__(wanted=True, state=RunState.Running)
+            self.force_close_calls = 0
+            self.join_calls = 0
+            self.join_timeout = None
+
+        def _force_close_api(self):
+            self.force_close_calls += 1
+
+        def await_stopped(self, timeout=None):
+            self.await_stopped_calls += 1
+            assert manager.svcs["pppp:0"] is self
+            assert timeout is not None
+            self.state = RunState.Stopped
+            return True
+
+        def join(self, timeout=None):
+            self.join_calls += 1
+            self.join_timeout = timeout
+
+    old = ReplaceableService()
+    new = FakeManagedService()
+    manager.register("pppp:0", old)
+
+    manager.replace_service("pppp:0", new)
+
+    assert old.stop_calls == 1
+    assert old.await_stopped_calls == 1
+    assert old.force_close_calls == 1
+    assert old.running is False
+    assert old.join_calls == 1
+    assert old.join_timeout is not None
+    assert manager.svcs["pppp:0"] is new
+    assert manager.refs["pppp:0"] == 0
 
 
 def test_service_stream_bounded_queue_drops_oldest_items():

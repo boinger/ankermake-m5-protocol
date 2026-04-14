@@ -4,13 +4,15 @@ import contextlib
 import time
 
 from enum import Enum
-from threading import Thread, Event
+from threading import Thread, Event, current_thread
 from datetime import datetime, timedelta
 import queue
 from queue import Queue
 
 _START_FAILURE_REPEAT_NOTICE_SECONDS = 10.0
 _START_FAILURE_REPEAT_NOTICE_COUNT = 5
+_REPLACE_SERVICE_STOP_TIMEOUT_SECONDS = 5.0
+_REPLACE_SERVICE_JOIN_TIMEOUT_SECONDS = 1.0
 
 
 class Holdoff:
@@ -285,7 +287,11 @@ class Service(Thread):
 
             self.idle(timeout=0.4)
 
-    def await_stopped(self):
+    def await_stopped(self, timeout=None):
+        deadline = None
+        if timeout is not None:
+            deadline = time.monotonic() + max(0.0, float(timeout))
+
         while True:
             if self.wanted:
                 log.warning(f"{self.name}: Service started while waiting for it to stop")
@@ -295,7 +301,15 @@ class Service(Thread):
                 log.debug(f"{self.name}: Stopped")
                 return True
 
-            self.idle(timeout=0.4)
+            wait_timeout = 0.4
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning(f"{self.name}: Timed out waiting for service to stop")
+                    return False
+                wait_timeout = min(wait_timeout, remaining)
+
+            self.idle(timeout=wait_timeout)
 
 
 class ServiceManager:
@@ -381,10 +395,20 @@ class ServiceManager:
             raise KeyError(f"Trying to replace unknown service {name!r}")
 
         old = self.svcs[name]
+        stopped = old.state == RunState.Stopped
+        replacing_current_thread = old is current_thread()
         try:
-            old.wanted = False
+            old.stop()
         except Exception:
-            pass
+            try:
+                old.wanted = False
+            except Exception:
+                pass
+        else:
+            try:
+                old.wanted = False
+            except Exception:
+                pass
         try:
             if hasattr(old, "_event"):
                 old._event.set()
@@ -395,9 +419,36 @@ class ServiceManager:
                 old._force_close_api()
         except Exception:
             pass
+
+        if not stopped and replacing_current_thread:
+            log.warning("%s: Replacement requested from the old service thread; skipping stop wait", name)
+        elif not stopped:
+            try:
+                stopped = old.await_stopped(timeout=_REPLACE_SERVICE_STOP_TIMEOUT_SECONDS)
+            except Exception as exc:
+                stopped = False
+                log.warning("%s: Failed waiting for old service %r to stop before replacement: %s", name, old, exc)
+
+        if not stopped:
+            log.warning(
+                "%s: Replacing service before old worker fully stopped after %.1fs",
+                name,
+                _REPLACE_SERVICE_STOP_TIMEOUT_SECONDS,
+            )
+
         try:
             old.running = False
         except Exception:
+            pass
+        try:
+            if hasattr(old, "_event"):
+                old._event.set()
+        except Exception:
+            pass
+        try:
+            if hasattr(old, "join") and not replacing_current_thread:
+                old.join(timeout=_REPLACE_SERVICE_JOIN_TIMEOUT_SECONDS)
+        except RuntimeError:
             pass
 
         self.svcs[name] = svc

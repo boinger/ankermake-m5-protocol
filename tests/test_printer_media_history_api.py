@@ -1008,6 +1008,24 @@ def test_snapshot_and_camera_frame_routes_support_external_camera(monkeypatch):
     assert all(call["ffmpeg_path"] == "/usr/bin/ffmpeg" for call in captures)
 
 
+def test_external_camera_stream_requires_auth_when_api_key_enabled():
+    client = app.test_client()
+    old_values, old_svc = _install_app_state(
+        video_supported=False,
+        videoqueue=None,
+    )
+
+    try:
+        unauthorized = client.get("/api/camera/stream")
+        authorized = client.get("/api/camera/stream", headers={"X-Api-Key": API_KEY})
+    finally:
+        _restore_app_state(old_values, old_svc)
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 400
+    assert authorized.get_json()["error"] == "External camera is not the active camera source."
+
+
 def test_camera_frame_route_reports_external_capture_errors_as_bad_gateway(monkeypatch):
     cfg = _base_config()
     cfg.camera = {

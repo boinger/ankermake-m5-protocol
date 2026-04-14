@@ -4,6 +4,8 @@ import time
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
+
 import web
 from web.service.timelapse import TimelapseService, _IN_PROGRESS_SUBDIR, _resolve_ffmpeg_path
 
@@ -35,7 +37,11 @@ def test_timelapse_meta_and_video_file_helpers(tmp_path):
     meta_dir.mkdir()
     svc._write_meta(meta_dir, "cube.gcode", 3)
 
-    assert svc._read_meta(meta_dir) == {"filename": "cube.gcode", "frame_count": 3}
+    meta = svc._read_meta(meta_dir)
+    assert meta["filename"] == "cube.gcode"
+    assert meta["frame_count"] == 3
+    assert meta["printer_index"] == 0
+    assert meta["printer_scope"] == "printer_SN1"
 
     video_a = tmp_path / "a.mp4"
     video_b = tmp_path / "b.mp4"
@@ -194,10 +200,23 @@ def test_timelapse_prunes_old_videos(tmp_path):
         path.write_bytes(name.encode())
         time.sleep(0.01)
 
+    old_snapshots = tmp_path / "snapshots" / "old"
+    old_snapshots.mkdir(parents=True)
+    (old_snapshots / "frame_00000.jpg").write_bytes(b"old-frame")
+    svc._write_meta(
+        old_snapshots,
+        "old.gcode",
+        1,
+        video_filename="old.mp4",
+        archived_at="2026-04-10T12:00:00",
+        status="archived",
+    )
+
     svc._prune_old_videos()
 
     remaining = sorted(p.name for p in tmp_path.glob("*.mp4"))
     assert remaining == ["mid.mp4", "new.mp4"]
+    assert not old_snapshots.exists()
 
 
 def test_timelapse_resolves_ffmpeg_through_web_fallback(monkeypatch):
@@ -245,6 +264,95 @@ def test_timelapse_scan_recovers_or_resumes_in_progress(monkeypatch, tmp_path):
     assert scheduled and scheduled[0][1] == "young.gcode"
     assert assembled and assembled[0][1] == "old.gcode" and assembled[0][3] == "_recovered"
     assert pruned == [True]
+
+
+def test_timelapse_scan_only_recovers_matching_printer_capture(monkeypatch, tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    cfg._cfg.printers.append(SimpleNamespace(sn="SN2", name="Printer 2", model="V8111"))
+    base = tmp_path / _IN_PROGRESS_SUBDIR
+    base.mkdir()
+
+    printer_zero = base / "printer_SN1_zero_capture"
+    printer_zero.mkdir()
+    (printer_zero / "frame_00000.jpg").write_bytes(b"x")
+    (printer_zero / "frame_00001.jpg").write_bytes(b"y")
+    with open(printer_zero / ".meta", "w") as fh:
+        json.dump({
+            "filename": "zero.gcode",
+            "frame_count": 2,
+            "printer_index": 0,
+            "printer_scope": "printer_SN1",
+        }, fh)
+
+    printer_one = base / "printer_SN2_one_capture"
+    printer_one.mkdir()
+    (printer_one / "frame_00000.jpg").write_bytes(b"x")
+    (printer_one / "frame_00001.jpg").write_bytes(b"y")
+    with open(printer_one / ".meta", "w") as fh:
+        json.dump({
+            "filename": "one.gcode",
+            "frame_count": 2,
+            "printer_index": 1,
+            "printer_scope": "printer_SN2",
+        }, fh)
+
+    scheduled = []
+    finalized = []
+
+    monkeypatch.setattr(
+        TimelapseService,
+        "_schedule_finalize",
+        lambda self, d, f, c, suffix="": scheduled.append((self._printer_index, d, f, c, suffix)),
+    )
+    monkeypatch.setattr(
+        TimelapseService,
+        "_finalize_capture_dir",
+        lambda self, d, f, c, suffix="": finalized.append((self._printer_index, d, f, c, suffix)),
+    )
+
+    svc0 = TimelapseService(cfg, captures_dir=tmp_path, printer_index=0)
+    assert svc0._resume_filename == "zero.gcode"
+    assert scheduled == [(0, str(printer_zero), "zero.gcode", 2, "")]
+    assert finalized == []
+
+    scheduled.clear()
+    svc1 = TimelapseService(cfg, captures_dir=tmp_path, printer_index=1)
+    assert svc1._resume_filename == "one.gcode"
+    assert scheduled == [(1, str(printer_one), "one.gcode", 2, "")]
+    assert finalized == []
+
+
+def test_timelapse_archived_media_listing_is_scoped_per_printer(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    cfg._cfg.printers.append(SimpleNamespace(sn="SN2", name="Printer 2", model="V8111"))
+
+    svc0 = TimelapseService(cfg, captures_dir=tmp_path, printer_index=0)
+    svc1 = TimelapseService(cfg, captures_dir=tmp_path, printer_index=1)
+
+    (tmp_path / "printer_SN1_zero.mp4").write_bytes(b"zero")
+    (tmp_path / "printer_SN2_one.mp4").write_bytes(b"one")
+    (tmp_path / "legacy.mp4").write_bytes(b"legacy")
+
+    snapshots = tmp_path / "snapshots"
+    zero_snapshots = snapshots / "printer_SN1_zero"
+    zero_snapshots.mkdir(parents=True)
+    (zero_snapshots / "frame_00000.jpg").write_bytes(b"zero")
+    svc0._write_meta(zero_snapshots, "zero.gcode", 1)
+
+    one_snapshots = snapshots / "printer_SN2_one"
+    one_snapshots.mkdir(parents=True)
+    (one_snapshots / "frame_00000.jpg").write_bytes(b"one")
+    svc1._write_meta(one_snapshots, "one.gcode", 1)
+
+    assert [video["filename"] for video in svc0.list_videos()] == [
+        "printer_SN1_zero.mp4",
+        "legacy.mp4",
+    ]
+    assert [video["filename"] for video in svc1.list_videos()] == ["printer_SN2_one.mp4"]
+    assert [collection["id"] for collection in svc0.list_snapshots()] == ["printer_SN1_zero"]
+    assert [collection["id"] for collection in svc1.list_snapshots()] == ["printer_SN2_one"]
+    assert svc0.get_video_path("legacy.mp4") == str(tmp_path / "legacy.mp4")
+    assert svc1.get_video_path("legacy.mp4") is None
 
 
 def test_timelapse_finish_and_fail_paths(monkeypatch, tmp_path):
@@ -506,15 +614,12 @@ def test_capture_thread_crash_clears_ref(tmp_path):
     """If _capture_loop() crashes from an uncaught exception, the
     try/finally should clear _capture_thread so start_capture() knows
     the thread is dead."""
-    import threading
-    from types import SimpleNamespace
-
     class CaptureLoopCrash(BaseException):
         """Uncatchable by except Exception — simulates a fatal crash."""
 
     config_mgr = SimpleNamespace(config_root=str(tmp_path))
     svc = TimelapseService(config_mgr, captures_dir=str(tmp_path))
-    svc._interval = 0.01
+    svc._interval = 0
 
     call_count = [0]
 
@@ -524,9 +629,10 @@ def test_capture_thread_crash_clears_ref(tmp_path):
             raise CaptureLoopCrash("Simulated fatal crash")
 
     svc._take_snapshot = crashing_snapshot
-    svc._capture_thread = threading.Thread(target=svc._capture_loop, daemon=True)
-    svc._capture_thread.start()
-    svc._capture_thread.join(timeout=2)
+    svc._capture_thread = object()
+
+    with pytest.raises(CaptureLoopCrash, match="Simulated fatal crash"):
+        svc._capture_loop()
 
     assert svc._capture_thread is None, "_capture_thread should be None after crash"
 
@@ -784,6 +890,40 @@ def test_timelapse_service_uses_per_printer_settings_when_present(tmp_path):
     assert svc1._save_persistent is False
     assert svc1._light_mode == "snapshot"
     assert svc1._camera_source == "external"
+
+
+def test_timelapse_reload_config_applies_saved_output_dir(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    initial_dir = tmp_path / "captures-initial"
+    updated_dir = tmp_path / "captures-updated"
+    cfg._cfg.timelapse["output_dir"] = str(initial_dir)
+
+    svc = TimelapseService(cfg)
+
+    assert svc._captures_dir == str(initial_dir)
+    assert initial_dir.is_dir()
+
+    cfg._cfg.timelapse["output_dir"] = str(updated_dir)
+    svc.reload_config()
+
+    assert svc._captures_dir == str(updated_dir)
+    assert updated_dir.is_dir()
+
+    (updated_dir / "updated.mp4").write_bytes(b"video")
+    assert svc.get_video_path("updated.mp4") == str(updated_dir / "updated.mp4")
+
+
+def test_timelapse_explicit_captures_dir_overrides_saved_output_dir(tmp_path):
+    cfg = FakeConfigManager(tmp_path)
+    explicit_dir = tmp_path / "explicit"
+    configured_dir = tmp_path / "configured"
+    cfg._cfg.timelapse["output_dir"] = str(configured_dir)
+
+    svc = TimelapseService(cfg, captures_dir=explicit_dir)
+
+    assert svc._captures_dir == str(explicit_dir)
+    assert explicit_dir.is_dir()
+    assert not configured_dir.exists()
 
 
 def test_timelapse_runtime_state_reports_recovery(tmp_path):

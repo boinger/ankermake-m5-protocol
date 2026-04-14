@@ -341,7 +341,11 @@ def test_pppp_probe_helper_and_state_websocket_emit_status(monkeypatch):
             "client_count": 1,
         }
 
-    old_values, old_svc = _install_app_state(web_module, config=FakeConfigManager(_base_config()), printer_index=0)
+    old_values, old_svc = _install_app_state(
+        web_module,
+        config=FakeConfigManager(_base_config()),
+        printer_index=0,
+    )
     monkeypatch.setattr("web.service.pppp.probe_pppp", lambda config, idx: True)
     monkeypatch.setattr("web.time.time", lambda: 100.0)
 
@@ -360,7 +364,10 @@ def test_pppp_probe_helper_and_state_websocket_emit_status(monkeypatch):
             }
         )
         web_module.app.svc = services
-        monkeypatch.setattr("web._maybe_start_pppp_probe", lambda reason="scheduled": None)
+        monkeypatch.setattr(
+            "web._maybe_start_pppp_probe",
+            lambda reason="scheduled", printer_index=None: None,
+        )
         monkeypatch.setattr("web.time.sleep", lambda seconds: None)
         _ws_handler(web_module, "pppp_state")(sock)
     finally:
@@ -374,7 +381,56 @@ def test_pppp_probe_helper_and_state_websocket_emit_status(monkeypatch):
                 "client_count": 0,
             }
 
-    assert json.loads(sock.sent[0]) == {"status": "connected"}
+    assert json.loads(sock.sent[0]) == {"status": "connected", "source": "probe"}
+
+
+def test_pppp_state_websocket_marks_stale_probe_success_dormant_without_reprobe(monkeypatch):
+    with web_module.app.pppp_probe_lock:
+        web_module.app.pppp_probe = {
+            "result": True,
+            "last_time": 100.0,
+            "fail_count": 0,
+            "thread": None,
+            "client_count": 1,
+        }
+
+    old_values, old_svc = _install_app_state(
+        web_module,
+        config=FakeConfigManager(_base_config()),
+        printer_index=0,
+    )
+    probe_calls = []
+
+    def record_probe(reason="scheduled", printer_index=None):
+        probe_calls.append((reason, printer_index))
+
+    try:
+        sock = FakeSock(close_after_sends=1)
+        mqtt_name = web_module.mqtt_service_name(0)
+        services = FakeServices(
+            svcs={
+                "pppp": SimpleNamespace(connected=False, wanted=False),
+                mqtt_name: SimpleNamespace(last_message_time=0.0),
+            }
+        )
+        web_module.app.svc = services
+        monkeypatch.setattr("web._maybe_start_pppp_probe", record_probe)
+        monkeypatch.setattr("web.time.time", lambda: 120.0)
+        monkeypatch.setattr("web.time.sleep", lambda seconds: None)
+        _ws_handler(web_module, "pppp_state")(sock)
+    finally:
+        _restore_app_state(web_module, old_values, old_svc)
+        with web_module.app.pppp_probe_lock:
+            web_module.app.pppp_probe = {
+                "result": None,
+                "last_time": 0.0,
+                "fail_count": 0,
+                "thread": None,
+                "client_count": 0,
+            }
+
+    assert json.loads(sock.sent[0]) == {"status": "dormant", "source": "none"}
+    assert probe_calls == []
 
 
 def test_pppp_probe_helper_skips_when_services_are_already_recovering(monkeypatch):

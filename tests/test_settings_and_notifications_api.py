@@ -359,6 +359,7 @@ def test_filament_service_settings_endpoints_persist_manual_and_legacy_modes():
                     "swap_prime_length_mm": 10,
                     "swap_unload_length_mm": 55,
                     "swap_load_length_mm": 65,
+                    "swap_home_pause_s": 42,
                 }
             },
             headers={"X-Api-Key": "secret-key-123456"},
@@ -376,8 +377,9 @@ def test_filament_service_settings_endpoints_persist_manual_and_legacy_modes():
     assert got.get_json()["filament_service"]["allow_legacy_swap"] is False
     assert got.get_json()["filament_service"]["quick_move_length_mm"] == 40
     assert got.get_json()["filament_service"]["swap_prime_length_mm"] == 10
-    assert got.get_json()["filament_service"]["swap_unload_length_mm"] == 50
+    assert got.get_json()["filament_service"]["swap_unload_length_mm"] == 60
     assert got.get_json()["filament_service"]["swap_load_length_mm"] == 120
+    assert got.get_json()["filament_service"]["swap_home_pause_s"] == 55
     assert updated.status_code == 200
     assert updated.get_json()["filament_service"]["allow_legacy_swap"] is True
     assert updated.get_json()["filament_service"]["manual_swap_preheat_temp_c"] == 149
@@ -385,11 +387,13 @@ def test_filament_service_settings_endpoints_persist_manual_and_legacy_modes():
     assert updated.get_json()["filament_service"]["swap_prime_length_mm"] == 10
     assert updated.get_json()["filament_service"]["swap_unload_length_mm"] == 55
     assert updated.get_json()["filament_service"]["swap_load_length_mm"] == 65
+    assert updated.get_json()["filament_service"]["swap_home_pause_s"] == 42
     assert clamped.status_code == 200
     assert cfg.filament_service["allow_legacy_swap"] is True
     assert cfg.filament_service["quick_move_length_mm"] == 12.5
     assert cfg.filament_service["swap_prime_length_mm"] == 10
     assert cfg.filament_service["swap_unload_length_mm"] == 55
     assert cfg.filament_service["swap_load_length_mm"] == 65
-    assert cfg.filament_service["manual_swap_preheat_temp_c"] == 150
-    assert clamped.get_json()["filament_service"]["manual_swap_preheat_temp_c"] == 150
+    assert cfg.filament_service["swap_home_pause_s"] == 42
+    assert cfg.filament_service["manual_swap_preheat_temp_c"] == 300
+    assert clamped.get_json()["filament_service"]["manual_swap_preheat_temp_c"] == 300

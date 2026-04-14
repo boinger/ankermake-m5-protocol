@@ -3,9 +3,103 @@ Test suite for security validation
 Tests SQL injection, XSS, path traversal, input validation
 """
 
+from contextlib import contextmanager
+from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
 import pytest
-from unittest.mock import Mock, patch, MagicMock
-from flask import Flask
+
+from cli.model import Account, Config, Printer
+from web import app
+from web.service.filament import FilamentStore
+
+
+API_KEY = "secret-key-123456"
+
+
+def _pending_security_coverage(reason):
+    pytest.skip(f"Pending security coverage: {reason}")
+
+
+def _printer(sn="SN1", name="Printer", model="V8111"):
+    return Printer(
+        id=sn,
+        sn=sn,
+        name=name,
+        model=model,
+        create_time=datetime(2024, 1, 1, 12, 0, 0),
+        update_time=datetime(2024, 1, 1, 12, 0, 0),
+        wifi_mac="aabbccddeeff",
+        ip_addr="192.168.1.10",
+        mqtt_key=b"\x01\x02",
+        api_hosts=["api.example"],
+        p2p_hosts=["p2p.example"],
+        p2p_duid=f"duid-{sn}",
+        p2p_key="secret",
+    )
+
+
+def _base_config():
+    return Config(
+        account=Account(
+            auth_token="token",
+            region="eu",
+            user_id="user-1",
+            email="user@example.com",
+        ),
+        printers=[_printer()],
+    )
+
+
+class FakeConfigManager:
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    @contextmanager
+    def open(self):
+        yield self.cfg
+
+    @contextmanager
+    def modify(self):
+        yield self.cfg
+
+
+def _install_security_state(tmp_path):
+    old_values = {
+        "api_key": app.config.get("api_key"),
+        "config": app.config.get("config"),
+        "login": app.config.get("login"),
+        "printer_index": app.config.get("printer_index"),
+        "printer_index_locked": app.config.get("printer_index_locked"),
+        "unsupported_device": app.config.get("unsupported_device"),
+        "video_supported": app.config.get("video_supported"),
+    }
+    old_svc = app.svc
+    old_filaments = getattr(app, "filaments", None)
+
+    app.config["api_key"] = API_KEY
+    app.config["config"] = FakeConfigManager(_base_config())
+    app.config["login"] = True
+    app.config["printer_index"] = 0
+    app.config["printer_index_locked"] = False
+    app.config["unsupported_device"] = False
+    app.config["video_supported"] = True
+    app.svc = SimpleNamespace(svcs={})
+    app.filaments = FilamentStore(tmp_path / "security-filaments.db")
+
+    return old_values, old_svc, old_filaments
+
+
+def _restore_security_state(old_values, old_svc, old_filaments):
+    app.svc = old_svc
+    app.filaments = old_filaments
+    for key, value in old_values.items():
+        app.config[key] = value
+
+
+def _auth_headers():
+    return {"X-Api-Key": API_KEY}
 
 
 class TestSQLInjectionProtection:
@@ -61,17 +155,11 @@ class TestPathTraversalProtection:
 
     def test_log_viewer_path_traversal_blocked(self):
         """GET /api/debug/logs/../../../etc/passwd is blocked"""
-        # This would need actual Flask test client
-        # Skeleton for implementation:
-        # 1. Request /api/debug/logs/../../../etc/passwd
-        # 2. Assert 400 Bad Request or path normalized to logs dir
-        pass
+        _pending_security_coverage("debug log file path traversal")
 
     def test_timelapse_filename_path_traversal(self):
         """Timelapse download with ../ in filename is blocked"""
-        # Test GET /api/timelapse/../../etc/passwd
-        # Should return 404 or 400
-        pass
+        _pending_security_coverage("timelapse download path traversal")
 
     def test_file_upload_path_sanitization(self):
         """File upload with path separators is sanitized"""
@@ -91,15 +179,11 @@ class TestXSSProtection:
 
     def test_gcode_filename_xss_escaped_in_response(self):
         """GCode filename with XSS payload is escaped in API response"""
-        # Test that <script>alert('XSS')</script>.gcode is escaped
-        # in JSON responses and HTML rendering
-        pass
+        _pending_security_coverage("G-code filename escaping in rendered UI")
 
     def test_printer_name_xss_escaped(self):
         """Printer name with HTML tags is escaped"""
-        # Test renaming printer to <img src=x onerror=alert(1)>
-        # Should be escaped in web UI
-        pass
+        _pending_security_coverage("printer name escaping in rendered UI")
 
 
 class TestInputValidation:
@@ -107,53 +191,76 @@ class TestInputValidation:
 
     def test_oversized_file_upload_rejected(self):
         """File upload exceeding UPLOAD_MAX_MB returns 413"""
-        # Mock file upload > UPLOAD_MAX_MB
-        # Assert HTTP 413 Payload Too Large
-        pass
+        _pending_security_coverage("oversized G-code upload request")
 
-    def test_invalid_api_key_format_rejected(self):
+    def test_invalid_api_key_format_rejected(self, tmp_path):
         """Malformed API key in X-Api-Key header is rejected"""
-        # Test with: null, empty string, SQL injection, XSS
-        pass
+        client = app.test_client()
+        old_values, old_svc, old_filaments = _install_security_state(tmp_path)
+        try:
+            for value in ("", "' OR 1=1 --", "<script>alert(1)</script>"):
+                response = client.get("/api/filaments", headers={"X-Api-Key": value})
+                assert response.status_code == 401
+        finally:
+            _restore_security_state(old_values, old_svc, old_filaments)
 
     def test_invalid_upload_rate_rejected(self):
         """Upload rate outside valid range (5,10,25,50,100) is rejected"""
-        from web import app as web_app
+        _pending_security_coverage("upload rate validation in settings/update routes")
 
-        # Test with invalid values: 0, -1, 999, "abc", null
-        invalid_values = [0, -1, 999, 1000, "abc", None]
-
-        for value in invalid_values:
-            # Should either reject or fall back to default
-            pass
-
-    def test_negative_printer_index_rejected(self):
+    def test_negative_printer_index_rejected(self, tmp_path):
         """Negative printer index in POST /api/printers/active is rejected"""
-        # Test index=-1, should return 400 or 404
-        pass
+        client = app.test_client()
+        old_values, old_svc, old_filaments = _install_security_state(tmp_path)
+        try:
+            response = client.post(
+                "/api/printers/active",
+                json={"index": -1},
+                headers=_auth_headers(),
+            )
+        finally:
+            _restore_security_state(old_values, old_svc, old_filaments)
 
-    def test_invalid_json_in_request_body(self):
+        assert response.status_code == 400
+
+    def test_invalid_json_in_request_body(self, tmp_path):
         """Malformed JSON in POST request returns 400"""
-        # Send invalid JSON to /api/filaments
-        # Assert 400 Bad Request
-        pass
+        client = app.test_client()
+        old_values, old_svc, old_filaments = _install_security_state(tmp_path)
+        try:
+            response = client.post(
+                "/api/filaments",
+                data="{bad json",
+                content_type="application/json",
+                headers=_auth_headers(),
+            )
+        finally:
+            _restore_security_state(old_values, old_svc, old_filaments)
 
-    def test_missing_required_fields_in_filament_create(self):
+        assert response.status_code == 400
+
+    def test_missing_required_fields_in_filament_create(self, tmp_path):
         """Creating filament without required fields returns 400"""
-        # POST /api/filaments with missing 'name' field
-        # Assert 400 Bad Request with clear error message
-        pass
+        client = app.test_client()
+        old_values, old_svc, old_filaments = _install_security_state(tmp_path)
+        try:
+            response = client.post(
+                "/api/filaments",
+                json={"material": "PLA"},
+                headers=_auth_headers(),
+            )
+        finally:
+            _restore_security_state(old_values, old_svc, old_filaments)
+
+        assert response.status_code == 400
 
     def test_excessively_long_filament_name(self):
         """Filament name > reasonable length is rejected or truncated"""
-        # Test with 10,000 character name
-        pass
+        _pending_security_coverage("maximum filament profile name length")
 
     def test_invalid_temperature_values(self):
         """Negative or extremely high temperatures are validated"""
-        # nozzle_temp=-10, bed_temp=1000
-        # Should be rejected or clamped
-        pass
+        _pending_security_coverage("filament temperature bounds validation")
 
 
 class TestMQTTCommandInjection:
@@ -161,37 +268,54 @@ class TestMQTTCommandInjection:
 
     def test_gcode_command_newline_injection(self):
         """GCode with embedded newlines doesn't inject multiple commands"""
-        # Attempt to inject multiple commands via newline
-        malicious_gcode = "G28\nM104 S300\nM140 S150"
-
-        # Should either reject or sanitize
-        # (Implementation-specific: might allow, split, or reject)
-        assert "\n" in malicious_gcode
-        pass
+        _pending_security_coverage("multi-command raw G-code policy")
 
     def test_printer_name_mqtt_injection(self):
         """Printer name with MQTT control chars is sanitized"""
-        # Test renaming with embedded null bytes, control chars
-        pass
+        _pending_security_coverage("printer name control-character sanitization")
 
 
 class TestAuthenticationBypass:
     """Test authentication bypass attempts"""
 
-    def test_empty_api_key_rejected(self):
+    def test_empty_api_key_rejected(self, tmp_path):
         """Empty API key in header is rejected"""
-        # X-Api-Key: "" should be treated as missing
-        pass
+        client = app.test_client()
+        old_values, old_svc, old_filaments = _install_security_state(tmp_path)
+        try:
+            response = client.get("/api/filaments", headers={"X-Api-Key": ""})
+        finally:
+            _restore_security_state(old_values, old_svc, old_filaments)
 
-    def test_api_key_in_query_string_disabled_for_sensitive_endpoints(self):
-        """API key in query string doesn't work for login/config endpoints"""
-        # For security, sensitive operations should require header auth
-        pass
+        assert response.status_code == 401
 
-    def test_session_cookie_without_api_key_on_protected_endpoint(self):
-        """Session cookie alone doesn't grant access to protected endpoints"""
-        # When ANKERCTL_API_KEY is set, session alone insufficient
-        pass
+    def test_api_key_query_string_bootstraps_session_and_strips_url(self, tmp_path):
+        """Valid URL API key starts a browser session and redirects to a clean URL."""
+        client = app.test_client()
+        old_values, old_svc, old_filaments = _install_security_state(tmp_path)
+        try:
+            response = client.get(f"/api/filaments?apikey={API_KEY}&foo=bar")
+            assert response.status_code == 302
+            assert "apikey" not in response.headers["Location"]
+
+            session_response = client.get("/api/filaments")
+        finally:
+            _restore_security_state(old_values, old_svc, old_filaments)
+
+        assert session_response.status_code == 200
+
+    def test_session_cookie_allows_browser_access_to_protected_endpoint(self, tmp_path):
+        """Authenticated browser session can access protected GET endpoints."""
+        client = app.test_client()
+        old_values, old_svc, old_filaments = _install_security_state(tmp_path)
+        try:
+            with client.session_transaction() as session:
+                session["authenticated"] = True
+            response = client.get("/api/filaments")
+        finally:
+            _restore_security_state(old_values, old_svc, old_filaments)
+
+        assert response.status_code == 200
 
 
 class TestCSRFProtection:
@@ -199,8 +323,7 @@ class TestCSRFProtection:
 
     def test_post_without_csrf_token(self):
         """POST request without CSRF token (if implemented) is rejected"""
-        # If CSRF protection is added in future
-        pass
+        _pending_security_coverage("CSRF enforcement when that feature exists")
 
 
 class TestRateLimiting:
@@ -208,8 +331,7 @@ class TestRateLimiting:
 
     def test_excessive_api_requests_rate_limited(self):
         """Excessive API calls are rate-limited"""
-        # If rate limiting is implemented
-        pass
+        _pending_security_coverage("rate limiting when that feature exists")
 
 
 class TestEnvironmentVariableInjection:
@@ -217,9 +339,7 @@ class TestEnvironmentVariableInjection:
 
     def test_env_var_with_shell_metacharacters(self):
         """Environment variables with shell metacharacters are safe"""
-        # Test FLASK_HOST="; rm -rf /"
-        # Should not execute shell commands
-        pass
+        _pending_security_coverage("environment value shell-metacharacter handling")
 
 
 class TestFileSystemSecurity:
@@ -227,19 +347,15 @@ class TestFileSystemSecurity:
 
     def test_log_directory_creation_safe_permissions(self):
         """Log directory created with safe permissions (not world-writable)"""
-        # Check ANKERCTL_LOG_DIR creation
-        pass
+        _pending_security_coverage("log directory permissions across platforms")
 
     def test_config_file_permissions(self):
         """Config file (default.json) has restricted permissions"""
-        # Should not be world-readable (contains tokens)
-        pass
+        _pending_security_coverage("config file permissions across platforms")
 
     def test_timelapse_temp_files_cleaned_up(self):
         """Temporary timelapse files are cleaned up on error"""
-        # Simulate capture failure
-        # Assert temp files removed
-        pass
+        _pending_security_coverage("timelapse temp-file cleanup on failure")
 
 
 # Integration test: Full security audit
@@ -247,25 +363,63 @@ class TestFileSystemSecurity:
 class TestSecurityIntegration:
     """Integration tests combining multiple attack vectors"""
 
-    def test_full_attack_chain_blocked(self):
+    def test_full_attack_chain_blocked(self, tmp_path):
         """Combined SQL injection + XSS + path traversal is blocked"""
-        # Complex attack scenario combining multiple vectors
-        pass
+        client = app.test_client()
+        old_values, old_svc, old_filaments = _install_security_state(tmp_path)
+        try:
+            response = client.get(
+                "/api/debug/state/..%2F..%2Fetc%2Fpasswd",
+                query_string={
+                    "name": "<script>alert(1)</script>",
+                    "filter": "' OR 1=1 --",
+                },
+                headers={"X-Api-Key": "' OR 1=1 --"},
+            )
+        finally:
+            _restore_security_state(old_values, old_svc, old_filaments)
 
-    def test_anonymous_user_cannot_access_protected_endpoints(self):
+        assert response.status_code == 401
+
+    def test_anonymous_user_cannot_access_protected_endpoints(self, tmp_path):
         """All protected endpoints require authentication"""
-        protected_endpoints = [
-            "/api/printer/gcode",
-            "/api/printer/control",
-            "/api/filaments",
-            "/api/debug/state",
-            "/api/ankerctl/server/reload",
+        protected_requests = [
+            ("post", "/api/printer/gcode", {"gcode": "G28"}),
+            ("post", "/api/printer/control", {"value": 1}),
+            ("get", "/api/filaments", None),
+            ("get", "/api/debug/state", None),
+            ("get", "/api/ankerctl/server/reload", None),
+            ("get", "/api/camera/frame", None),
+            ("get", "/api/camera/stream", None),
+            ("get", "/api/snapshot", None),
         ]
 
-        # Test each without auth, assert 401/403
-        pass
+        client = app.test_client()
+        old_values, old_svc, old_filaments = _install_security_state(tmp_path)
+        try:
+            responses = []
+            for method, path, payload in protected_requests:
+                request_method = getattr(client, method)
+                kwargs = {"json": payload} if payload is not None else {}
+                responses.append((path, request_method(path, **kwargs).status_code))
+        finally:
+            _restore_security_state(old_values, old_svc, old_filaments)
 
-    def test_authenticated_user_can_access_allowed_endpoints(self):
+        assert responses
+        assert all(status == 401 for _, status in responses), responses
+
+    def test_authenticated_user_can_access_allowed_endpoints(self, tmp_path):
         """Authenticated user can access non-restricted endpoints"""
-        # Test with valid API key
-        pass
+        client = app.test_client()
+        old_values, old_svc, old_filaments = _install_security_state(tmp_path)
+        try:
+            health = client.get("/api/health")
+            filaments = client.get("/api/filaments", headers=_auth_headers())
+            camera_stream = client.get("/api/camera/stream", headers=_auth_headers())
+        finally:
+            _restore_security_state(old_values, old_svc, old_filaments)
+
+        assert health.status_code == 200
+        assert filaments.status_code == 200
+        assert isinstance(filaments.get_json().get("filaments"), list)
+        assert camera_stream.status_code != 401

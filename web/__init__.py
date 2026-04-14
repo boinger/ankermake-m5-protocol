@@ -52,6 +52,7 @@ class _AccessLogNoiseFilter(logging.Filter):
         '"GET /api/printer/runtime-state',
         '"GET /api/camera/frame',
         '"GET /api/camera/stream',
+        '"GET /api/filaments/service/swap',
     )
 
     def filter(self, record):
@@ -289,7 +290,7 @@ if not app.secret_key:
     app.secret_key = token(24)
 app.svc = ServiceManager()
 app.filament_swap_lock = threading.Lock()
-app.filament_swap_state = None
+app.filament_swap_state = {}
 app.pppp_probe_lock = threading.Lock()
 
 
@@ -1021,25 +1022,46 @@ def _resolve_filament_service_settings(cfg):
 
 FILAMENT_SERVICE_DEFAULT_LENGTH_MM = 40.0
 FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM = 10.0
-FILAMENT_SERVICE_SWAP_UNLOAD_DEFAULT_LENGTH_MM = 50.0
+FILAMENT_SERVICE_SWAP_UNLOAD_DEFAULT_LENGTH_MM = 60.0
 FILAMENT_SERVICE_SWAP_LOAD_DEFAULT_LENGTH_MM = 120.0
 FILAMENT_SERVICE_MAX_LENGTH_MM = 300.0
 FILAMENT_SERVICE_FEEDRATE_MM_MIN = 240
 FILAMENT_SERVICE_EXTRUDE_FEEDRATE_MM_MIN = 900
 FILAMENT_SERVICE_RETRACT_FEEDRATE_MM_MIN = 2700
 FILAMENT_SERVICE_SWAP_PRIME_FEEDRATE_MM_MIN = 240
-FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN = 240
+FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN = FILAMENT_SERVICE_RETRACT_FEEDRATE_MM_MIN
 FILAMENT_SERVICE_SWAP_LOAD_FEEDRATE_MM_MIN = 240
 FILAMENT_SERVICE_SWAP_PARK_X_MM = 0.0
 FILAMENT_SERVICE_SWAP_PARK_Y_MM = 230.0
 FILAMENT_SERVICE_SWAP_Z_LIFT_MM = 50.0
-FILAMENT_SERVICE_SWAP_PARK_FEEDRATE_MM_MIN = 9000
+FILAMENT_SERVICE_SWAP_PARK_FEEDRATE_MM_MIN = 3000
 FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN = 600
+FILAMENT_SERVICE_SWAP_HOME_READY_TEMP_C = int(os.getenv("FILAMENT_SWAP_HOME_READY_TEMP_C", 180))
+FILAMENT_SERVICE_SWAP_HOME_SETTLE_S = float(os.getenv(
+    "FILAMENT_SWAP_HOME_PAUSE_S",
+    os.getenv("FILAMENT_SWAP_HOME_SETTLE_S", 55.0),
+))
+FILAMENT_SERVICE_SWAP_COOLDOWN_DELAY_S = float(os.getenv("FILAMENT_SWAP_COOLDOWN_DELAY_S", 0.75))
+FILAMENT_SERVICE_SWAP_MOTION_SETTLE_S = float(os.getenv("FILAMENT_SWAP_MOTION_SETTLE_S", 1.0))
+FILAMENT_SERVICE_SWAP_PARK_MIN_TRAVEL_MM = float(os.getenv("FILAMENT_SWAP_PARK_MIN_TRAVEL_MM", 250.0))
+FILAMENT_SERVICE_SWAP_MAX_WAIT_S = 180.0
+FILAMENT_SERVICE_TARGET_ACK_TIMEOUT_S = float(os.getenv("FILAMENT_SERVICE_TARGET_ACK_TIMEOUT_S", 3.0))
 FILAMENT_SERVICE_HEAT_TIMEOUT_S = 240.0
 FILAMENT_SERVICE_HEAT_POLL_S = 0.5
 FILAMENT_SERVICE_HEAT_TOLERANCE_C = 5
+FILAMENT_SERVICE_TEMP_MAX_AGE_S = float(os.getenv("FILAMENT_SERVICE_TEMP_MAX_AGE_S", 15.0))
+FILAMENT_SERVICE_MANUAL_SWAP_DEFAULT_TEMP_C = 180
 FILAMENT_SERVICE_MANUAL_SWAP_MIN_TEMP_C = 130
-FILAMENT_SERVICE_MANUAL_SWAP_MAX_TEMP_C = 150
+FILAMENT_SERVICE_MANUAL_SWAP_MAX_TEMP_C = 300
+_FILAMENT_SWAP_RUNNING_PHASES = frozenset({
+    "homing",
+    "heating_unload",
+    "priming_unload",
+    "unloading",
+    "heating_load",
+    "loading",
+    "cooling_down",
+})
 Z_OFFSET_STEP_MM = 0.01
 Z_OFFSET_REFRESH_TIMEOUT_S = 5.0
 Z_OFFSET_CONFIRM_TIMEOUT_S = 8.0
@@ -1089,6 +1111,28 @@ def _filament_service_setting_length(settings, key, default=FILAMENT_SERVICE_DEF
         return round(default, 2)
 
 
+def _filament_service_seconds(payload, key, default=FILAMENT_SERVICE_SWAP_HOME_SETTLE_S):
+    raw = payload.get(key, default)
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{key} must be a number")
+    if not math.isfinite(seconds):
+        raise ValueError(f"{key} must be a finite number")
+    if seconds < 0:
+        raise ValueError(f"{key} must be >= 0")
+    if seconds > FILAMENT_SERVICE_SWAP_MAX_WAIT_S:
+        raise ValueError(f"{key} must be <= {FILAMENT_SERVICE_SWAP_MAX_WAIT_S:g}")
+    return round(seconds, 2)
+
+
+def _filament_service_setting_seconds(settings, key, default=FILAMENT_SERVICE_SWAP_HOME_SETTLE_S):
+    try:
+        return _filament_service_seconds({key: settings.get(key, default)}, key, default=default)
+    except (AttributeError, ValueError):
+        return round(default, 2)
+
+
 def _normalize_filament_service_settings(settings):
     normalized = dict(settings or {})
     normalized["allow_legacy_swap"] = _filament_service_bool(normalized.get("allow_legacy_swap"))
@@ -1108,6 +1152,11 @@ def _normalize_filament_service_settings(settings):
         normalized,
         "swap_load_length_mm",
         FILAMENT_SERVICE_SWAP_LOAD_DEFAULT_LENGTH_MM,
+    )
+    normalized["swap_home_pause_s"] = _filament_service_setting_seconds(
+        normalized,
+        "swap_home_pause_s",
+        FILAMENT_SERVICE_SWAP_HOME_SETTLE_S,
     )
     return normalized
 
@@ -1144,14 +1193,9 @@ def _build_filament_swap_park_gcode(
     park_y_mm=FILAMENT_SERVICE_SWAP_PARK_Y_MM,
 ):
     return "\n".join([
-        "G28",
         "G91",
-        f"G1 Z{_format_extrusion_mm(z_lift_mm)} F{FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN}",
+        f"G0 Z{_format_extrusion_mm(z_lift_mm)} F{FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN}",
         "G90",
-        (
-            f"G1 X{_format_extrusion_mm(park_x_mm)} "
-            f"Y{_format_extrusion_mm(park_y_mm)} F{FILAMENT_SERVICE_SWAP_PARK_FEEDRATE_MM_MIN}"
-        ),
         "M400",
     ])
 
@@ -1181,38 +1225,112 @@ def _serialize_filament_swap_state(state):
             "z_lift_mm": state.get("z_lift_mm"),
             "park_x_mm": state.get("park_x_mm"),
             "park_y_mm": state.get("park_y_mm"),
+            "home_pause_s": state.get("home_pause_s"),
             "manual_swap_preheat_temp_c": state.get("manual_swap_preheat_temp_c"),
         },
     }
 
 
-def _filament_swap_state_get(token=None):
+def _filament_swap_states_locked():
+    states = app.filament_swap_state
+    if states is None:
+        app.filament_swap_state = {}
+        return app.filament_swap_state
+
+    if isinstance(states, dict) and "token" in states:
+        printer_index = _service_printer_index(states.get("printer_index"))
+        states["printer_index"] = printer_index
+        app.filament_swap_state = {printer_index: states}
+        return app.filament_swap_state
+
+    if not isinstance(states, dict):
+        app.filament_swap_state = {}
+        return app.filament_swap_state
+
+    normalized = {}
+    changed = False
+    for raw_printer_index, state in list(states.items()):
+        if not isinstance(state, dict):
+            changed = True
+            continue
+        printer_index = _service_printer_index(raw_printer_index)
+        state["printer_index"] = printer_index
+        normalized[printer_index] = state
+        changed = changed or printer_index != raw_printer_index
+
+    if changed:
+        app.filament_swap_state = normalized
+        return app.filament_swap_state
+    return states
+
+
+def _filament_swap_state_by_token_locked(states, token, printer_index=None):
+    if token is None:
+        return None, None
+
+    if printer_index is not None:
+        resolved_index = _service_printer_index(printer_index)
+        state = states.get(resolved_index)
+        if state is not None and state.get("token") == token:
+            return resolved_index, state
+        return None, None
+
+    for resolved_index, state in states.items():
+        if state is not None and state.get("token") == token:
+            return resolved_index, state
+    return None, None
+
+
+def _filament_swap_state_get(token=None, printer_index=None):
     with app.filament_swap_lock:
-        state = app.filament_swap_state
+        states = _filament_swap_states_locked()
+        if token is not None:
+            _, state = _filament_swap_state_by_token_locked(states, token, printer_index=printer_index)
+            return dict(state) if state is not None else None
+
+        state = states.get(_service_printer_index(printer_index))
         if state is None:
-            return None
-        if token is not None and state.get("token") != token:
             return None
         return dict(state)
 
 
-def _filament_swap_state_update(token, **updates):
+def _filament_swap_state_set_if_absent(state):
     with app.filament_swap_lock:
-        state = app.filament_swap_state
-        if state is None or state.get("token") != token:
+        states = _filament_swap_states_locked()
+        state = dict(state)
+        printer_index = _service_printer_index(state.get("printer_index"))
+        if states.get(printer_index) is not None:
+            return None
+        state["printer_index"] = printer_index
+        states[printer_index] = state
+        return dict(state)
+
+
+def _filament_swap_state_update(token, printer_index=None, **updates):
+    with app.filament_swap_lock:
+        states = _filament_swap_states_locked()
+        _, state = _filament_swap_state_by_token_locked(states, token, printer_index=printer_index)
+        if state is None:
             return None
         state.update(updates)
         return dict(state)
 
 
-def _filament_swap_state_clear(token=None):
+def _filament_swap_state_clear(token=None, printer_index=None):
     with app.filament_swap_lock:
-        state = app.filament_swap_state
+        states = _filament_swap_states_locked()
+        if token is not None:
+            resolved_index, state = _filament_swap_state_by_token_locked(
+                states,
+                token,
+                printer_index=printer_index,
+            )
+        else:
+            resolved_index = _service_printer_index(printer_index)
+            state = states.get(resolved_index)
         if state is None:
             return None
-        if token is not None and state.get("token") != token:
-            return None
-        app.filament_swap_state = None
+        states.pop(resolved_index, None)
         return dict(state)
 
 
@@ -1238,22 +1356,86 @@ def _assert_filament_service_ready(mqtt):
         raise RuntimeError("Filament service commands are blocked while a print is active")
 
 
-def _wait_for_filament_service_nozzle(mqtt, target_temp_c):
+class _FilamentSwapCancelled(Exception):
+    pass
+
+
+def _wait_for_filament_swap_delay(delay_s, should_continue=None):
+    deadline = time.monotonic() + max(0.0, float(delay_s or 0.0))
+    while time.monotonic() < deadline:
+        if should_continue is not None and not should_continue():
+            raise _FilamentSwapCancelled()
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+
+def _wait_for_filament_swap_home(should_continue=None, pause_s=None):
+    delay_s = FILAMENT_SERVICE_SWAP_HOME_SETTLE_S if pause_s is None else pause_s
+    _wait_for_filament_swap_delay(delay_s, should_continue=should_continue)
+
+
+def _filament_swap_motion_wait_s(length_mm, feedrate_mm_min):
+    try:
+        length = abs(float(length_mm))
+        feedrate = max(1.0, float(feedrate_mm_min))
+    except (TypeError, ValueError):
+        return FILAMENT_SERVICE_SWAP_MOTION_SETTLE_S
+    return max(0.5, (length / feedrate * 60.0) + FILAMENT_SERVICE_SWAP_MOTION_SETTLE_S)
+
+
+def _wait_for_filament_swap_motion(length_mm, feedrate_mm_min, should_continue=None):
+    _wait_for_filament_swap_delay(
+        _filament_swap_motion_wait_s(length_mm, feedrate_mm_min),
+        should_continue=should_continue,
+    )
+
+
+def _wait_for_filament_swap_park(z_lift_mm, park_x_mm, park_y_mm, should_continue=None):
+    try:
+        z_seconds = abs(float(z_lift_mm)) / max(1.0, float(FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN)) * 60.0
+    except (TypeError, ValueError):
+        z_seconds = 0.0
+    _wait_for_filament_swap_delay(
+        z_seconds + FILAMENT_SERVICE_SWAP_MOTION_SETTLE_S,
+        should_continue=should_continue,
+    )
+
+
+def _send_filament_swap_home_all(mqtt, should_continue=None, pause_s=None):
+    send_home = getattr(mqtt, "send_home", None)
+    if callable(send_home):
+        send_home("all")
+    else:
+        mqtt.send_gcode("G28")
+    _wait_for_filament_swap_home(should_continue=should_continue, pause_s=pause_s)
+
+
+def _wait_for_filament_service_nozzle(mqtt, target_temp_c, should_continue=None, tolerance_c=FILAMENT_SERVICE_HEAT_TOLERANCE_C):
     deadline = time.monotonic() + FILAMENT_SERVICE_HEAT_TIMEOUT_S
     next_query = 0.0
     last_temp = mqtt.nozzle_temp
-    target_ready = int(target_temp_c) - FILAMENT_SERVICE_HEAT_TOLERANCE_C
+    target_ready = int(target_temp_c) - max(0, int(tolerance_c))
+    require_fresh_temp = hasattr(mqtt, "nozzle_temp_updated_at")
 
     while time.monotonic() < deadline:
+        if should_continue is not None and not should_continue():
+            raise _FilamentSwapCancelled()
         now = time.monotonic()
         if now >= next_query:
-            mqtt.request_status()
+            request_status = getattr(mqtt, "request_status", None)
+            if callable(request_status):
+                request_status()
             next_query = now + 2.0
 
         current_temp = mqtt.nozzle_temp
         if current_temp is not None:
             last_temp = current_temp
-            if current_temp >= target_ready:
+            temp_updated_at = getattr(mqtt, "nozzle_temp_updated_at", 0.0)
+            fresh_enough = (
+                not require_fresh_temp
+                or not temp_updated_at
+                or time.time() - temp_updated_at <= FILAMENT_SERVICE_TEMP_MAX_AGE_S
+            )
+            if current_temp >= target_ready and fresh_enough:
                 return current_temp
 
         time.sleep(FILAMENT_SERVICE_HEAT_POLL_S)
@@ -1264,12 +1446,83 @@ def _wait_for_filament_service_nozzle(mqtt, target_temp_c):
     )
 
 
+def _wait_for_filament_service_nozzle_target(mqtt, target_temp_c, should_continue=None):
+    if not hasattr(mqtt, "nozzle_temp_target"):
+        _wait_for_filament_swap_delay(0.25, should_continue=should_continue)
+        return None
+
+    target_temp_c = int(target_temp_c)
+    deadline = time.monotonic() + FILAMENT_SERVICE_TARGET_ACK_TIMEOUT_S
+    next_query = 0.0
+    last_target = getattr(mqtt, "nozzle_temp_target", None)
+
+    while time.monotonic() < deadline:
+        if should_continue is not None and not should_continue():
+            raise _FilamentSwapCancelled()
+
+        now = time.monotonic()
+        if now >= next_query:
+            request_status = getattr(mqtt, "request_status", None)
+            if callable(request_status):
+                request_status()
+            next_query = now + 0.5
+
+        current_target = getattr(mqtt, "nozzle_temp_target", None)
+        if current_target is not None:
+            last_target = current_target
+            try:
+                if int(round(float(current_target))) == target_temp_c:
+                    return current_target
+            except (TypeError, ValueError):
+                pass
+
+        time.sleep(0.25)
+
+    log.warning(
+        "Filament swap: nozzle target %sC was not observed before homing (last target: %s); continuing",
+        target_temp_c,
+        last_target if last_target is not None else "unknown",
+    )
+    return last_target
+
+
+def _filament_service_nozzle_target_matches(observed_target, target_temp_c):
+    if observed_target is None:
+        return False
+    try:
+        return int(round(float(observed_target))) == int(target_temp_c)
+    except (TypeError, ValueError):
+        return False
+
+
+def _send_filament_service_nozzle_target(mqtt, target_temp_c, should_continue=None, attempts=3):
+    target_temp_c = int(target_temp_c)
+    last_target = None
+    can_observe_target = hasattr(mqtt, "nozzle_temp_target")
+    for _ in range(max(1, int(attempts))):
+        if should_continue is not None and not should_continue():
+            raise _FilamentSwapCancelled()
+        mqtt.send_gcode(f"M104 S{target_temp_c}")
+        last_target = _wait_for_filament_service_nozzle_target(
+            mqtt,
+            target_temp_c,
+            should_continue=should_continue,
+        )
+        if (
+            not can_observe_target
+            or _filament_service_nozzle_target_matches(last_target, target_temp_c)
+        ):
+            return last_target
+        _wait_for_filament_swap_delay(0.75, should_continue=should_continue)
+    return last_target
+
+
 def _filament_service_manual_swap_temp(settings):
-    raw_temp = settings.get("manual_swap_preheat_temp_c", 140)
+    raw_temp = settings.get("manual_swap_preheat_temp_c", FILAMENT_SERVICE_MANUAL_SWAP_DEFAULT_TEMP_C)
     try:
         temp_c = int(raw_temp)
     except (TypeError, ValueError):
-        temp_c = 140
+        temp_c = FILAMENT_SERVICE_MANUAL_SWAP_DEFAULT_TEMP_C
     return max(FILAMENT_SERVICE_MANUAL_SWAP_MIN_TEMP_C, min(FILAMENT_SERVICE_MANUAL_SWAP_MAX_TEMP_C, temp_c))
 
 
@@ -1278,67 +1531,189 @@ def _run_legacy_swap_unload(token):
     if not state:
         return
 
+    printer_index = _service_printer_index(state.get("printer_index"))
+
+    def should_continue():
+        return _filament_swap_state_get(token, printer_index=printer_index) is not None
+
+    def ensure_continue():
+        if not should_continue():
+            raise _FilamentSwapCancelled()
+
     try:
         park_gcode = _build_filament_swap_park_gcode(
             state.get("z_lift_mm", FILAMENT_SERVICE_SWAP_Z_LIFT_MM),
             state.get("park_x_mm", FILAMENT_SERVICE_SWAP_PARK_X_MM),
             state.get("park_y_mm", FILAMENT_SERVICE_SWAP_PARK_Y_MM),
         )
+        prime_length_mm = state.get("prime_length_mm", FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM)
+        unload_length_mm = state["unload_length_mm"]
+        prime_feedrate_mm_min = state.get(
+            "prime_feedrate_mm_min",
+            FILAMENT_SERVICE_SWAP_PRIME_FEEDRATE_MM_MIN,
+        )
+        unload_feedrate_mm_min = state.get(
+            "unload_feedrate_mm_min",
+            FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN,
+        )
+        home_pause_s = state.get("home_pause_s", FILAMENT_SERVICE_SWAP_HOME_SETTLE_S)
         prime_gcode = _build_filament_move_gcode(
-            state.get("prime_length_mm", FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM),
-            feedrate_mm_min=state.get("prime_feedrate_mm_min", FILAMENT_SERVICE_SWAP_PRIME_FEEDRATE_MM_MIN),
+            prime_length_mm,
+            feedrate_mm_min=prime_feedrate_mm_min,
         )
         unload_gcode = _build_filament_move_gcode(
-            -state["unload_length_mm"],
-            feedrate_mm_min=state.get("unload_feedrate_mm_min", FILAMENT_SERVICE_FEEDRATE_MM_MIN),
+            -unload_length_mm,
+            feedrate_mm_min=unload_feedrate_mm_min,
         )
-        with borrow_mqtt(state.get("printer_index")) as mqtt:
+        home_preheat_temp_c = min(
+            int(state["unload_temp_c"]),
+            int(state.get("manual_swap_preheat_temp_c") or FILAMENT_SERVICE_SWAP_HOME_READY_TEMP_C),
+        )
+        home_ready_temp_c = home_preheat_temp_c
+        with borrow_mqtt(printer_index) as mqtt:
             _assert_filament_service_ready(mqtt)
 
             _filament_swap_state_update(
                 token,
+                printer_index=printer_index,
+                phase="heating_unload",
+                message=(
+                    f"Heating nozzle to {state['unload_temp_c']}°C; "
+                    f"waiting for {home_ready_temp_c}°C before homing..."
+                ),
+                error=None,
+            )
+            _filament_swap_state_update(
+                token,
+                printer_index=printer_index,
+                phase="heating_unload",
+                message=f"Heating nozzle to {home_preheat_temp_c}C before homing...",
+                error=None,
+            )
+            mqtt.send_gcode(f"M104 S{home_preheat_temp_c}")
+            _wait_for_filament_service_nozzle(
+                mqtt,
+                home_ready_temp_c,
+                should_continue=should_continue,
+                tolerance_c=0,
+            )
+            ensure_continue()
+
+            _filament_swap_state_update(
+                token,
+                printer_index=printer_index,
+                phase="heating_unload",
+                message=f"Setting nozzle target to {state['unload_temp_c']}C for unload...",
+                error=None,
+            )
+            _send_filament_service_nozzle_target(
+                mqtt,
+                state["unload_temp_c"],
+                should_continue=should_continue,
+            )
+            ensure_continue()
+
+            _filament_swap_state_update(
+                token,
+                printer_index=printer_index,
                 phase="homing",
                 message=(
-                    "Homing and parking before filament swap. Make sure the bed and toolhead path are clear."
+                    f"Homing all axes before filament swap. Waiting {home_pause_s:g}s before raising Z."
+                ),
+                error=None,
+            )
+            _send_filament_swap_home_all(mqtt, should_continue=should_continue, pause_s=home_pause_s)
+            ensure_continue()
+
+            _filament_swap_state_update(
+                token,
+                printer_index=printer_index,
+                phase="heating_unload",
+                message=f"Reapplying nozzle target {state['unload_temp_c']}C after homing...",
+                error=None,
+            )
+            _send_filament_service_nozzle_target(
+                mqtt,
+                state["unload_temp_c"],
+                should_continue=should_continue,
+            )
+            ensure_continue()
+
+            _filament_swap_state_update(
+                token,
+                printer_index=printer_index,
+                phase="homing",
+                message=(
+                    f"Raising Z {state.get('z_lift_mm', FILAMENT_SERVICE_SWAP_Z_LIFT_MM)} mm..."
                 ),
                 error=None,
             )
             mqtt.send_gcode(park_gcode)
+            _wait_for_filament_swap_park(
+                state.get("z_lift_mm", FILAMENT_SERVICE_SWAP_Z_LIFT_MM),
+                state.get("park_x_mm", FILAMENT_SERVICE_SWAP_PARK_X_MM),
+                state.get("park_y_mm", FILAMENT_SERVICE_SWAP_PARK_Y_MM),
+                should_continue=should_continue,
+            )
+            ensure_continue()
 
-            current_temp = mqtt.nozzle_temp
-            if current_temp is None or current_temp < (state["unload_temp_c"] - FILAMENT_SERVICE_HEAT_TOLERANCE_C):
-                _filament_swap_state_update(
-                    token,
-                    phase="heating_unload",
-                    message=f"Heating nozzle to {state['unload_temp_c']}°C for unload...",
-                    error=None,
-                )
-                mqtt.send_gcode(f"M104 S{state['unload_temp_c']}")
-                _wait_for_filament_service_nozzle(mqtt, state["unload_temp_c"])
+            _send_filament_service_nozzle_target(
+                mqtt,
+                state["unload_temp_c"],
+                should_continue=should_continue,
+            )
+            ensure_continue()
 
             _filament_swap_state_update(
                 token,
+                printer_index=printer_index,
+                phase="heating_unload",
+                message=f"Waiting for nozzle to reach {state['unload_temp_c']}°C for unload...",
+                error=None,
+            )
+            _wait_for_filament_service_nozzle(
+                mqtt,
+                state["unload_temp_c"],
+                should_continue=should_continue,
+            )
+            ensure_continue()
+
+            _filament_swap_state_update(
+                token,
+                printer_index=printer_index,
                 phase="priming_unload",
                 message=(
-                    f"Extruding {state.get('prime_length_mm', FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM)} mm "
-                    f"to soften {state['unload_profile_name']} before unload..."
+                    f"Extruding {prime_length_mm} mm before unloading "
+                    f"{state['unload_profile_name']}..."
                 ),
                 error=None,
             )
             mqtt.send_gcode(prime_gcode)
+            _wait_for_filament_swap_motion(
+                prime_length_mm,
+                prime_feedrate_mm_min,
+                should_continue=should_continue,
+            )
+            ensure_continue()
 
             _filament_swap_state_update(
                 token,
+                printer_index=printer_index,
                 phase="unloading",
-                message=(
-                    f"Retracting {state['unload_length_mm']} mm for {state['unload_profile_name']}..."
-                ),
+                message=f"Retracting {unload_length_mm} mm for {state['unload_profile_name']}...",
                 error=None,
             )
             mqtt.send_gcode(unload_gcode)
+            _wait_for_filament_swap_motion(
+                unload_length_mm,
+                unload_feedrate_mm_min,
+                should_continue=should_continue,
+            )
+            ensure_continue()
 
         _filament_swap_state_update(
             token,
+            printer_index=printer_index,
             phase="await_manual_swap",
             message=(
                 "Unload finished. Replace the filament, feed the new filament into the extruder, "
@@ -1346,9 +1721,12 @@ def _run_legacy_swap_unload(token):
             ),
             error=None,
         )
+    except _FilamentSwapCancelled:
+        _filament_swap_state_clear(token, printer_index=printer_index)
     except (RuntimeError, TimeoutError, ConnectionError) as exc:
         _filament_swap_state_update(
             token,
+            printer_index=printer_index,
             phase="error",
             message=f"Automatic unload failed: {exc}",
             error=str(exc),
@@ -1360,40 +1738,81 @@ def _run_legacy_swap_load(token):
     if not state:
         return
 
+    printer_index = _service_printer_index(state.get("printer_index"))
+
+    def should_continue():
+        return _filament_swap_state_get(token, printer_index=printer_index) is not None
+
+    def ensure_continue():
+        if not should_continue():
+            raise _FilamentSwapCancelled()
+
     try:
-        gcode = _build_filament_move_gcode(
-            state["load_length_mm"],
-            feedrate_mm_min=state.get("load_feedrate_mm_min", FILAMENT_SERVICE_FEEDRATE_MM_MIN),
+        load_length_mm = state["load_length_mm"]
+        load_feedrate_mm_min = state.get("load_feedrate_mm_min", FILAMENT_SERVICE_FEEDRATE_MM_MIN)
+        load_gcode = _build_filament_move_gcode(
+            load_length_mm,
+            feedrate_mm_min=load_feedrate_mm_min,
         )
-        with borrow_mqtt(state.get("printer_index")) as mqtt:
+        purge_started = False
+        with borrow_mqtt(printer_index) as mqtt:
             _assert_filament_service_ready(mqtt)
-            current_temp = mqtt.nozzle_temp
-            if current_temp is None or current_temp < (state["load_temp_c"] - FILAMENT_SERVICE_HEAT_TOLERANCE_C):
-                _filament_swap_state_update(
-                    token,
-                    phase="heating_load",
-                    message=f"Heating nozzle to {state['load_temp_c']}°C for load / purge...",
-                    error=None,
-                )
-                mqtt.send_gcode(f"M104 S{state['load_temp_c']}")
-                _wait_for_filament_service_nozzle(mqtt, state["load_temp_c"])
+            _filament_swap_state_update(
+                token,
+                printer_index=printer_index,
+                phase="heating_load",
+                message=f"Heating nozzle to {state['load_temp_c']}°C for load / purge...",
+                error=None,
+            )
+            mqtt.send_gcode(f"M104 S{state['load_temp_c']}")
+            _wait_for_filament_service_nozzle(
+                mqtt,
+                state["load_temp_c"],
+                should_continue=should_continue,
+            )
+            ensure_continue()
 
             _filament_swap_state_update(
                 token,
+                printer_index=printer_index,
                 phase="loading",
                 message=(
                     f"Loading / purging {state['load_profile_name']} "
-                    f"({state['load_length_mm']} mm)..."
+                    f"({load_length_mm} mm)..."
                 ),
                 error=None,
             )
-            mqtt.send_gcode(gcode)
-            mqtt.send_gcode("M104 S0")
+            try:
+                mqtt.send_gcode(load_gcode)
+                purge_started = True
+                _wait_for_filament_swap_motion(
+                    load_length_mm,
+                    load_feedrate_mm_min,
+                    should_continue=should_continue,
+                )
+                ensure_continue()
+            finally:
+                if purge_started:
+                    _filament_swap_state_update(
+                        token,
+                        printer_index=printer_index,
+                        phase="cooling_down",
+                        message="Load / purge finished. Sending nozzle cooldown...",
+                        error=None,
+                    )
+                    _wait_for_filament_swap_delay(
+                        FILAMENT_SERVICE_SWAP_COOLDOWN_DELAY_S,
+                        should_continue=None,
+                    )
+                    mqtt.send_gcode("M104 S0")
 
-        _filament_swap_state_clear(token)
+        _filament_swap_state_clear(token, printer_index=printer_index)
+    except _FilamentSwapCancelled:
+        _filament_swap_state_clear(token, printer_index=printer_index)
     except (RuntimeError, TimeoutError, ConnectionError) as exc:
         _filament_swap_state_update(
             token,
+            printer_index=printer_index,
             phase="error",
             message=f"Automatic load / purge failed: {exc}",
             error=str(exc),
@@ -1696,6 +2115,7 @@ def pppp_state(sock):
     log.info("Starting PPPP state websocket handler for printer_index=%s", printer_index)
 
     last_status = None
+    last_source = None
     last_keepalive = 0.0
     pppp_was_connected = False  # True once we see "connected"; resets on dormant
     mqtt_was_stale = False      # tracks previous stale state to detect recovery
@@ -1703,6 +2123,7 @@ def pppp_state(sock):
     # Scheduling constants
     PROBE_INTERVAL = 60.0    # back-off interval after MAX_RETRIES failures
     RETRY_INTERVAL = 15.0    # interval between retries after a failure
+    PROBE_SUCCESS_FRESH_SEC = 5.0  # only trust cached probe success briefly
     MQTT_STALE_AFTER = 30.0  # MQTT considered stale after 30s silence
     MAX_RETRIES = 2          # retries after first failure before switching to PROBE_INTERVAL
 
@@ -1722,9 +2143,11 @@ def pppp_state(sock):
             # Passive read — no ref-count increment, never starts the service.
             probe = _get_pppp_probe_state(printer_index)
             pppp = get_pppp_service(printer_index)
+            current_source = "none"
 
             if pppp is not None and bool(getattr(pppp, "connected", False)):
                 current_status = "connected"
+                current_source = "service"
                 pppp_was_connected = True
                 with app.pppp_probe_lock:
                     probe["result"] = None
@@ -1755,9 +2178,22 @@ def pppp_state(sock):
                 # Also probe when PPPP was recently connected but service stopped
                 # (e.g. last video client disconnected) so the badge refreshes.
                 pppp_went_dormant = pppp_was_connected and probe_result is None
+                probe_success_fresh = (
+                    probe_result is True
+                    and last_probe_time > 0
+                    and (now - last_probe_time) <= PROBE_SUCCESS_FRESH_SEC
+                )
+                stale_probe_success = probe_result is True and not probe_success_fresh
 
+                # A stale successful probe should only stop cached-green badges; it should not
+                # cause another passive probe by itself or the UI loops while video is off.
                 should_probe = (
-                    (mqtt_stale or mqtt_recovered or probe_result is False or pppp_went_dormant)
+                    (
+                        mqtt_stale
+                        or mqtt_recovered
+                        or probe_result is False
+                        or pppp_went_dormant
+                    )
                     and (now - last_probe_time) > next_interval
                 )
                 if should_probe:
@@ -1767,22 +2203,30 @@ def pppp_state(sock):
                               else "retry after fail")
                     _maybe_start_pppp_probe(reason, printer_index=printer_index)
 
-                if probe_result is True:
+                if probe_success_fresh:
                     current_status = "connected"
+                    current_source = "probe"
                 elif probe_result is False:
                     current_status = "disconnected"
+                    current_source = "probe"
                 elif pppp is not None and getattr(pppp, "wanted", False) and pppp_was_connected:
                     # Service is still wanted but lost its PPPP connection.
                     current_status = "disconnected"
+                    current_source = "service"
                 else:
                     # Service not running or connecting for the first time → dormant.
                     current_status = "dormant"
                     if pppp is None or not getattr(pppp, "wanted", False):
                         pppp_was_connected = False
 
-            if current_status != last_status or (current_status == "connected" and now - last_keepalive >= 10.0):
-                sock.send(json.dumps({"status": current_status}))
+            if (
+                current_status != last_status
+                or current_source != last_source
+                or (current_status == "connected" and now - last_keepalive >= 10.0)
+            ):
+                sock.send(json.dumps({"status": current_status, "source": current_source}))
                 last_status = current_status
+                last_source = current_source
                 if current_status == "connected":
                     last_keepalive = now
 
@@ -1935,14 +2379,23 @@ def app_root():
     config = app.config["config"]
     with config.open() as cfg:
         printers_list = []
+        active_printer_index = _service_printer_index(app.config.get("printer_index", 0))
         if cfg:
             anker_config = str(web.config.config_show(cfg))
             config_existing_email = cfg.account.email if cfg.account else ""
-            printer = cfg.printers[app.config["printer_index"]]
+            printers = getattr(cfg, "printers", []) or []
+            if printers and not (0 <= active_printer_index < len(printers)):
+                active_printer_index = 0
+            printer = printers[active_printer_index] if printers else None
+            if not printers:
+                anker_config = (
+                    "No printers are configured for this account. "
+                    "Import from eufyMake Studio or log in again from Setup."
+                )
             upload_rate_mbps, upload_rate_source = cli.util.resolve_upload_rate_mbps_with_source(cfg)
             upload_rate_config = getattr(cfg, "upload_rate_mbps", None)
             country = cfg.account.country if cfg.account else ""
-            for i, p in enumerate(cfg.printers):
+            for i, p in enumerate(printers):
                 printers_list.append({
                     "index": i,
                     "name": p.name,
@@ -1959,8 +2412,8 @@ def app_root():
             upload_rate_source = None
             country = ""
 
-        active_camera = _resolve_camera_settings(cfg, printer_index=app.config.get("printer_index", 0)) if cfg else _resolve_camera_settings(None)
-        printer_video_supported = bool(app.config.get("video_supported", False))
+        active_camera = _resolve_camera_settings(cfg, printer_index=active_printer_index) if cfg else _resolve_camera_settings(None)
+        printer_video_supported = bool(app.config.get("video_supported", False) and printer is not None)
         show_camera_ffmpeg_warning = bool(
             printer_video_supported
             or (active_camera.get("external") or {}).get("configured")
@@ -1976,13 +2429,13 @@ def app_root():
             "index.html",
             request_host=request_host,
             request_port=request_port,
-            configure=app.config["login"],
+            configure=bool(app.config["login"] and printer is not None),
             login_file_path=web.platform.login_path(web.platform.current_platform()),
             anker_config=anker_config,
             config_existing_email=config_existing_email,
             country_codes=json.dumps(cli.countrycodes.country_codes),
             current_country=country,
-            video_supported=app.config.get("video_supported", False),
+            video_supported=printer_video_supported,
             printer_video_supported=printer_video_supported,
             camera_features_available=bool(active_camera.get("feature_available")),
             active_camera=active_camera,
@@ -1997,7 +2450,7 @@ def app_root():
             video_profiles=web.service.video.VIDEO_PROFILES,
             video_profile_default=web.service.video.VIDEO_PROFILE_DEFAULT_ID,
             printers=printers_list,
-            active_printer_index=app.config["printer_index"],
+            active_printer_index=active_printer_index,
             printer_index_locked=app.config.get("printer_index_locked", False),
             unsupported_device=app.config.get("unsupported_device", False),
             ankerctl_root=os.path.realpath(ROOT_DIR),
@@ -2727,6 +3180,11 @@ def app_api_settings_filament_service_update():
                 fs_payload[key] = _filament_service_length({key: fs_payload[key]}, key)
             except ValueError as exc:
                 return {"error": str(exc)}, 400
+    if "swap_home_pause_s" in fs_payload:
+        try:
+            fs_payload["swap_home_pause_s"] = _filament_service_seconds(fs_payload, "swap_home_pause_s")
+        except ValueError as exc:
+            return {"error": str(exc)}, 400
 
     with config.modify() as cfg:
         if not cfg:
@@ -3776,8 +4234,8 @@ def app_api_filaments_duplicate(profile_id):
 
 @app.get("/api/filaments/service/swap")
 def app_api_filament_service_swap_state():
-    with app.filament_swap_lock:
-        return _serialize_filament_swap_state(app.filament_swap_state)
+    printer_index = _requested_printer_index()
+    return _serialize_filament_swap_state(_filament_swap_state_get(printer_index=printer_index))
 
 
 @app.post("/api/filaments/service/preheat")
@@ -3897,6 +4355,7 @@ def app_api_filament_service_swap_start():
     unload_feedrate_mm_min = FILAMENT_SERVICE_FEEDRATE_MM_MIN
     load_feedrate_mm_min = FILAMENT_SERVICE_FEEDRATE_MM_MIN
     prime_feedrate_mm_min = FILAMENT_SERVICE_SWAP_PRIME_FEEDRATE_MM_MIN
+    home_pause_s = filament_settings.get("swap_home_pause_s", FILAMENT_SERVICE_SWAP_HOME_SETTLE_S)
 
     if allow_legacy_swap:
         try:
@@ -3916,6 +4375,11 @@ def app_api_filament_service_swap_start():
                 {"load_length_mm": payload.get("load_length_mm", filament_settings["swap_load_length_mm"])},
                 "load_length_mm",
             )
+            home_pause_s = _filament_service_seconds(
+                {"home_pause_s": payload.get("home_pause_s", home_pause_s)},
+                "home_pause_s",
+                default=home_pause_s,
+            )
         except ValueError as exc:
             return {"error": str(exc)}, 400
         except LookupError as exc:
@@ -3924,9 +4388,8 @@ def app_api_filament_service_swap_start():
         unload_feedrate_mm_min = FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN
         load_feedrate_mm_min = FILAMENT_SERVICE_SWAP_LOAD_FEEDRATE_MM_MIN
 
-    with app.filament_swap_lock:
-        if app.filament_swap_state is not None:
-            return {"error": "A filament swap is already in progress"}, 409
+    if _filament_swap_state_get(printer_index=printer_index) is not None:
+        return {"error": "A filament swap is already in progress"}, 409
 
     swap_state = {
         "token": token(12),
@@ -3948,6 +4411,7 @@ def app_api_filament_service_swap_start():
         "z_lift_mm": FILAMENT_SERVICE_SWAP_Z_LIFT_MM,
         "park_x_mm": FILAMENT_SERVICE_SWAP_PARK_X_MM,
         "park_y_mm": FILAMENT_SERVICE_SWAP_PARK_Y_MM,
+        "home_pause_s": home_pause_s,
         "manual_swap_preheat_temp_c": manual_swap_preheat_temp_c,
         "prime_feedrate_mm_min": prime_feedrate_mm_min,
         "unload_feedrate_mm_min": unload_feedrate_mm_min,
@@ -3956,8 +4420,8 @@ def app_api_filament_service_swap_start():
 
     if allow_legacy_swap:
         swap_state["message"] = (
-            "Guided automatic swap will home and park first. Make sure the bed is clear. "
-            f"Then it will heat {unload_profile['name']} to {unload_temp_c}°C, "
+            f"Guided automatic swap will start heating {unload_profile['name']} to {unload_temp_c}°C, "
+            f"then home, wait {home_pause_s:g}s, raise Z, "
             f"extrude {prime_length_mm} mm, and retract {unload_length_mm} mm."
         )
     else:
@@ -3967,8 +4431,16 @@ def app_api_filament_service_swap_start():
             "then confirm. Use Quick Extrude afterward if you need to purge."
         )
 
-    with app.filament_swap_lock:
-        app.filament_swap_state = swap_state
+    if allow_legacy_swap:
+        swap_state["message"] = (
+            f"Guided automatic swap will preheat to {manual_swap_preheat_temp_c}C, "
+            f"set {unload_profile['name']} to {unload_temp_c}C, then home, "
+            f"wait {home_pause_s:g}s, raise Z, "
+            f"extrude {prime_length_mm} mm, and retract {unload_length_mm} mm."
+        )
+
+    if _filament_swap_state_set_if_absent(swap_state) is None:
+        return {"error": "A filament swap is already in progress"}, 409
 
     try:
         with borrow_mqtt(printer_index) as mqtt:
@@ -3978,13 +4450,13 @@ def app_api_filament_service_swap_start():
             else:
                 mqtt.send_gcode(f"M104 S{manual_swap_preheat_temp_c}")
     except RuntimeError as exc:
-        _filament_swap_state_clear(swap_state["token"])
+        _filament_swap_state_clear(swap_state["token"], printer_index=printer_index)
         return {"error": str(exc)}, 409
     except TimeoutError as exc:
-        _filament_swap_state_clear(swap_state["token"])
+        _filament_swap_state_clear(swap_state["token"], printer_index=printer_index)
         return {"error": str(exc)}, 504
     except ConnectionError as exc:
-        _filament_swap_state_clear(swap_state["token"])
+        _filament_swap_state_clear(swap_state["token"], printer_index=printer_index)
         return {"error": str(exc)}, 503
 
     return {
@@ -3999,19 +4471,18 @@ def app_api_filament_service_swap_start():
 def app_api_filament_service_swap_confirm():
     printer_index = _requested_printer_index()
     payload = request.get_json(silent=True) or {}
-    with app.filament_swap_lock:
-        swap_state = app.filament_swap_state
-        if swap_state is None:
-            return {"error": "No filament swap is in progress"}, 409
-        provided_token = payload.get("token")
-        if provided_token and provided_token != swap_state["token"]:
-            return {"error": "Swap token mismatch"}, 409
-        if swap_state.get("phase") in {"homing", "heating_unload", "priming_unload", "unloading", "heating_load", "loading"}:
-            return {"error": "Swap stage is still running; wait for it to finish first"}, 409
-        printer_index = _service_printer_index(swap_state.get("printer_index", printer_index))
+    swap_state = _filament_swap_state_get(printer_index=printer_index)
+    if swap_state is None:
+        return {"error": "No filament swap is in progress"}, 409
+    provided_token = payload.get("token")
+    if provided_token and provided_token != swap_state["token"]:
+        return {"error": "Swap token mismatch"}, 409
+    if swap_state.get("phase") in _FILAMENT_SWAP_RUNNING_PHASES:
+        return {"error": "Swap stage is still running; wait for it to finish first"}, 409
+    printer_index = _service_printer_index(swap_state.get("printer_index", printer_index))
 
     if swap_state.get("mode") == "manual":
-        completed_swap = _filament_swap_state_clear(swap_state["token"])
+        completed_swap = _filament_swap_state_clear(swap_state["token"], printer_index=printer_index)
         return {
             "status": "ok",
             "message": (
@@ -4025,6 +4496,7 @@ def app_api_filament_service_swap_confirm():
 
     _filament_swap_state_update(
         swap_state["token"],
+        printer_index=printer_index,
         phase="heating_load",
         message=(
             f"Heating for automatic load / purge of {swap_state['load_profile_name']} "
@@ -4036,14 +4508,26 @@ def app_api_filament_service_swap_confirm():
         with borrow_mqtt(printer_index) as mqtt:
             _assert_filament_service_ready(mqtt)
     except RuntimeError as exc:
-        _filament_swap_state_update(swap_state["token"], phase="error", message=str(exc), error=str(exc))
+        _filament_swap_state_update(
+            swap_state["token"],
+            printer_index=printer_index,
+            phase="error",
+            message=str(exc),
+            error=str(exc),
+        )
         return {"error": str(exc)}, 409
     except ConnectionError as exc:
-        _filament_swap_state_update(swap_state["token"], phase="error", message=str(exc), error=str(exc))
+        _filament_swap_state_update(
+            swap_state["token"],
+            printer_index=printer_index,
+            phase="error",
+            message=str(exc),
+            error=str(exc),
+        )
         return {"error": str(exc)}, 503
 
     _filament_swap_start_background(_run_legacy_swap_load, swap_state["token"])
-    current_state = _filament_swap_state_get(swap_state["token"])
+    current_state = _filament_swap_state_get(swap_state["token"], printer_index=printer_index)
     if current_state is None:
         return {
             "status": "ok",
@@ -4060,22 +4544,28 @@ def app_api_filament_service_swap_confirm():
 
 @app.post("/api/filaments/service/swap/cancel")
 def app_api_filament_service_swap_cancel():
+    printer_index = _requested_printer_index()
     payload = request.get_json(silent=True) or {}
-    with app.filament_swap_lock:
-        swap_state = app.filament_swap_state
-        if swap_state is None:
-            return {"status": "ok", "pending": False, "swap": None}
-        provided_token = payload.get("token")
-        if provided_token and provided_token != swap_state["token"]:
-            return {"error": "Swap token mismatch"}, 409
-        if swap_state.get("phase") in {"homing", "heating_unload", "priming_unload", "unloading", "heating_load", "loading"}:
-            return {"error": "Cannot cancel while an automatic swap stage is running"}, 409
-        app.filament_swap_state = None
+    swap_state = _filament_swap_state_get(printer_index=printer_index)
+    if swap_state is None:
+        return {"status": "ok", "pending": False, "swap": None}
+    provided_token = payload.get("token")
+    if provided_token and provided_token != swap_state["token"]:
+        return {"error": "Swap token mismatch"}, 409
+    printer_index = _service_printer_index(swap_state.get("printer_index", printer_index))
+    cancelled_swap = _filament_swap_state_clear(swap_state["token"], printer_index=printer_index)
+    try:
+        with borrow_mqtt(printer_index) as mqtt:
+            if mqtt:
+                mqtt.send_gcode("M104 S0")
+    except Exception as exc:
+        log.warning("Filament swap cancel: could not send nozzle cooldown: %s", exc)
 
     return {
         "status": "ok",
         "message": "Filament swap cancelled.",
-        "cancelled_swap": swap_state,
+        "cancelled_swap": cancelled_swap,
+        "gcode": "M104 S0",
         "pending": False,
         "swap": None,
     }
@@ -4617,6 +5107,7 @@ _PROTECTED_GET_PATHS = {
     "/api/debug/logs",
     "/api/debug/services",
     "/api/camera/frame",
+    "/api/camera/stream",
     "/api/snapshot",
     # Sensitive credential exposure: HA MQTT password, Apprise URLs/keys
     "/api/settings/mqtt",
