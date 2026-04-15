@@ -3,6 +3,7 @@ from datetime import datetime
 from types import SimpleNamespace
 
 from cli.model import Account, Config, Printer
+import web as web_module
 from web import app
 
 
@@ -25,8 +26,9 @@ def _printer(sn="SN1", name="Printer", model="V8111"):
 
 
 class FakeConfigManager:
-    def __init__(self, cfg):
+    def __init__(self, cfg, config_root=None):
         self.cfg = cfg
+        self.config_root = config_root
 
     @contextmanager
     def open(self):
@@ -54,9 +56,9 @@ def _base_config():
     )
 
 
-def _install_app_state(cfg=None, mqtt=None):
+def _install_app_state(cfg=None, mqtt=None, config_root=None):
     cfg = cfg or _base_config()
-    manager = FakeConfigManager(cfg)
+    manager = FakeConfigManager(cfg, config_root=config_root)
     mqtt = mqtt if mqtt is not None else SimpleNamespace(
         timelapse=SimpleNamespace(reload_config=lambda config: None),
         ha=SimpleNamespace(reload_config=lambda config: None),
@@ -377,9 +379,9 @@ def test_filament_service_settings_endpoints_persist_manual_and_legacy_modes():
     assert got.get_json()["filament_service"]["allow_legacy_swap"] is False
     assert got.get_json()["filament_service"]["quick_move_length_mm"] == 40
     assert got.get_json()["filament_service"]["swap_prime_length_mm"] == 10
-    assert got.get_json()["filament_service"]["swap_unload_length_mm"] == 60
+    assert got.get_json()["filament_service"]["swap_unload_length_mm"] == 40
     assert got.get_json()["filament_service"]["swap_load_length_mm"] == 120
-    assert got.get_json()["filament_service"]["swap_home_pause_s"] == 55
+    assert got.get_json()["filament_service"]["swap_home_pause_s"] == 70
     assert updated.status_code == 200
     assert updated.get_json()["filament_service"]["allow_legacy_swap"] is True
     assert updated.get_json()["filament_service"]["manual_swap_preheat_temp_c"] == 149
@@ -397,3 +399,40 @@ def test_filament_service_settings_endpoints_persist_manual_and_legacy_modes():
     assert cfg.filament_service["swap_home_pause_s"] == 42
     assert cfg.filament_service["manual_swap_preheat_temp_c"] == 300
     assert clamped.get_json()["filament_service"]["manual_swap_preheat_temp_c"] == 300
+
+
+def test_filament_service_advanced_command_config_creates_and_opens(tmp_path, monkeypatch):
+    client = app.test_client()
+    opened_paths = []
+    monkeypatch.setattr(
+        web_module,
+        "_open_file_with_default_app",
+        lambda path: opened_paths.append(path) or True,
+    )
+    old, old_svc, _cfg, _mqtt = _install_app_state(config_root=tmp_path)
+
+    try:
+        unauthorized = client.get("/api/settings/filament-service/advanced")
+        got = client.get(
+            "/api/settings/filament-service/advanced",
+            headers={"X-Api-Key": "secret-key-123456"},
+        )
+        opened = client.post(
+            "/api/settings/filament-service/advanced/open",
+            headers={"X-Api-Key": "secret-key-123456"},
+        )
+    finally:
+        _restore_app_state(old, old_svc)
+
+    command_path = tmp_path / "filament_swap_commands.json"
+    assert unauthorized.status_code == 401
+    assert got.status_code == 200
+    assert got.get_json()["created"] is True
+    assert got.get_json()["path"] == str(command_path)
+    assert "z_lift" in got.get_json()["config"]["commands"]
+    assert got.get_json()["config"]["settings"]["swap_unload_length_mm"] == 40.0
+    assert got.get_json()["config"]["settings"]["swap_load_length_mm"] == 120.0
+    assert command_path.exists()
+    assert opened.status_code == 200
+    assert opened.get_json()["path"] == str(command_path)
+    assert opened_paths == [command_path]

@@ -38,6 +38,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 log = logging.getLogger("web")
@@ -1014,20 +1015,25 @@ def _resolve_apprise(cfg):
 
 
 def _resolve_filament_service_settings(cfg):
+    defaults = cli.model.default_filament_service_config()
+    advanced_settings = _load_filament_swap_commands().get("settings") or {}
+    for key in tuple(defaults):
+        if key in advanced_settings:
+            defaults[key] = advanced_settings[key]
     return merge_dict_defaults(
         getattr(cfg, "filament_service", None),
-        cli.model.default_filament_service_config(),
+        defaults,
     )
 
 
 FILAMENT_SERVICE_DEFAULT_LENGTH_MM = 40.0
 FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM = 10.0
-FILAMENT_SERVICE_SWAP_UNLOAD_DEFAULT_LENGTH_MM = 60.0
+FILAMENT_SERVICE_SWAP_UNLOAD_DEFAULT_LENGTH_MM = 40.0
 FILAMENT_SERVICE_SWAP_LOAD_DEFAULT_LENGTH_MM = 120.0
 FILAMENT_SERVICE_MAX_LENGTH_MM = 300.0
 FILAMENT_SERVICE_FEEDRATE_MM_MIN = 240
-FILAMENT_SERVICE_EXTRUDE_FEEDRATE_MM_MIN = 900
-FILAMENT_SERVICE_RETRACT_FEEDRATE_MM_MIN = 2700
+FILAMENT_SERVICE_EXTRUDE_FEEDRATE_MM_MIN = 600
+FILAMENT_SERVICE_RETRACT_FEEDRATE_MM_MIN = 2000
 FILAMENT_SERVICE_SWAP_PRIME_FEEDRATE_MM_MIN = 240
 FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN = FILAMENT_SERVICE_RETRACT_FEEDRATE_MM_MIN
 FILAMENT_SERVICE_SWAP_LOAD_FEEDRATE_MM_MIN = 240
@@ -1039,7 +1045,7 @@ FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN = 600
 FILAMENT_SERVICE_SWAP_HOME_READY_TEMP_C = int(os.getenv("FILAMENT_SWAP_HOME_READY_TEMP_C", 180))
 FILAMENT_SERVICE_SWAP_HOME_SETTLE_S = float(os.getenv(
     "FILAMENT_SWAP_HOME_PAUSE_S",
-    os.getenv("FILAMENT_SWAP_HOME_SETTLE_S", 55.0),
+    os.getenv("FILAMENT_SWAP_HOME_SETTLE_S", 70.0),
 ))
 FILAMENT_SERVICE_SWAP_COOLDOWN_DELAY_S = float(os.getenv("FILAMENT_SWAP_COOLDOWN_DELAY_S", 0.75))
 FILAMENT_SERVICE_SWAP_MOTION_SETTLE_S = float(os.getenv("FILAMENT_SWAP_MOTION_SETTLE_S", 1.0))
@@ -1062,6 +1068,49 @@ _FILAMENT_SWAP_RUNNING_PHASES = frozenset({
     "loading",
     "cooling_down",
 })
+FILAMENT_SWAP_ADVANCED_CONFIG_NAME = "filament_swap_commands"
+FILAMENT_SWAP_ADVANCED_CONFIG_DEFAULT = {
+    "version": 1,
+    "description": (
+        "Advanced filament swap command templates and default settings. Edit only "
+        "if you know your printer accepts the replacement G-code. Restart is not required."
+    ),
+    "settings": {
+        "allow_legacy_swap": False,
+        "manual_swap_preheat_temp_c": FILAMENT_SERVICE_MANUAL_SWAP_DEFAULT_TEMP_C,
+        "quick_move_length_mm": FILAMENT_SERVICE_DEFAULT_LENGTH_MM,
+        "swap_prime_length_mm": FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM,
+        "swap_unload_length_mm": FILAMENT_SERVICE_SWAP_UNLOAD_DEFAULT_LENGTH_MM,
+        "swap_load_length_mm": FILAMENT_SERVICE_SWAP_LOAD_DEFAULT_LENGTH_MM,
+        "swap_home_pause_s": FILAMENT_SERVICE_SWAP_HOME_SETTLE_S,
+        "swap_home_ready_temp_c": FILAMENT_SERVICE_SWAP_HOME_READY_TEMP_C,
+        "swap_z_lift_mm": FILAMENT_SERVICE_SWAP_Z_LIFT_MM,
+        "swap_z_feedrate_mm_min": FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN,
+        "swap_prime_feedrate_mm_min": FILAMENT_SERVICE_SWAP_PRIME_FEEDRATE_MM_MIN,
+        "swap_unload_feedrate_mm_min": FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN,
+        "swap_load_feedrate_mm_min": FILAMENT_SERVICE_SWAP_LOAD_FEEDRATE_MM_MIN,
+        "swap_cooldown_delay_s": FILAMENT_SERVICE_SWAP_COOLDOWN_DELAY_S,
+    },
+    "commands": {
+        "set_nozzle_temp": "M104 S{temp_c}",
+        "cooldown_nozzle": "M104 S0",
+        "home_all": "native:home_all",
+        "relative_mode": "G91",
+        "z_lift": "G1 Z{z_lift_mm} F{z_feedrate}",
+        "wait_for_moves": "M400",
+        "absolute_mode": "G90",
+        "prime": "M83\nG1 E{prime_length_mm} F{prime_feedrate}\nM400\nM82",
+        "unload": "M83\nG1 E-{unload_length_mm} F{unload_feedrate}\nM400\nM82",
+        "load": "M83\nG1 E{load_length_mm} F{load_feedrate}\nM400\nM82",
+    },
+    "available_variables": {
+        "set_nozzle_temp": ["temp_c"],
+        "z_lift": ["z_lift_mm", "z_feedrate"],
+        "prime": ["prime_length_mm", "prime_feedrate"],
+        "unload": ["unload_length_mm", "unload_feedrate"],
+        "load": ["load_length_mm", "load_feedrate"],
+    },
+}
 Z_OFFSET_STEP_MM = 0.01
 Z_OFFSET_REFRESH_TIMEOUT_S = 5.0
 Z_OFFSET_CONFIRM_TIMEOUT_S = 8.0
@@ -1177,6 +1226,180 @@ def _format_extrusion_mm(length_mm):
     return text or "0"
 
 
+def _filament_swap_advanced_config_path(config_manager=None):
+    config_manager = config_manager or app.config.get("config")
+    if not config_manager:
+        return None
+    config_path = getattr(config_manager, "config_path", None)
+    if callable(config_path):
+        return Path(config_path(FILAMENT_SWAP_ADVANCED_CONFIG_NAME))
+    config_root = getattr(config_manager, "config_root", None)
+    if config_root:
+        return Path(config_root) / f"{FILAMENT_SWAP_ADVANCED_CONFIG_NAME}.json"
+    return None
+
+
+def _default_filament_swap_commands():
+    return json.loads(json.dumps(FILAMENT_SWAP_ADVANCED_CONFIG_DEFAULT))
+
+
+def _coerce_filament_swap_command(value):
+    if isinstance(value, list):
+        return "\n".join(str(item) for item in value if str(item).strip())
+    return str(value or "")
+
+
+def _coerce_filament_swap_setting(value, default):
+    if isinstance(default, bool):
+        return _filament_service_bool(value)
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int(float(value))
+    if isinstance(default, float):
+        return float(value)
+    return value
+
+
+def _merge_filament_swap_advanced_config(loaded):
+    defaults = _default_filament_swap_commands()
+    if not isinstance(loaded, dict):
+        return defaults, True
+
+    merged = dict(loaded)
+    changed = False
+    for key, value in defaults.items():
+        if key not in merged:
+            merged[key] = value
+            changed = True
+
+    commands = dict(defaults.get("commands") or {})
+    user_commands = loaded.get("commands") or {}
+    if isinstance(user_commands, dict):
+        for key, value in user_commands.items():
+            commands[str(key)] = _coerce_filament_swap_command(value)
+    else:
+        changed = True
+    if merged.get("commands") != commands:
+        changed = True
+    merged["commands"] = commands
+
+    settings = dict(defaults.get("settings") or {})
+    user_settings = loaded.get("settings") or {}
+    if isinstance(user_settings, dict):
+        for key, value in user_settings.items():
+            key = str(key)
+            if key in settings:
+                try:
+                    settings[key] = _coerce_filament_swap_setting(value, settings[key])
+                except (TypeError, ValueError):
+                    log.warning("Invalid filament swap advanced setting '%s'; using default", key)
+                    changed = True
+            else:
+                settings[key] = value
+    else:
+        changed = True
+    if merged.get("settings") != settings:
+        changed = True
+    merged["settings"] = settings
+
+    return merged, changed
+
+
+def _ensure_filament_swap_advanced_config():
+    path = _filament_swap_advanced_config_path()
+    defaults = _default_filament_swap_commands()
+    if path is None:
+        return defaults, None, False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(json.dumps(defaults, indent=2) + "\n", encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return defaults, path, True
+    loaded = _load_filament_swap_commands()
+    try:
+        raw_loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raw_loaded = None
+    _, changed = _merge_filament_swap_advanced_config(raw_loaded)
+    if changed:
+        try:
+            path.write_text(json.dumps(loaded, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            log.warning("Could not update filament swap command config defaults: %s", exc)
+    return loaded, path, False
+
+
+def _load_filament_swap_commands():
+    path = _filament_swap_advanced_config_path()
+    defaults = _default_filament_swap_commands()
+    if path is None or not path.exists():
+        return defaults
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Could not load filament swap command config; using defaults: %s", exc)
+        return defaults
+    merged, _ = _merge_filament_swap_advanced_config(loaded)
+    return merged
+
+
+def _filament_swap_advanced_settings():
+    settings = _load_filament_swap_commands().get("settings") or {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def _filament_swap_advanced_number(key, default, minimum=None, maximum=None, integer=False):
+    raw = _filament_swap_advanced_settings().get(key, default)
+    try:
+        value = int(float(raw)) if integer else float(raw)
+    except (TypeError, ValueError):
+        log.warning("Invalid filament swap advanced setting '%s'; using default", key)
+        value = default
+    if minimum is not None and value < minimum:
+        log.warning("Filament swap advanced setting '%s' is below minimum; using default", key)
+        value = default
+    if maximum is not None and value > maximum:
+        log.warning("Filament swap advanced setting '%s' is above maximum; using default", key)
+        value = default
+    return value
+
+
+def _filament_swap_command_template(command_name):
+    commands = _load_filament_swap_commands().get("commands") or {}
+    default_commands = FILAMENT_SWAP_ADVANCED_CONFIG_DEFAULT["commands"]
+    return _coerce_filament_swap_command(commands.get(command_name, default_commands.get(command_name, "")))
+
+
+def _format_filament_swap_command(command_name, required=False, **values):
+    template = _filament_swap_command_template(command_name)
+    if not template.strip():
+        if not required:
+            return ""
+        template = FILAMENT_SWAP_ADVANCED_CONFIG_DEFAULT["commands"].get(command_name, "")
+        if not template.strip():
+            return ""
+    try:
+        return template.format(**values)
+    except (KeyError, IndexError, ValueError) as exc:
+        log.warning("Invalid filament swap command template '%s': %s; using default", command_name, exc)
+        default_template = FILAMENT_SWAP_ADVANCED_CONFIG_DEFAULT["commands"].get(command_name, "")
+        return default_template.format(**values)
+
+
+def _open_file_with_default_app(path):
+    path = Path(path)
+    if os.name == "nt" and hasattr(os, "startfile"):
+        os.startfile(str(path))  # type: ignore[attr-defined]
+        return True
+    opener = shutil.which("xdg-open") or shutil.which("open")
+    if not opener:
+        return False
+    subprocess.Popen([opener, str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return True
+
+
 def _build_filament_move_gcode(delta_mm, feedrate_mm_min=FILAMENT_SERVICE_FEEDRATE_MM_MIN):
     extrusion = _format_extrusion_mm(delta_mm)
     return "\n".join([
@@ -1187,22 +1410,27 @@ def _build_filament_move_gcode(delta_mm, feedrate_mm_min=FILAMENT_SERVICE_FEEDRA
     ])
 
 
-def _build_filament_swap_park_gcode(
+def _build_filament_swap_z_lift_gcode(
     z_lift_mm=FILAMENT_SERVICE_SWAP_Z_LIFT_MM,
-    park_x_mm=FILAMENT_SERVICE_SWAP_PARK_X_MM,
-    park_y_mm=FILAMENT_SERVICE_SWAP_PARK_Y_MM,
+    z_feedrate_mm_min=FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN,
 ):
-    return "\n".join([
-        "G91",
-        f"G0 Z{_format_extrusion_mm(z_lift_mm)} F{FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN}",
-        "G90",
-        "M400",
-    ])
+    return _format_filament_swap_command(
+        "z_lift",
+        z_lift_mm=_format_extrusion_mm(z_lift_mm),
+        z_feedrate=int(z_feedrate_mm_min),
+    )
 
 
 def _serialize_filament_swap_state(state):
     if not state:
         return {"pending": False, "swap": None}
+    home_pause_until = state.get("home_pause_until")
+    home_pause_remaining_s = None
+    if home_pause_until:
+        try:
+            home_pause_remaining_s = max(0, round(float(home_pause_until) - time.time(), 1))
+        except (TypeError, ValueError):
+            home_pause_until = None
     return {
         "pending": True,
         "swap": {
@@ -1226,6 +1454,9 @@ def _serialize_filament_swap_state(state):
             "park_x_mm": state.get("park_x_mm"),
             "park_y_mm": state.get("park_y_mm"),
             "home_pause_s": state.get("home_pause_s"),
+            "home_pause_started_at": state.get("home_pause_started_at"),
+            "home_pause_until": home_pause_until,
+            "home_pause_remaining_s": home_pause_remaining_s,
             "manual_swap_preheat_temp_c": state.get("manual_swap_preheat_temp_c"),
         },
     }
@@ -1312,6 +1543,9 @@ def _filament_swap_state_update(token, printer_index=None, **updates):
         _, state = _filament_swap_state_by_token_locked(states, token, printer_index=printer_index)
         if state is None:
             return None
+        if updates.get("phase") != "homing":
+            updates.setdefault("home_pause_started_at", None)
+            updates.setdefault("home_pause_until", None)
         state.update(updates)
         return dict(state)
 
@@ -1389,9 +1623,13 @@ def _wait_for_filament_swap_motion(length_mm, feedrate_mm_min, should_continue=N
     )
 
 
-def _wait_for_filament_swap_park(z_lift_mm, park_x_mm, park_y_mm, should_continue=None):
+def _wait_for_filament_swap_z_lift(
+    z_lift_mm,
+    z_feedrate_mm_min=FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN,
+    should_continue=None,
+):
     try:
-        z_seconds = abs(float(z_lift_mm)) / max(1.0, float(FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN)) * 60.0
+        z_seconds = abs(float(z_lift_mm)) / max(1.0, float(z_feedrate_mm_min)) * 60.0
     except (TypeError, ValueError):
         z_seconds = 0.0
     _wait_for_filament_swap_delay(
@@ -1400,10 +1638,39 @@ def _wait_for_filament_swap_park(z_lift_mm, park_x_mm, park_y_mm, should_continu
     )
 
 
+def _send_filament_swap_z_lift(
+    mqtt,
+    z_lift_mm,
+    z_feedrate_mm_min=FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN,
+    should_continue=None,
+):
+    for command_name in ("relative_mode", "z_lift", "wait_for_moves", "absolute_mode"):
+        if command_name == "z_lift":
+            gcode = _build_filament_swap_z_lift_gcode(z_lift_mm, z_feedrate_mm_min)
+        else:
+            gcode = _format_filament_swap_command(command_name)
+        if gcode.strip():
+            mqtt.send_gcode(gcode)
+    _wait_for_filament_swap_z_lift(
+        z_lift_mm,
+        z_feedrate_mm_min=z_feedrate_mm_min,
+        should_continue=should_continue,
+    )
+
+
 def _send_filament_swap_home_all(mqtt, should_continue=None, pause_s=None):
-    send_home = getattr(mqtt, "send_home", None)
-    if callable(send_home):
-        send_home("all")
+    home_command = _format_filament_swap_command("home_all").strip()
+    native_prefix = "native:"
+    if home_command.lower().startswith(native_prefix):
+        axis = home_command[len(native_prefix):].strip().lower()
+        axis = axis.removeprefix("home_") or "all"
+        send_home = getattr(mqtt, "send_home", None)
+        if callable(send_home):
+            send_home(axis)
+        else:
+            mqtt.send_gcode("G28")
+    elif home_command:
+        mqtt.send_gcode(home_command)
     else:
         mqtt.send_gcode("G28")
     _wait_for_filament_swap_home(should_continue=should_continue, pause_s=pause_s)
@@ -1479,7 +1746,7 @@ def _wait_for_filament_service_nozzle_target(mqtt, target_temp_c, should_continu
         time.sleep(0.25)
 
     log.warning(
-        "Filament swap: nozzle target %sC was not observed before homing (last target: %s); continuing",
+        "Filament swap: nozzle target %sC was not observed during swap (last target: %s); continuing",
         target_temp_c,
         last_target if last_target is not None else "unknown",
     )
@@ -1502,7 +1769,7 @@ def _send_filament_service_nozzle_target(mqtt, target_temp_c, should_continue=No
     for _ in range(max(1, int(attempts))):
         if should_continue is not None and not should_continue():
             raise _FilamentSwapCancelled()
-        mqtt.send_gcode(f"M104 S{target_temp_c}")
+        mqtt.send_gcode(_format_filament_swap_command("set_nozzle_temp", required=True, temp_c=target_temp_c))
         last_target = _wait_for_filament_service_nozzle_target(
             mqtt,
             target_temp_c,
@@ -1541,11 +1808,6 @@ def _run_legacy_swap_unload(token):
             raise _FilamentSwapCancelled()
 
     try:
-        park_gcode = _build_filament_swap_park_gcode(
-            state.get("z_lift_mm", FILAMENT_SERVICE_SWAP_Z_LIFT_MM),
-            state.get("park_x_mm", FILAMENT_SERVICE_SWAP_PARK_X_MM),
-            state.get("park_y_mm", FILAMENT_SERVICE_SWAP_PARK_Y_MM),
-        )
         prime_length_mm = state.get("prime_length_mm", FILAMENT_SERVICE_SWAP_PRIME_DEFAULT_LENGTH_MM)
         unload_length_mm = state["unload_length_mm"]
         prime_feedrate_mm_min = state.get(
@@ -1557,13 +1819,15 @@ def _run_legacy_swap_unload(token):
             FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN,
         )
         home_pause_s = state.get("home_pause_s", FILAMENT_SERVICE_SWAP_HOME_SETTLE_S)
-        prime_gcode = _build_filament_move_gcode(
-            prime_length_mm,
-            feedrate_mm_min=prime_feedrate_mm_min,
+        prime_gcode = _format_filament_swap_command(
+            "prime",
+            prime_length_mm=_format_extrusion_mm(prime_length_mm),
+            prime_feedrate=int(prime_feedrate_mm_min),
         )
-        unload_gcode = _build_filament_move_gcode(
-            -unload_length_mm,
-            feedrate_mm_min=unload_feedrate_mm_min,
+        unload_gcode = _format_filament_swap_command(
+            "unload",
+            unload_length_mm=_format_extrusion_mm(unload_length_mm),
+            unload_feedrate=int(unload_feedrate_mm_min),
         )
         home_preheat_temp_c = min(
             int(state["unload_temp_c"]),
@@ -1580,7 +1844,7 @@ def _run_legacy_swap_unload(token):
                 message=f"Heating nozzle to {home_preheat_temp_c}°C before homing...",
                 error=None,
             )
-            mqtt.send_gcode(f"M104 S{home_preheat_temp_c}")
+            mqtt.send_gcode(_format_filament_swap_command("set_nozzle_temp", required=True, temp_c=home_preheat_temp_c))
             _wait_for_filament_service_nozzle(
                 mqtt,
                 home_ready_temp_c,
@@ -1603,6 +1867,7 @@ def _run_legacy_swap_unload(token):
             )
             ensure_continue()
 
+            home_pause_started_at = time.time()
             _filament_swap_state_update(
                 token,
                 printer_index=printer_index,
@@ -1610,6 +1875,8 @@ def _run_legacy_swap_unload(token):
                 message=(
                     f"Homing all axes before filament swap. Waiting {home_pause_s:g}s before raising Z."
                 ),
+                home_pause_started_at=home_pause_started_at,
+                home_pause_until=home_pause_started_at + max(0.0, float(home_pause_s or 0.0)),
                 error=None,
             )
             _send_filament_swap_home_all(mqtt, should_continue=should_continue, pause_s=home_pause_s)
@@ -1636,13 +1903,14 @@ def _run_legacy_swap_unload(token):
                 message=(
                     f"Raising Z {state.get('z_lift_mm', FILAMENT_SERVICE_SWAP_Z_LIFT_MM)} mm..."
                 ),
+                home_pause_started_at=None,
+                home_pause_until=None,
                 error=None,
             )
-            mqtt.send_gcode(park_gcode)
-            _wait_for_filament_swap_park(
+            _send_filament_swap_z_lift(
+                mqtt,
                 state.get("z_lift_mm", FILAMENT_SERVICE_SWAP_Z_LIFT_MM),
-                state.get("park_x_mm", FILAMENT_SERVICE_SWAP_PARK_X_MM),
-                state.get("park_y_mm", FILAMENT_SERVICE_SWAP_PARK_Y_MM),
+                z_feedrate_mm_min=state.get("z_feedrate_mm_min", FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN),
                 should_continue=should_continue,
             )
             ensure_continue()
@@ -1740,9 +2008,10 @@ def _run_legacy_swap_load(token):
     try:
         load_length_mm = state["load_length_mm"]
         load_feedrate_mm_min = state.get("load_feedrate_mm_min", FILAMENT_SERVICE_FEEDRATE_MM_MIN)
-        load_gcode = _build_filament_move_gcode(
-            load_length_mm,
-            feedrate_mm_min=load_feedrate_mm_min,
+        load_gcode = _format_filament_swap_command(
+            "load",
+            load_length_mm=_format_extrusion_mm(load_length_mm),
+            load_feedrate=int(load_feedrate_mm_min),
         )
         purge_started = False
         with borrow_mqtt(printer_index) as mqtt:
@@ -1754,7 +2023,11 @@ def _run_legacy_swap_load(token):
                 message=f"Heating nozzle to {state['load_temp_c']}°C for load / purge...",
                 error=None,
             )
-            mqtt.send_gcode(f"M104 S{state['load_temp_c']}")
+            _send_filament_service_nozzle_target(
+                mqtt,
+                state["load_temp_c"],
+                should_continue=should_continue,
+            )
             _wait_for_filament_service_nozzle(
                 mqtt,
                 state["load_temp_c"],
@@ -1791,10 +2064,10 @@ def _run_legacy_swap_load(token):
                         error=None,
                     )
                     _wait_for_filament_swap_delay(
-                        FILAMENT_SERVICE_SWAP_COOLDOWN_DELAY_S,
+                        state.get("cooldown_delay_s", FILAMENT_SERVICE_SWAP_COOLDOWN_DELAY_S),
                         should_continue=None,
                     )
-                    mqtt.send_gcode("M104 S0")
+                    mqtt.send_gcode(_format_filament_swap_command("cooldown_nozzle", required=True))
 
         _filament_swap_state_clear(token, printer_index=printer_index)
     except _FilamentSwapCancelled:
@@ -3188,6 +3461,39 @@ def app_api_settings_filament_service_update():
     return {"status": "ok", "filament_service": new_config}
 
 
+@app.get("/api/settings/filament-service/advanced")
+def app_api_settings_filament_service_advanced():
+    config_data, path, created = _ensure_filament_swap_advanced_config()
+    return {
+        "status": "ok",
+        "path": str(path) if path else None,
+        "created": created,
+        "config": config_data,
+    }
+
+
+@app.post("/api/settings/filament-service/advanced/open")
+def app_api_settings_filament_service_advanced_open():
+    config_data, path, created = _ensure_filament_swap_advanced_config()
+    if path is None:
+        return {"error": "No local config path is available for advanced filament swap commands"}, 500
+
+    try:
+        opened = _open_file_with_default_app(path)
+    except OSError as exc:
+        return {"error": f"Could not open advanced filament swap command config: {exc}"}, 500
+
+    if not opened:
+        return {"error": f"No system file opener found. Edit this file manually: {path}"}, 500
+
+    return {
+        "status": "ok",
+        "path": str(path),
+        "created": created,
+        "config": config_data,
+    }
+
+
 # GCode prefixes that are unsafe to send while a print is active
 _UNSAFE_GCODE_PREFIXES = {"G0", "G1", "G28", "G29", "G91", "G90"}
 
@@ -4346,6 +4652,24 @@ def app_api_filament_service_swap_start():
     load_feedrate_mm_min = FILAMENT_SERVICE_FEEDRATE_MM_MIN
     prime_feedrate_mm_min = FILAMENT_SERVICE_SWAP_PRIME_FEEDRATE_MM_MIN
     home_pause_s = filament_settings.get("swap_home_pause_s", FILAMENT_SERVICE_SWAP_HOME_SETTLE_S)
+    z_lift_mm = _filament_swap_advanced_number(
+        "swap_z_lift_mm",
+        FILAMENT_SERVICE_SWAP_Z_LIFT_MM,
+        minimum=0.0,
+        maximum=FILAMENT_SERVICE_MAX_LENGTH_MM,
+    )
+    z_feedrate_mm_min = _filament_swap_advanced_number(
+        "swap_z_feedrate_mm_min",
+        FILAMENT_SERVICE_SWAP_Z_FEEDRATE_MM_MIN,
+        minimum=1.0,
+        integer=True,
+    )
+    cooldown_delay_s = _filament_swap_advanced_number(
+        "swap_cooldown_delay_s",
+        FILAMENT_SERVICE_SWAP_COOLDOWN_DELAY_S,
+        minimum=0.0,
+        maximum=FILAMENT_SERVICE_SWAP_MAX_WAIT_S,
+    )
 
     if allow_legacy_swap:
         try:
@@ -4375,8 +4699,24 @@ def app_api_filament_service_swap_start():
         except LookupError as exc:
             return {"error": str(exc)}, 404
 
-        unload_feedrate_mm_min = FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN
-        load_feedrate_mm_min = FILAMENT_SERVICE_SWAP_LOAD_FEEDRATE_MM_MIN
+        unload_feedrate_mm_min = _filament_swap_advanced_number(
+            "swap_unload_feedrate_mm_min",
+            FILAMENT_SERVICE_SWAP_UNLOAD_FEEDRATE_MM_MIN,
+            minimum=1.0,
+            integer=True,
+        )
+        load_feedrate_mm_min = _filament_swap_advanced_number(
+            "swap_load_feedrate_mm_min",
+            FILAMENT_SERVICE_SWAP_LOAD_FEEDRATE_MM_MIN,
+            minimum=1.0,
+            integer=True,
+        )
+        prime_feedrate_mm_min = _filament_swap_advanced_number(
+            "swap_prime_feedrate_mm_min",
+            FILAMENT_SERVICE_SWAP_PRIME_FEEDRATE_MM_MIN,
+            minimum=1.0,
+            integer=True,
+        )
 
     swap_state = {
         "token": token(12),
@@ -4395,7 +4735,8 @@ def app_api_filament_service_swap_start():
         "prime_length_mm": prime_length_mm,
         "unload_length_mm": unload_length_mm,
         "load_length_mm": load_length_mm,
-        "z_lift_mm": FILAMENT_SERVICE_SWAP_Z_LIFT_MM,
+        "z_lift_mm": z_lift_mm,
+        "z_feedrate_mm_min": z_feedrate_mm_min,
         "park_x_mm": FILAMENT_SERVICE_SWAP_PARK_X_MM,
         "park_y_mm": FILAMENT_SERVICE_SWAP_PARK_Y_MM,
         "home_pause_s": home_pause_s,
@@ -4403,6 +4744,7 @@ def app_api_filament_service_swap_start():
         "prime_feedrate_mm_min": prime_feedrate_mm_min,
         "unload_feedrate_mm_min": unload_feedrate_mm_min,
         "load_feedrate_mm_min": load_feedrate_mm_min,
+        "cooldown_delay_s": cooldown_delay_s,
     }
 
     if allow_legacy_swap:
@@ -5092,6 +5434,7 @@ _PROTECTED_GET_PATHS = {
     # Sensitive credential exposure: HA MQTT password, Apprise URLs/keys
     "/api/settings/mqtt",
     "/api/settings/filament-service",
+    "/api/settings/filament-service/advanced",
     "/api/settings/timelapse",
     "/api/notifications/settings",
     # Exposes printer serial numbers, IP addresses, and MAC addresses

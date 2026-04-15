@@ -30,8 +30,9 @@ def _printer(sn="SN1", name="Printer", model="V8111"):
 
 
 class FakeConfigManager:
-    def __init__(self, cfg):
+    def __init__(self, cfg, config_root=None):
         self.cfg = cfg
+        self.config_root = config_root
 
     @contextmanager
     def open(self):
@@ -81,7 +82,7 @@ def _install_state(tmp_path, mqtt):
     old_filaments = getattr(app, "filaments", None)
     old_swap = getattr(app, "filament_swap_state", None)
 
-    app.config["config"] = FakeConfigManager(_base_config())
+    app.config["config"] = FakeConfigManager(_base_config(), config_root=tmp_path)
     app.config["api_key"] = API_KEY
     app.config["login"] = True
     app.config["printer_index"] = 0
@@ -232,8 +233,8 @@ def test_filament_service_preheat_and_move_routes(tmp_path):
     assert move_default.status_code == 200
     assert invalid.status_code == 400
     assert sent[0] == "M104 S220"
-    assert "G1 E-25 F2700" in sent[1]
-    assert "G1 E12.5 F900" in sent[2]
+    assert "G1 E-25 F2000" in sent[1]
+    assert "G1 E12.5 F600" in sent[2]
 
 
 def test_filament_swap_routes_follow_manual_guided_flow_by_default(tmp_path):
@@ -362,7 +363,7 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
     home_calls = []
     home_waits = []
     motion_waits = []
-    park_waits = []
+    z_lift_waits = []
     target_waits = []
     mqtt = SimpleNamespace(
         is_printing=False,
@@ -386,8 +387,8 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
         motion_waits.append((length_mm, feedrate_mm_min))
         assert should_continue is None or should_continue()
 
-    def fake_park_wait(z_lift_mm, park_x_mm, park_y_mm, should_continue=None):
-        park_waits.append((z_lift_mm, park_x_mm, park_y_mm))
+    def fake_z_lift_wait(z_lift_mm, z_feedrate_mm_min=600, should_continue=None):
+        z_lift_waits.append(z_lift_mm)
         assert should_continue is None or should_continue()
 
     def fake_home_wait(should_continue=None, pause_s=None):
@@ -402,7 +403,7 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
     monkeypatch.setattr(web_module, "_filament_swap_start_background", fake_start_background)
     monkeypatch.setattr(web_module, "_wait_for_filament_swap_home", fake_home_wait)
     monkeypatch.setattr(web_module, "_wait_for_filament_swap_motion", fake_motion_wait)
-    monkeypatch.setattr(web_module, "_wait_for_filament_swap_park", fake_park_wait)
+    monkeypatch.setattr(web_module, "_wait_for_filament_swap_z_lift", fake_z_lift_wait)
     monkeypatch.setattr(web_module, "_wait_for_filament_service_nozzle_target", fake_target_wait)
     monkeypatch.setattr(web_module, "FILAMENT_SERVICE_SWAP_COOLDOWN_DELAY_S", 0)
 
@@ -452,16 +453,19 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
     assert sent[0] == "M104 S180"
     assert sent[1] == "M104 S220"
     assert sent[2] == "M104 S220"
-    assert "G0 Z50 F600" in sent[3]
-    assert sent[4] == "M104 S220"
-    assert "G1 E10 F240" in sent[5]
-    assert "G1 E-55 F2700" in sent[6]
-    assert sent[7] == "M104 S240"
-    assert "G1 E65 F240" in sent[8]
-    assert sent[9] == "M104 S0"
-    assert target_waits == [220, 220, 220]
-    assert motion_waits == [(10, 240), (55, 2700), (65, 240)]
-    assert park_waits == [(50.0, 0.0, 230.0)]
+    assert sent[3] == "G91"
+    assert sent[4] == "G1 Z50 F600"
+    assert sent[5] == "M400"
+    assert sent[6] == "G90"
+    assert sent[7] == "M104 S220"
+    assert "G1 E10 F240" in sent[8]
+    assert "G1 E-55 F2000" in sent[9]
+    assert sent[10] == "M104 S240"
+    assert "G1 E65 F240" in sent[11]
+    assert sent[12] == "M104 S0"
+    assert target_waits == [220, 220, 220, 240]
+    assert motion_waits == [(10, 240), (55, 2000), (65, 240)]
+    assert z_lift_waits == [50.0]
 
 
 def test_legacy_swap_sends_heat_before_homing_when_nozzle_is_cold(tmp_path, monkeypatch):
@@ -470,7 +474,7 @@ def test_legacy_swap_sends_heat_before_homing_when_nozzle_is_cold(tmp_path, monk
     home_waits = []
     wait_calls = []
     motion_waits = []
-    park_waits = []
+    z_lift_waits = []
     target_waits = []
     mqtt = SimpleNamespace(
         is_printing=False,
@@ -496,8 +500,8 @@ def test_legacy_swap_sends_heat_before_homing_when_nozzle_is_cold(tmp_path, monk
         motion_waits.append((length_mm, feedrate_mm_min))
         assert should_continue is None or should_continue()
 
-    def fake_park_wait(z_lift_mm, park_x_mm, park_y_mm, should_continue=None):
-        park_waits.append((z_lift_mm, park_x_mm, park_y_mm))
+    def fake_z_lift_wait(z_lift_mm, z_feedrate_mm_min=600, should_continue=None):
+        z_lift_waits.append(z_lift_mm)
         assert should_continue is None or should_continue()
 
     def fake_home_wait(should_continue=None, pause_s=None):
@@ -512,7 +516,7 @@ def test_legacy_swap_sends_heat_before_homing_when_nozzle_is_cold(tmp_path, monk
     monkeypatch.setattr(web_module, "_filament_swap_start_background", fake_start_background)
     monkeypatch.setattr(web_module, "_wait_for_filament_swap_home", fake_home_wait)
     monkeypatch.setattr(web_module, "_wait_for_filament_swap_motion", fake_motion_wait)
-    monkeypatch.setattr(web_module, "_wait_for_filament_swap_park", fake_park_wait)
+    monkeypatch.setattr(web_module, "_wait_for_filament_swap_z_lift", fake_z_lift_wait)
     monkeypatch.setattr(web_module, "_wait_for_filament_service_nozzle", fake_wait_for_nozzle)
     monkeypatch.setattr(web_module, "_wait_for_filament_service_nozzle_target", fake_target_wait)
 
@@ -537,15 +541,41 @@ def test_legacy_swap_sends_heat_before_homing_when_nozzle_is_cold(tmp_path, monk
     assert sent[1] == "M104 S220"
     assert sent[2] == "M104 S220"
     assert home_calls == ["all"]
-    assert home_waits == [55.0]
-    assert "G0 Z50 F600" in sent[3]
-    assert sent[4] == "M104 S220"
-    assert "G1 E10 F240" in sent[5]
-    assert "G1 E-60 F2700" in sent[6]
+    assert home_waits == [70.0]
+    assert sent[3] == "G91"
+    assert sent[4] == "G1 Z50 F600"
+    assert sent[5] == "M400"
+    assert sent[6] == "G90"
+    assert sent[7] == "M104 S220"
+    assert "G1 E10 F240" in sent[8]
+    assert "G1 E-40 F2000" in sent[9]
     assert wait_calls == [(180, 0), (220, 5)]
     assert target_waits == [220, 220, 220]
-    assert motion_waits == [(10.0, 240), (60.0, 2700)]
-    assert park_waits == [(50.0, 0.0, 230.0)]
+    assert motion_waits == [(10.0, 240), (40.0, 2000)]
+    assert z_lift_waits == [50.0]
+
+
+def test_filament_swap_command_config_overrides_templates(tmp_path):
+    mqtt = SimpleNamespace(is_printing=False, nozzle_temp=25, send_gcode=lambda gcode: None)
+    old_values, old_svc, old_filaments, old_swap = _install_state(tmp_path, mqtt)
+    command_config = tmp_path / "filament_swap_commands.json"
+    command_config.write_text(
+        '{"commands":{"set_nozzle_temp":"M109 S{temp_c}","z_lift":"G1 Z{z_lift_mm} F1234"}}',
+        encoding="utf-8",
+    )
+
+    try:
+        nozzle_command = web_module._format_filament_swap_command("set_nozzle_temp", temp_c=220)
+        lift_command = web_module._format_filament_swap_command(
+            "z_lift",
+            z_lift_mm="50",
+            z_feedrate=600,
+        )
+    finally:
+        _restore_state(old_values, old_svc, old_filaments, old_swap)
+
+    assert nozzle_command == "M109 S220"
+    assert lift_command == "G1 Z50 F1234"
 
 
 def test_legacy_swap_cancel_is_allowed_while_stage_is_running(tmp_path, monkeypatch):

@@ -78,11 +78,11 @@ def default_filament_service_config():
         "manual_swap_preheat_temp_c": int(os.getenv("FILAMENT_MANUAL_SWAP_PREHEAT_TEMP_C", 180)),
         "quick_move_length_mm": float(os.getenv("FILAMENT_QUICK_MOVE_LENGTH_MM", 40)),
         "swap_prime_length_mm": float(os.getenv("FILAMENT_SWAP_PRIME_LENGTH_MM", 10)),
-        "swap_unload_length_mm": float(os.getenv("FILAMENT_SWAP_UNLOAD_LENGTH_MM", 60)),
+        "swap_unload_length_mm": float(os.getenv("FILAMENT_SWAP_UNLOAD_LENGTH_MM", 40)),
         "swap_load_length_mm": float(os.getenv("FILAMENT_SWAP_LOAD_LENGTH_MM", 120)),
         "swap_home_pause_s": float(os.getenv(
             "FILAMENT_SWAP_HOME_PAUSE_S",
-            os.getenv("FILAMENT_SWAP_HOME_SETTLE_S", 55),
+            os.getenv("FILAMENT_SWAP_HOME_SETTLE_S", 70),
         )),
     }
 
