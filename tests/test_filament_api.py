@@ -233,8 +233,8 @@ def test_filament_service_preheat_and_move_routes(tmp_path):
     assert move_default.status_code == 200
     assert invalid.status_code == 400
     assert sent[0] == "M104 S220"
-    assert "G1 E-25 F2700" in sent[1]
-    assert "G1 E12.5 F900" in sent[2]
+    assert "G1 E-25 F2000" in sent[1]
+    assert "G1 E12.5 F600" in sent[2]
 
 
 def test_filament_swap_routes_follow_manual_guided_flow_by_default(tmp_path):
@@ -459,12 +459,12 @@ def test_filament_swap_routes_cover_legacy_start_confirm_and_cancel(tmp_path, mo
     assert sent[6] == "G90"
     assert sent[7] == "M104 S220"
     assert "G1 E10 F240" in sent[8]
-    assert "G1 E-55 F2700" in sent[9]
+    assert "G1 E-55 F2000" in sent[9]
     assert sent[10] == "M104 S240"
     assert "G1 E65 F240" in sent[11]
     assert sent[12] == "M104 S0"
     assert target_waits == [220, 220, 220, 240]
-    assert motion_waits == [(10, 240), (55, 2700), (65, 240)]
+    assert motion_waits == [(10, 240), (55, 2000), (65, 240)]
     assert z_lift_waits == [50.0]
 
 
@@ -548,10 +548,10 @@ def test_legacy_swap_sends_heat_before_homing_when_nozzle_is_cold(tmp_path, monk
     assert sent[6] == "G90"
     assert sent[7] == "M104 S220"
     assert "G1 E10 F240" in sent[8]
-    assert "G1 E-40 F2700" in sent[9]
+    assert "G1 E-40 F2000" in sent[9]
     assert wait_calls == [(180, 0), (220, 5)]
     assert target_waits == [220, 220, 220]
-    assert motion_waits == [(10.0, 240), (40.0, 2700)]
+    assert motion_waits == [(10.0, 240), (40.0, 2000)]
     assert z_lift_waits == [50.0]
 
 
