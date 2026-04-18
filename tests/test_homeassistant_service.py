@@ -25,6 +25,7 @@ class FakeMQTTClient:
         self.loop_stopped = False
         self.disconnected = False
         self.will = None
+        self.reconnect_delay = None
 
     def username_pw_set(self, user, password):
         self.username_password = (user, password)
@@ -34,6 +35,12 @@ class FakeMQTTClient:
 
     def connect(self, host, port, keepalive=60):
         self.connected = (host, port, keepalive)
+
+    def connect_async(self, host, port, keepalive=60):
+        self.connected = (host, port, keepalive)
+
+    def reconnect_delay_set(self, min_delay=1, max_delay=120):
+        self.reconnect_delay = (min_delay, max_delay)
 
     def loop_start(self):
         self.loop_started = True
@@ -160,9 +167,65 @@ def test_homeassistant_start_and_stop(monkeypatch):
 
     assert fake_client.username_password == ("ha-user", "ha-pass")
     assert fake_client.connected == ("mqtt.example", 1884, 60)
+    assert fake_client.reconnect_delay == (1, 60)
     assert fake_client.loop_started is True
     assert fake_client.disconnected is True
     assert fake_client.loop_stopped is True
+
+
+def test_homeassistant_start_survives_unreachable_broker(monkeypatch):
+    """connect_async stores params without doing I/O, so a broker that is
+    unreachable at startup should still leave the client active — paho's
+    background thread will retry."""
+    fake_client = FakeMQTTClient()
+
+    class FakePahoModule:
+        class CallbackAPIVersion:
+            VERSION1 = object()
+
+        @staticmethod
+        def Client(*args, **kwargs):
+            return fake_client
+
+    monkeypatch.setattr("web.service.homeassistant.paho_mqtt", FakePahoModule)
+
+    svc = HomeAssistantService(FakeConfigManager(_service_config()), printer_sn="SN123", printer_name="Printer")
+    svc.start()
+
+    # Broker is unreachable, so we are not connected yet — but the client
+    # is alive and loop_start has been called, so paho will keep retrying.
+    assert svc._client is fake_client
+    assert svc._connected is False
+    assert fake_client.loop_started is True
+    assert fake_client.reconnect_delay == (1, 60)
+
+
+def test_homeassistant_start_handles_invalid_broker_config(monkeypatch):
+    """connect_async raises ValueError for bad host/port — that's a
+    genuine misconfiguration, not transient unreachability, so we give up
+    cleanly rather than leaving paho's thread running."""
+    fake_client = FakeMQTTClient()
+
+    def bad_connect_async(host, port, keepalive=60):
+        raise ValueError(f"invalid port: {port}")
+    fake_client.connect_async = bad_connect_async
+
+    class FakePahoModule:
+        class CallbackAPIVersion:
+            VERSION1 = object()
+
+        @staticmethod
+        def Client(*args, **kwargs):
+            return fake_client
+
+    monkeypatch.setattr("web.service.homeassistant.paho_mqtt", FakePahoModule)
+
+    svc = HomeAssistantService(FakeConfigManager(_service_config()), printer_sn="SN123", printer_name="Printer")
+    svc.start()
+
+    assert svc._client is None
+    # loop_start must NOT have been called when connect_async failed
+    assert fake_client.loop_started is False
 
 
 def test_homeassistant_reload_restarts_on_config_change(monkeypatch):

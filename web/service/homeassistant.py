@@ -140,7 +140,14 @@ class HomeAssistantService:
     # ------------------------------------------------------------------
 
     def start(self):
-        """Connect to the HA MQTT broker and publish discovery configs."""
+        """Connect to the HA MQTT broker and publish discovery configs.
+
+        Uses connect_async() + loop_start() so a broker that is briefly
+        unreachable at startup (for example, when ankerctl and Mosquitto are
+        launched together in docker-compose) does not permanently disable HA
+        integration. paho's background thread retries with exponential
+        backoff.
+        """
         if not self._enabled:
             return
 
@@ -157,16 +164,27 @@ class HomeAssistantService:
         self._client.on_disconnect = self._on_disconnect
         self._client.on_message = self._on_message
 
+        # Bound reconnect backoff so brief broker outages recover quickly
+        # but sustained unreachability doesn't hammer the network.
+        self._client.reconnect_delay_set(min_delay=1, max_delay=60)
+
         # Set LWT (Last Will and Testament) so HA marks device offline
         avail_topic = self._availability_topic()
         self._client.will_set(avail_topic, payload="offline", qos=1, retain=True)
 
         try:
-            self._client.connect(self._host, self._port, keepalive=60)
-            self._client.loop_start()
-        except Exception as err:
-            log.error(f"HA MQTT: connection failed: {err}")
+            # connect_async() stores params without doing network I/O.
+            # loop_start() spins up paho's background thread which performs
+            # the initial connect and any subsequent reconnect attempts.
+            self._client.connect_async(self._host, self._port, keepalive=60)
+        except (ValueError, OSError) as err:
+            # Raised only for invalid host/port syntax, not for transient
+            # unreachability. Treat as a genuine misconfiguration.
+            log.error(f"HA MQTT: invalid broker configuration: {err}")
             self._client = None
+            return
+
+        self._client.loop_start()
 
     def stop(self):
         """Disconnect from the HA MQTT broker and mark device offline."""
