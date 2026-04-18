@@ -31,8 +31,8 @@ def pppp_open(config, printer_index, timeout=None, dumpfile=None):
         deadline = datetime.now() + timedelta(seconds=timeout)
 
     with config.open() as cfg:
-        if printer_index >= len(cfg.printers):
-            raise ValueError(f"Printer number {printer_index} out of range, max printer number is {len(cfg.printers)-1}")
+        if printer_index < 0 or printer_index >= len(cfg.printers):
+            raise ValueError(f"Printer number {printer_index} out of range, must be in 0..{len(cfg.printers)-1}")
         printer = cfg.printers[printer_index]
         ip_addr = pppp_resolve_printer_ip(config, printer, printer_index, dumpfile=dumpfile)
         if not ip_addr:

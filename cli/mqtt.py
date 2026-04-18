@@ -26,8 +26,8 @@ FILE_LIST_SOURCE_VALUES = {
 def mqtt_open(config, printer_index, insecure):
 
     with config.open() as cfg:
-        if printer_index >= len(cfg.printers):
-            raise ValueError(f"Printer number {printer_index} out of range, max printer number is {len(cfg.printers)-1}")
+        if printer_index < 0 or printer_index >= len(cfg.printers):
+            raise ValueError(f"Printer number {printer_index} out of range, must be in 0..{len(cfg.printers)-1}")
         printer = cfg.printers[printer_index]
         acct = cfg.account
         server = servertable[acct.region]

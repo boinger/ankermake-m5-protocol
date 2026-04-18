@@ -321,3 +321,29 @@ def test_pppp_open_raises_on_invalid_printer_index():
     import pytest
     with pytest.raises(ValueError, match="out of range"):
         cli.pppp.pppp_open(config, printer_index=0)
+
+
+def test_mqtt_open_raises_on_negative_printer_index():
+    """Negative indices must not silently select the last printer via
+    Python's negative indexing."""
+    import cli.mqtt
+    config = FakeConfigContext(printers=[SimpleNamespace(name="p0"), SimpleNamespace(name="p1")])
+    import pytest
+    with pytest.raises(ValueError, match="out of range"):
+        cli.mqtt.mqtt_open(config, printer_index=-1, insecure=False)
+
+
+def test_pppp_open_raises_on_negative_printer_index():
+    import cli.pppp
+    config = FakeConfigContext(printers=[SimpleNamespace(name="p0"), SimpleNamespace(name="p1")])
+    import pytest
+    with pytest.raises(ValueError, match="out of range"):
+        cli.pppp.pppp_open(config, printer_index=-1)
+
+
+def test_printer_option_rejects_negative_values():
+    """click IntRange(min=0) rejects --printer -1 at argument parse time."""
+    runner = CliRunner()
+    result = runner.invoke(ankerctl.main, ["--printer", "-1", "config", "show"])
+    assert result.exit_code != 0
+    assert "is not in the range" in result.output or "Invalid value" in result.output
